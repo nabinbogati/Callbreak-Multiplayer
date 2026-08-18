@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7. Persistent App State — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m07">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 7 of 20</p>
+<h1>Persistent App State</h1>
+<p class="lede">
+The game is playable, but everything about it resets on every restart — theme,
+player name, even <em>who this player is</em>. This module builds
+<code>state/app_settings.dart</code>, <code>state/identity_store.dart</code>, and
+<code>state/active_game_binding.dart</code> — the layer that survives a restart.
+</p>
+
+<h2 id="appsettings"><code>state/app_settings.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/state/app_settings.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Dozens of widgets need to read (and a few need to change) the same handful of
+preferences — theme, card style, difficulty, animation speed. Without one
+shared, observable store, every screen would need its own copy, and a change on
+the settings sheet would never be seen by the table screen already on the
+navigation stack.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Two different mutation philosophies live on the same class, on
+purpose.</strong> Display preferences (<code>theme</code>,
+<code>animationSpeed</code>, ...) are plain in-memory fields that call
+<code>notifyListeners()</code> on every change — cheap to lose on reinstall, so
+no persistence effort is spent on them here. Anything that identifies the
+<em>player</em> is instead delegated to <code>identity</code> (an
+<code>IdentityStore</code>, below), which is backed by disk — per the file's own
+doc comment, "a theme is cheap to pick again after a reinstall, an account is
+not." The cost of splitting it this way: two different code paths for "change a
+setting" exist in one class, and a future field has to be consciously assigned
+to the right one.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>class AppSettings extends ChangeNotifier {
+  AppSettings({IdentityStore? identity})
+    : _identity = identity ?? IdentityStore.inMemory();
+  ...
+  set theme(TableTheme value) {
+    if (_theme == value) return;
+    _theme = value;
+    notifyListeners();
+  }
+  ...
+  String? get guestToken =&gt; _identity.guestToken;
+
+  set guestToken(String? value) {
+    if (value == null || value.isEmpty || value == _identity.guestToken) return;
+    unawaited(_identity.saveGuestToken(value));
+    // Deliberately no notifyListeners: this is a credential, not UI state, and
+    // rebuilding the tree on every join would be pure noise.
+  }
+}</code></pre>
+<p>
+Compare the two setters directly: <code>theme</code> mutates a local field and
+notifies — a normal <code>ChangeNotifier</code> setter, with the
+early-return-if-unchanged guard repeated on <em>every</em> setter in this file
+(a small but consistent discipline: never rebuild the tree for a no-op write).
+<code>guestToken</code> instead writes straight through to disk via
+<code>identity</code> and explicitly does <em>not</em> call
+<code>notifyListeners()</code> — the comment states why directly: nothing on
+screen needs to rebuild because a credential changed behind the scenes.
+</p>
+
+<details class="try">
+<summary>Try it yourself — before reading it, guess what <code>effectiveServerUrl</code> does and why it's separate from the plain <code>serverUrl</code> getter</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>/// Debug-only override for the game server URL. Empty means "no override
+/// set", in which case [effectiveServerUrl] falls back to
+/// [kDefaultServerUrl]. This is not a user-facing setting in release
+/// builds — see the developer section in the settings sheet, which is
+/// tree-shaken out of release builds via `kDebugMode`.
+String get serverUrl =&gt; _serverUrl;
+
+String get effectiveServerUrl =&gt;
+    (kDebugMode &amp;&amp; _serverUrl.trim().isNotEmpty) ? _serverUrl : kDefaultServerUrl;</code></pre>
+<p>
+<code>serverUrl</code> is the raw override a developer typed into a debug-only
+settings field; <code>effectiveServerUrl</code> is what
+<code>RemoteSession</code> (module 9) actually connects to. The split exists so
+release builds can never accidentally point at a stray debug URL — the override
+is only honoured when <code>kDebugMode</code> is true, a compile-time constant
+that gets tree-shaken out of release builds entirely, per the doc comment.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>kDefaultServerUrl</code> (line 15) is hard-coded to
+<code>'ws://192.168.1.133:8080/ws'</code> — a specific developer's LAN IP
+address baked directly into the shipped source, not a placeholder like
+<code>localhost</code>. Anyone who builds this project without also setting a
+debug override will have their app try to reach a machine on someone else's
+home network. A safer default (<code>localhost</code>, or a build-time
+<code>--dart-define</code>) would fail obviously instead of silently pointing
+at the wrong host.
+</div>
+</div>
+
+<h2 id="identitystore"><code>state/identity_store.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/state/identity_store.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The server needs to recognise the same device across restarts — to resolve a
+<code>POST /v1/auth/device</code> call to the same account, and to let a player
+reclaim a seat after the app was killed mid-game (module 16's
+<code>docs/PERSISTENCE.md</code> covers the server side). This file is the one
+place that identity lives on disk.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A hand-rolled UUID v4 generator instead of the <code>uuid</code> pub
+package</strong> — the file's own comment states the reasoning plainly: "this
+is the only thing the app would use one for, and the whole specification is
+the two bit-twiddles below." Pulling in a dependency for a fifteen-line
+algorithm the project needs exactly once is a real cost/benefit call, made
+explicitly rather than by default.
+</p>
+<p>
+<strong><code>Random.secure()</code>, not the plain <code>Random()</code>,
+generates the device id</strong> — again spelled out directly: "two ids that
+collide would silently merge two games on the server... <code>Random()</code>
+is seeded from the clock, and phones start games at round numbers of
+milliseconds far more often than a uniform distribution would suggest." A
+cryptographically secure generator costs a little more CPU per call (called
+exactly once per install) in exchange for closing a real, if narrow, collision
+risk that a clock-seeded generator has.
+</p>
+<p>
+<strong>Every decode path swallows its own errors and returns
+<code>null</code> instead of throwing</strong> (<code>cachedUser</code>,
+<code>activeGame</code>, <code>pendingAbandoned</code>) — the comment on
+<code>cachedUser</code>: "A profile written by an older build that no longer
+decodes is not worth a crash — the next <code>/v1/me</code> replaces it." This
+mirrors the backend's own persistence philosophy (module 16): storage failures
+degrade gracefully rather than crashing the thing they support. The cost is
+the same one graceful degradation always has — a real bug in the decode path
+looks identical to "an old build's data," silently, with nothing surfaced to
+notice the difference.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>static Future&lt;IdentityStore&gt; open() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    var deviceId = prefs.getString(_kDeviceId);
+    if (deviceId == null || deviceId.isEmpty) {
+      deviceId = _newDeviceId();
+      await prefs.setString(_kDeviceId, deviceId);
+    }
+    ...
+    return IdentityStore._(prefs, deviceId, values);
+  } catch (_) {
+    return IdentityStore.inMemory();
+  }
+}</code></pre>
+<p>
+The device id is minted exactly once — read it if it's already there, mint and
+persist a fresh one if not, and never touch it again afterward (the class doc
+comment: "written exactly once, on first launch, and only ever read
+afterwards"). If <em>anything</em> in that whole block throws — the platform
+denies storage, the plugin isn't available — the fallback isn't a crash, it's
+<code>IdentityStore.inMemory()</code>: the same public API, but nothing behind
+it actually persists. Per its own doc comment: "Losing history is bad; refusing
+to launch the game over it would be worse."
+</p>
+
+<p><strong>Why <code>ActiveGame</code> stores <code>mode</code> as a string
+(lines 249–251):</strong></p>
+<pre><code>/// [mode] is stored as [GameMode.name] rather than the enum itself so this
+/// file does not need to import `net/session.dart` — the caller that
+/// reconstructs a session converts it back with `GameMode.values.byName`.
+class ActiveGame { ... }</code></pre>
+<p>
+This is a dependency-direction decision, not a data-format one: the state
+layer deliberately does not import the net layer, even though the enum itself
+lives there. Storing the enum's plain string name instead keeps that boundary
+intact — the cost is one extra <code>GameMode.values.byName(...)</code>
+conversion at the one call site that reconstructs a session from this record.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness beyond what's already flagged in <code>AppSettings</code> above —
+this file is a careful, well-reasoned example of "storage is best-effort,
+never load-bearing for whether the app runs at all."
+</div>
+</div>
+
+<h2 id="activegamebinding"><code>state/active_game_binding.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/state/active_game_binding.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A player killed by the OS mid-game (not a graceful app close — a real kill,
+task-switched away and never brought back) gets no chance to tell the server
+goodbye. Without a persisted record of "I was at this table, here's my resume
+token," the app has no way to even offer reclaiming that seat on next launch —
+it would just look like a fresh install to the player.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A standalone function that wires a <code>RemoteSession</code>
+(module 9) to <code>AppSettings</code>/<code>IdentityStore</code> from
+outside both, rather than <code>RemoteSession</code> persisting its own resume
+state internally.</strong> This keeps <code>RemoteSession</code> itself
+unaware that <code>IdentityStore</code> exists at all — the net layer doesn't
+import the state layer, mirroring the reverse boundary <code>ActiveGame</code>
+just kept in the other direction. The cost: this wiring only happens where
+something remembers to call it — module 6 showed the one real call site,
+<code>wireActiveGamePersistence(settings, session)</code> in
+<code>home_screen.dart:881</code>, right after constructing a
+<code>RemoteSession</code>.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>void wireActiveGamePersistence(AppSettings settings, RemoteSession session) {
+  String? persistedToken;
+  session.addListener(() {
+    settings.guestToken = session.guestToken;
+
+    final view = session.view;
+    final terminal =
+        session.status == SessionStatus.closed ||
+        session.status == SessionStatus.error ||
+        view?.phase == GamePhase.gameOver;
+    if (terminal) {
+      final stored = settings.identity.activeGame;
+      if (stored != null &amp;&amp;
+          stored.serverUrl == session.serverUrl &amp;&amp;
+          stored.roomCode == session.roomCode) {
+        unawaited(settings.identity.clearActiveGame());
+      }
+      return;
+    }
+
+    final token = session.resumeToken;
+    if (token != null &amp;&amp; token != persistedToken) {
+      persistedToken = token;
+      unawaited(settings.identity.saveActiveGame(ActiveGame(...)));
+    }
+  });
+}</code></pre>
+<p>
+This is a listener attached once, at session creation, that watches every
+future change and does two things: keeps <code>guestToken</code> current (so
+the player's identity survives across future tables), and keeps the "table I
+could reclaim" record current — writing a fresh one whenever a new
+<code>resumeToken</code> is issued (join, or every reconnect), and clearing it
+the moment the session reaches a genuinely final state. The
+<code>stored.serverUrl == session.serverUrl && stored.roomCode == session.roomCode</code>
+check before clearing matters: it stops <em>this</em> session from erasing a
+record that belongs to some <em>other</em> table, in case more than one
+session has existed in the process's lifetime.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+Because this is opt-in wiring rather than something <code>RemoteSession</code>
+does automatically in its own constructor, any future code path that builds a
+<code>RemoteSession</code> without also calling
+<code>wireActiveGamePersistence</code> would silently lose the "reclaim my
+seat after a kill" feature for that path — with nothing in the type system to
+catch the omission, since <code>RemoteSession</code> works perfectly well
+without it, just without persistence. A safer version would take this wiring
+inside <code>RemoteSession</code>'s own constructor (accepting an optional
+<code>IdentityStore</code>), making it opt-out instead of opt-in.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>AppSettings.guestToken</code>'s setter deliberately skip <code>notifyListeners()</code> while every other setter calls it?</summary>
+<div class="answer">
+Because a credential changing isn't something any widget needs to rebuild in
+response to — it's persisted state, not UI state. Calling
+<code>notifyListeners()</code> there would rebuild the whole
+<code>SettingsScope</code> subtree for no visible benefit, on every join.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>IdentityStore</code> use <code>Random.secure()</code> instead of the default <code>Random()</code> for the device id, when the id doesn't need to be unguessable, only unique?</summary>
+<div class="answer">
+Because the default <code>Random()</code> is seeded from the system clock, and
+phones tend to launch an app for the first time at round numbers of
+milliseconds — a plain clock-seeded generator has a real, if narrow, chance of
+producing colliding ids across different devices, which would silently merge
+two players' games server-side. <code>Random.secure()</code> avoids that
+regardless of when the device happens to boot.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>ActiveGame</code> store <code>GameMode</code> as a plain string instead of the enum value itself?</summary>
+<div class="answer">
+So <code>identity_store.dart</code> (the state layer) never has to import
+<code>net/session.dart</code> (the net layer) just to reference the enum type
+— keeping that dependency direction one-way. The cost is a
+<code>GameMode.values.byName(...)</code> conversion at the point the record is
+later reconstructed into a real session.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>wireActiveGamePersistence</code> lives outside <code>RemoteSession</code> entirely, as a function the caller must remember to invoke. What does that buy, and what's the real risk?</summary>
+<div class="answer">
+It buys a clean boundary: <code>RemoteSession</code> never needs to know
+<code>IdentityStore</code> exists. The real risk is that this wiring is opt-in
+— any future code path that constructs a <code>RemoteSession</code> without
+also calling this function will silently work fine except for losing
+seat-reclaim-after-a-kill, with no compiler error or test failure pointing at
+the gap.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="06-core-ui.html">← Module 6: Core Table UI</a>
+<a href="08-audio.html">Module 8: Audio →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

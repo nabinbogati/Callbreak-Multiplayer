@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8. Audio — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m08">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 8 of 20</p>
+<h1>Audio</h1>
+<p class="lede">
+A card game with no sound reads as broken the moment you play it. This module
+builds <code>audio/audio_controller.dart</code> — background music plus
+one-shot sound effects (card thrown, trick collected, trump played, the turn
+clock's tick), triggered from the table screen you built in module 6.
+</p>
+
+<h2 id="audiocontroller"><code>audio/audio_controller.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/audio/audio_controller.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Without this file, every place that wants to make a sound (a card landing, a
+trick won) would have to manage its own audio player and its own error
+handling for "what if the audio plugin isn't available on this platform." This
+file centralises both: one process-wide controller, and one guarantee, stated
+in its own doc comment — "Every underlying player call is guarded so a missing
+or failing audio plugin can never crash the game."
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A process-wide singleton (<code>static AudioController? instance</code>),
+initialised once from <code>main.dart</code>, instead of an
+<code>InheritedWidget</code>-scoped instance like <code>AppSettings</code>.</strong>
+Sound has no meaningful "scope" the way settings do — there is exactly one
+soundtrack for the whole app, so a global reachable from anywhere
+(<code>AudioController.instance?.playShot()</code>) is simpler than threading it
+through the widget tree. The cost is the usual one for a singleton: nothing in
+the type system stops code from calling <code>AudioController.instance</code>
+before <code>init()</code> has run — every call site has to null-check it, which
+you can see it already does (<code>AudioController.instance?.stopDeal()</code>
+in module 6's <code>table_screen.dart</code>).
+</p>
+<p>
+<strong>Sound is triggered imperatively by whoever has the relevant context
+(<code>table_screen.dart</code>'s event listener, module 6), not by
+<code>AudioController</code> itself subscribing to the game's event
+stream.</strong> Some of that context isn't available to
+<code>AudioController</code> at all — deciding whether a play deserves the
+"trump" sound needs to know the trick's led suit, which lives in UI-adjacent
+state, not in a bare <code>GameEvent</code>. Exposing a small imperative API
+(<code>playShot()</code>, <code>playTrump()</code>, <code>startTick()</code>...)
+keeps this file from needing to understand game rules at all — the cost is that
+every place sound should play has to remember to call it; nothing enforces that
+a new event type gets a matching sound.
+</p>
+<p>
+<strong>Separate, dedicated <code>AudioPlayer</code> instances for looping
+sounds (<code>_musicPlayer</code>, <code>_tickPlayer</code>, <code>_dealPlayer</code>),
+but a brand-new, disposable one per call for one-shot sounds
+(<code>_oneShot</code>).</strong> A loop needs a persistent player to start,
+stop, and resume; a one-shot card sound needs to be able to overlap itself —
+two cards played in quick succession should both make a sound, which a single
+shared, reused player couldn't do without cutting the first one off. The cost
+is real object churn: every single card play constructs and disposes a whole
+new <code>AudioPlayer</code>.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>The graceful-degradation pattern, everywhere in this file:</strong></p>
+<pre><code>Future&lt;void&gt; _syncMusic() async {
+  try {
+    if (_settings.musicEnabled) {
+      final player = _musicPlayer ??= AudioPlayer()..setReleaseMode(ReleaseMode.loop);
+      await player.play(_bgMusic, volume: _musicVolume);
+    } else {
+      await _musicPlayer?.stop();
+    }
+  } catch (_) {
+    // Audio unavailable (tests, headless platforms) — stay silent.
+  }
+}</code></pre>
+<p>
+This exact shape — try the real audio call, catch anything, do nothing — repeats
+in nearly every method in this file (<code>_pauseMusic</code>,
+<code>_startDeal</code>, <code>_startTick</code>, <code>_oneShot</code>). It's
+the same principle module 7's <code>IdentityStore</code> applied to storage,
+now applied to audio: a feature that enhances the experience must never be
+allowed to break the experience it's enhancing. A test running headless, or a
+platform with no audio output, plays the whole game in total, correct silence
+instead of crashing.
+</p>
+
+<p><strong>App lifecycle: pausing music when the app leaves the screen
+(lines 82–101):</strong></p>
+<pre><code>void didChangeAppLifecycleState(AppLifecycleState state) {
+  switch (state) {
+    case AppLifecycleState.hidden:
+    case AppLifecycleState.paused:
+    case AppLifecycleState.detached:
+      if (_musicPausedForLifecycle) return;
+      _musicPausedForLifecycle = true;
+      unawaited(_pauseMusic());
+    case AppLifecycleState.resumed:
+      if (!_musicPausedForLifecycle) return;
+      _musicPausedForLifecycle = false;
+      unawaited(_resumeMusic());
+    case AppLifecycleState.inactive:
+      break;
+  }
+}</code></pre>
+<p>
+<code>_musicPausedForLifecycle</code> is doing real work here — it distinguishes
+"paused because the app went to the background" from "paused because the
+player turned music off in settings." Without that flag, coming back to the
+foreground would blindly try to resume music even for a player who had it
+turned off, per the comment: "Music the player never enabled is never
+touched."
+</p>
+
+<details class="try">
+<summary>Try it yourself — why does <code>_startDeal</code> set <code>playbackRate</code> to <code>3.0</code> before looping the deal sound?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>/// The deal card sound is a short single swish; looped at its natural speed
+/// it lags a 55ms-per-card deal, so it is played faster to keep time.
+static const _dealRate = 3.0;
+
+Future&lt;void&gt; _startDeal() async {
+  if (!_settings.sfxEnabled) return;
+  try {
+    final player = _dealPlayer ??= AudioPlayer()..setReleaseMode(ReleaseMode.loop);
+    await player.setPlaybackRate(_dealRate);
+    await player.play(_deal, volume: _dealVolume, mode: PlayerMode.lowLatency);
+  } catch (_) { ... }
+}</code></pre>
+<p>
+Thirteen cards land roughly every 55ms during the dealing flourish (module 6's
+<code>_DealOverlay</code>) — much faster than one playback of the swish sample
+takes to finish. Looping it at normal speed would visibly lag behind the
+cards actually landing on screen; playing it 3× faster keeps the sound in
+rhythm with what the eye is watching, a small but real audio/visual sync
+detail.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+Every <code>catch (_)</code> in this file (e.g. lines 77–79, 106–108, 141–144,
+186–189, 207–213) swallows <em>any</em> exception identically — a genuinely
+unavailable audio plugin looks exactly the same as a typo'd asset path or a
+real bug in this code, with zero logging even in debug builds. A developer who
+breaks something here (renames an asset, say) gets total silence with no
+signal that anything is wrong, rather than a caught-but-visible warning. A
+minimal fix: log via <code>debugPrint</code> inside the catch blocks (a no-op
+in release builds) so a real bug is at least visible during development
+without changing the "never crash" guarantee for production.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why is <code>AudioController</code> a process-wide singleton instead of scoped through the widget tree the way <code>AppSettings</code> is?</summary>
+<div class="answer">
+There's exactly one soundtrack for the whole app — no widget needs a
+differently-scoped audio controller the way different screens might want
+different settings. A reachable-from-anywhere global is simpler for something
+with genuinely global scope, at the cost of every call site needing a
+null-check for the window before <code>init()</code> has run.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>_oneShot</code> create a brand-new <code>AudioPlayer</code> for every single sound, disposing it right after, instead of reusing one player for all one-shot sounds?</summary>
+<div class="answer">
+So overlapping sounds (two cards played in quick succession, a trump sound
+alongside a card shot) can each play fully without one cutting the other off.
+A single reused player could only ever play one sound at a time.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>What real failure does the every-call-site <code>try</code>/<code>catch</code>-and-silently-continue pattern in this file protect against, and what does it cost when something actually goes wrong here that isn't "audio unavailable"?</summary>
+<div class="answer">
+It protects the whole game from crashing over a missing plugin, a headless
+test environment, or unsupported platform audio — sound is treated as
+enhancement, never a dependency. The cost is that a real bug in this file
+(bad asset path, wrong parameters) fails identically to "no audio hardware" —
+silently, with no log to tell the two apart during development.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="07-app-state.html">← Module 7: Persistent App State</a>
+<a href="09-rest-upload.html">Module 9: REST Client & Upload Queue →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

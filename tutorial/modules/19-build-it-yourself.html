@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19. Build It Yourself — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m19">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part IV — Finish · Module 19 of 20</p>
+<h1>Build It Yourself</h1>
+<p class="lede">
+Eighteen modules read the real source and explained why every file exists
+the way it does. This one asks you to close the tab and rebuild it — or a
+scoped, honest slice of it — from memory and first principles. No code is
+given here. What follows is a checklist in build order, and a collapsible
+hint for each item that nudges you toward the decision, not the
+implementation.
+</p>
+
+<h2>How to use this module</h2>
+<p>
+Pick one track below, not all three. Rebuilding the entire project solo is
+a multi-week undertaking even having just read how it works — that's not
+a failure of this course, it's an honest reflection of how much real
+software this actually is. A track that gets you a working, playable
+slice end-to-end teaches you more than an abandoned attempt at everything.
+</p>
+<ul>
+<li><strong>Track A — Solo engine, no network (modules 1–3).</strong> A
+pure Dart (or any language) card engine, playable against three bots in a
+terminal or the simplest UI you can manage. No Flutter widgets required if
+you'd rather prove the engine works first.</li>
+<li><strong>Track B — Full offline Flutter app (modules 1–8).</strong> A
+real, playable app: engine, bot, UI, settings, audio. No networking at
+all — this is exactly what <code>LocalSession</code> already proves is a
+complete, standalone product.</li>
+<li><strong>Track C — Minimal Go server (modules 11–15).</strong> Skip the
+Flutter client entirely. Build a Go server that accepts a WebSocket
+connection, lets a client join a room, deals a hand, and enforces turns —
+proven with a hand-written test client or even <code>websocat</code>, not a
+real app.</li>
+</ul>
+<p>
+Whichever track, hold yourself to the same standard this course modeled:
+before you write a non-trivial function, ask <em>why this approach and not
+an obvious alternative</em> — that question, asked honestly, is most of
+what separates code that works from code you actually understand.
+</p>
+
+<h2 id="track-a">Track A checklist — the engine (modules 1–3)</h2>
+
+<ul class="checklist">
+<li><label><input type="checkbox" data-check-id="t19-item-1"> A card type with a stable, compact wire id (something you could
+send over a network or store in a log line) and a full 52-card deck.
+</label><details><summary>Hint</summary>Module 1 covers two real design decisions
+here: how equality/identity works for a card (does your language give you
+this for free, or do you need to define it?), and why the id format
+matters even before you have any networking at all — think about
+debuggability and logging, not just wire format.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-2"> A "legal moves" function that takes a hand and the current trick and
+returns what's playable — no game state needed beyond those two inputs.
+</label><details><summary>Hint</summary>There are exactly three cases in Call
+Break's follow-suit rule, and the trickiest one isn't "must follow
+suit" — it's what happens when a player already-trumped a trick and a later
+player is void in the led suit too. Get the "heading" rule (must beat the
+best card of the led suit if you can) right before worrying about
+trump.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-3"> A trick-winner function, and a way to ask "would this card win if
+played right now" without duplicating the trick-winner logic.
+</label><details><summary>Hint</summary>Module 1's real answer to the second part
+is a specific, reusable trick: construct a hypothetical trick with the
+candidate card appended, using a sentinel value for "seat," and ask your
+real trick-winner function who it thinks won.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-4"> A bidding-estimate heuristic — doesn't need to be sophisticated, just
+consistent, since a bot and a "suggest my bid" button both need to agree on
+what a hand is worth.
+</label><details><summary>Hint</summary>Resist the urge to make this perfect. The
+real one weighs top trumps heavily, discounts an unprotected high card in a
+short suit, and separately estimates "ruffing value" from voids and
+singletons — but any consistent heuristic that a bot can use to bid
+reasonably is enough for this checklist item.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-5"> A game state machine with an explicit phase (lobby → bidding →
+playing → hand-over → game-over), and exactly two ways to mutate it: place
+a bid, play a card.
+</label><details><summary>Hint</summary>The single most important design question
+here: what does your mutation method do when the move is illegal or out of
+turn? Module 2's answer — return a signal, change nothing — is deliberately
+boring. Resist building rollback logic; make illegal moves impossible to
+have partially applied in the first place.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-6"> A "redacted view" function — the <em>only</em> way state leaves your
+game object, producing a seat's own cards in full and every other seat
+reduced to a count.
+</label><details><summary>Hint</summary>Before you write this function, ask
+yourself: is there any other path by which a caller could reach another
+seat's cards? If your game object exposes its raw hand array publicly, you
+have not actually built this boundary — you've built a suggestion.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-7"> A bot brain that can bid and play a legal card, difficulty-adjustable
+by at least one knob (noise, blunder rate, or lookahead depth — your
+choice).
+</label><details><summary>Hint</summary>The real bot never breaks a legal-move
+guarantee even at its noisiest setting — noise perturbs which legal move it
+picks, never whether the move is legal. Keep that invariant no matter how
+you implement difficulty.</details></li>
+</ul>
+
+<h2 id="track-b">Track B checklist — the offline app (modules 4–8)</h2>
+<p class="lede" style="margin-top:-0.4em">Everything in Track A, plus:</p>
+
+<ul class="checklist">
+<li><label><input type="checkbox" data-check-id="t19-item-8"> A session abstraction your UI talks to, with at least one real
+implementation (local/offline) — designed so a second implementation
+(networked) could be added later without changing the UI.
+</label><details><summary>Hint</summary>Module 5's real test for whether this
+abstraction is right: could you write the UI against it before the local
+implementation exists at all, using a fake? If the interface leaks anything
+specific to "runs on this device," it's not yet abstract enough.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-9"> A self-scheduling game loop: after any state change, decide what
+happens next (a bot's turn? nothing, wait for a human?) and schedule it —
+without a UI-driven loop or a busy-poll.
+</label><details><summary>Hint</summary>The real one uses one self-cancelling,
+self-rescheduling timer, not a fixed tick. Every state change re-decides
+what the next scheduled action should be, and cancels whatever was
+previously scheduled first.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-10"> A hand of cards rendered as an interactive fan, with drag-to-play or
+tap-to-play — your choice — and legal/illegal cards visually distinct.
+</label><details><summary>Hint</summary>The genuinely hard part isn't the visuals,
+it's the gesture-state machine: what happens if a drag starts, then the
+underlying legal-moves set changes mid-drag (the player bid, the trick
+cleared)? Decide on that behavior deliberately, don't let it fall out of
+whatever code happens to run.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-11"> Settings that persist across a restart, using whatever the most
+boring, standard local-storage mechanism is for your platform.
+</label><details><summary>Hint</summary>Module 7's real lesson here isn't the
+storage mechanism, it's the failure mode: what does your app do the very
+first time it runs, with nothing stored yet? And what does it do if the
+storage read itself throws? Neither should be a crash.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-12"> Sound effects wired to game events, with app-lifecycle awareness (do
+not keep playing music if the app is backgrounded).
+</label><details><summary>Hint</summary>Decide your failure policy for "the audio
+plugin isn't available on this platform/simulator" before you write a
+single <code>play()</code> call, and apply it consistently everywhere
+rather than an ad hoc try/catch per call site.</details></li>
+</ul>
+
+<h2 id="track-c">Track C checklist — a minimal Go server (modules 11–15)</h2>
+
+<ul class="checklist">
+<li><label><input type="checkbox" data-check-id="t19-item-13"> A typed configuration loader that reads environment variables with
+sane defaults, and fails startup only for the one or two settings that are
+genuinely unsafe to guess.
+</label><details><summary>Hint</summary>Pick your one unsafe-to-default setting
+deliberately (module 11's is the token-signing secret) — the exercise here
+is drawing that line honestly, not defaulting everything or nothing.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-14"> A JSON frame format for client↔server messages, with a decode
+function that validates everything before any game logic ever sees a
+frame.
+</label><details><summary>Hint</summary>Decide, and write down for yourself, what
+"absent" versus "present but zero" means for at least one field (a bid of
+0 versus no bid). If your language's JSON decoding can't distinguish them
+by default, that's the actual design problem this item is testing.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-15"> A room actor: one single-threaded owner of a table's state, reachable
+only through a well-defined set of messages — no shared-memory access from
+outside.
+</label><details><summary>Hint</summary>The real test of whether you've actually
+built this: could two goroutines (or threads, or async tasks) ever call a
+mutating method on the same table's state at the same time in your design?
+If the honest answer is "no, because there's only ever one owner," you've
+built it. If it's "no, because I remembered to lock," you've built
+something else.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-16"> A WebSocket handler that authenticates a guest identity, joins a
+player to a room, and forwards subsequent frames to that room's actor.
+</label><details><summary>Hint</summary>Decide what happens to a frame that arrives
+before a join, and a frame that arrives after the socket has been told to
+close but before the socket has actually closed. Both are real states your
+handler will be in.</details></li>
+
+<li><label><input type="checkbox" data-check-id="t19-item-17"> A signed, stateless token format for guest identity — no database
+required to verify one.
+</label><details><summary>Hint</summary>Use a constant-time comparison for the
+signature check, and write yourself a one-sentence justification for why —
+if you can't state the actual attack it prevents, look up timing side-
+channels before moving on.</details></li>
+</ul>
+
+<h2>When you're stuck</h2>
+<p>
+Getting stuck on a specific decision — not a syntax error, an actual "I
+don't know which way to go here" — is the point of this module, not a sign
+you're doing it wrong. Before re-reading the matching module in this
+course, try writing down, in one sentence, the trade-off you're actually
+weighing. Often the act of naming both sides is enough to decide. If it
+isn't, go back and reread that module's <strong>Decision</strong> section
+specifically — not the code, the reasoning — and see whether the real
+project's trade-off matches the one you'd already identified.
+</p>
+
+<h2>Done, or ready to stop here?</h2>
+<p>
+There's no checklist completion tracked for this module — the honest
+measure of whether Track A, B, or C succeeded is whether what you built
+actually runs and plays a hand of Call Break. If it does, you've rebuilt,
+from first principles, the same decisions eighteen modules of real
+production code arrived at. The last module collects everything this
+course found that the real project still hasn't gotten right — worth
+reading whether or not you attempt this one.
+</p>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="18-observability-scaling.html">← Module 18: Observability, Scaling & Deploy</a>
+<a href="20-roadmap.html">Module 20: Roadmap: Prototype → Production →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13. Room Actor & Matchmaking — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m13">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 13 of 20</p>
+<h1>Room Actor & Matchmaking</h1>
+<p class="lede">
+This is the heart of the server: one goroutine per table, running the
+<code>engine.Game</code> from module 12, pacing it the way the Flutter
+client already paces its own offline and LAN tables, and handling everything
+a real network throws at it — drops, reconnects, timeouts — that an offline
+game never has to. It's the biggest package in the backend (about 3,400
+lines across <code>room</code> and <code>match</code>), so this module walks
+it file by file, grouped around one idea: <strong>a table is a goroutine you
+talk to with messages, never a struct you call methods on directly.</strong>
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">config, protocol (11) · engine (12) — the rulebook and the wire format</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">room, match ◀ you are here</text>
+  <text x="32" y="98" fill="#9db0a4">One goroutine per table owns one *engine.Game — no locks, no shared state</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">ws (module 14) — the only thing that ever calls into a Room</text>
+  <text x="32" y="154" fill="#9db0a4">db (module 16) — what Recorder writes to, off the hot path</text>
+  <text x="32" y="172" fill="#9db0a4">auth (module 15) — GuestID identity a seat is keyed on</text>
+</svg>
+</div>
+
+<h2 id="roomgo"><code>room/room.go</code> — the actor loop</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/room.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Somebody has to own a table's mutable state — the seats, the engine, the
+pending timers — and decide, once and for all, that nothing outside can
+touch it directly. This file is that somebody: it starts one goroutine per
+table and gives it exactly one door in, an inbox channel.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Actor model with message-passing, not a struct guarded by a mutex.</strong>
+The package comment states the payoff directly: "Each table is one goroutine
+that exclusively owns its state ... Nothing outside touches that state —
+callers post messages to an inbox and the actor applies them in order. That
+is what makes turn ordering trivially correct and removes every lock from
+the hot path." The mutex alternative is completely workable — lock, mutate,
+unlock, for every one of dozens of operations — but it pushes the burden of
+"did I lock everything I needed to, and in the right order" onto every
+future contributor touching this code. The actor model instead makes the
+question moot: there is only ever one goroutine that could touch this state,
+so there is nothing to race. The cost is indirection — every operation from
+outside becomes "build a message, post it, maybe wait on a reply channel"
+instead of a direct method call — visible in <code>message.go</code> below.
+</p>
+<p>
+<strong>A panic costs one table, not the process.</strong>
+</p>
+<pre><code>defer func() {
+	if p := recover(); p != nil {
+		r.log.Error("room panicked", "panic", p)
+		for i := range r.seats {
+			if c := r.seats[i].client; c != nil {
+				c.Send(protocol.Encode(protocol.NewError(
+					protocol.ErrInternal, "The table hit an internal error.", true)))
+				c.Close("internal", "internal error")
+			}
+		}
+	}
+}()</code></pre>
+<p>
+Every table's actor goroutine has its own <code>recover()</code> at the top
+of <code>run</code>. Without it, a single bug — a nil pointer, an index out
+of range, anything — in one table's game logic would crash the entire
+process and take down every other table on the node with it. The
+alternative, letting the panic propagate, is strictly worse for a
+multi-tenant server: one player's edge case should never be able to end
+everyone else's game. The trade-off is that the four players at the
+panicking table simply lose their game — recovering here means "give up on
+this table cleanly," not "repair the state and keep going," because nobody
+can safely reason about what state a goroutine was in when it panicked
+partway through a mutation.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>for {
+	r.armTimer(timer)
+	select {
+	case <-ctx.Done():
+		r.shutdown("server_shutdown")
+		return
+	case <-r.done:
+		r.shutdown("closed")
+		return
+	case <-timer.C:
+		if r.tick() { return }
+	case msg := <-r.inbox:
+		r.handle(msg)
+	}
+}</code></pre>
+<p>
+The entire actor is this one loop. Every iteration re-arms a single timer to
+the table's next pending deadline (module continues in
+<code>deadlines.go</code> below), then blocks on a <code>select</code>
+between four things: the server shutting down, this specific room being
+told to close, that timer firing, or a message arriving. Because it's a
+single <code>select</code>, there is no way for two of these to be handled
+"at the same time" — Go's runtime picks exactly one ready case per
+iteration, which is what keeps ordering trivially correct.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<strong>No test exercises this file, or the actor loop it defines, at all.</strong>
+Of the ten <code>.go</code> files in <code>backend/internal/room/</code>,
+only two have a matching <code>_test.go</code>
+(<code>recorder_test.go</code>, <code>status_test.go</code>) — there is no
+<code>room_test.go</code>, no test that starts a real actor and drives it
+through <code>Join</code>/<code>Action</code>/a timeout tick. This matters
+more here than almost anywhere else in the codebase: this file's panic
+recovery, its shutdown ordering, and its single-timer arming are exactly the
+kind of concurrency-adjacent logic that's easy to get subtly wrong and hard
+to verify by inspection alone. See this module's other improvement notes for
+a concrete failure mode this gap would have caught.
+</div>
+</div>
+
+<h2 id="messagego"><code>room/message.go</code> — talking to the actor</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/message.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The actor model in <code>room.go</code> needs a concrete "door in" — a
+closed set of things a caller is allowed to ask a table to do, each carrying
+exactly the data that request needs. This file defines that set and the
+public methods (<code>Join</code>, <code>Action</code>,
+<code>Disconnected</code>, ...) that turn a normal-looking method call into
+a message posted to the inbox.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A marker-interface message type, and a reply channel for anything
+that needs an answer.</strong>
+</p>
+<pre><code>type message interface{ isRoomMessage() }
+
+type joinMsg struct {
+	req   JoinRequest
+	reply chan JoinResult
+}
+
+func (r *Room) Join(req JoinRequest) JoinResult {
+	reply := make(chan JoinResult, 1)
+	if !r.post(joinMsg{req: req, reply: reply}) {
+		return JoinResult{Err: protocol.ErrRoomNotFound, ...}
+	}
+	select {
+	case res := <-reply:
+		return res
+	case <-r.closed:
+		return JoinResult{Err: protocol.ErrRoomNotFound, ...}
+	}
+}</code></pre>
+<p>
+<code>Join</code> looks like an ordinary synchronous method from the
+caller's side — call it, get a <code>JoinResult</code> back — but internally
+it's fully asynchronous: a message goes into the inbox, and the calling
+goroutine blocks on a buffered, single-use reply channel until the actor
+gets around to it. This is the standard Go answer to "I need a synchronous
+answer from an asynchronous worker," and it's what lets the WebSocket
+handler (module 14) treat a room almost like a normal object despite it
+being a separate goroutine underneath. Messages that need no answer
+(<code>Action</code>, <code>Disconnected</code>) skip the reply channel
+entirely and just post-and-forget.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p>
+The dispatch itself lives in <code>handle</code>, a single type switch over
+every message variant, each delegating to an <code>apply*</code> function
+defined in the file that owns that concern —
+<code>applyJoin</code>/<code>applyLeave</code> in <code>lobby.go</code>,
+<code>applyBid</code>/<code>applyPlay</code> in <code>play.go</code>. One
+detail worth noticing: <code>statusMsg</code> (module's <code>status.go</code>)
+is special-cased to skip the "this counts as activity" bookkeeping every
+other message triggers —
+</p>
+<pre><code>func (r *Room) handle(m message) {
+	if msg, ok := m.(statusMsg); ok {
+		msg.reply <- r.buildStatus()
+		return
+	}
+	r.lastActivity = time.Now()
+	r.idleAt = r.lastActivity.Add(r.pacing.IdleTTL)
+	switch msg := m.(type) { ... }
+}</code></pre>
+<p>
+so an admin dashboard polling a table's status every few seconds cannot
+accidentally keep an abandoned table alive past its idle collection —
+reading a table's state is deliberately not treated the same as a player
+doing something at it.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found. Every message-posting method
+(<code>post</code>) already handles the room-is-gone case by selecting on
+<code>r.closed</code> alongside the send, so a caller can never block
+forever posting to a room whose actor has already exited.
+</div>
+</div>
+
+<h2 id="deadlinesgo"><code>room/deadlines.go</code> — one timer, several clocks</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/deadlines.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A table has up to five different things that might need to happen on their
+own, with no player input: clear a finished trick, auto-play a bot or
+timed-out human's turn, deal after a lobby countdown, advance past a
+scoreboard nobody dismissed in time, or get collected once it's sat empty
+too long. This file is what turns those five concerns into the single timer
+<code>room.go</code>'s loop actually waits on.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>One <code>time.Timer</code>, re-armed every loop iteration to the
+earliest of several deadline fields — not five separate timers or
+goroutines.</strong>
+</p>
+<pre><code>func (r *Room) nextDeadline() (time.Time, bool) {
+	var best time.Time
+	consider := func(t time.Time) {
+		if t.IsZero() { return }
+		if best.IsZero() || t.Before(best) { best = t }
+	}
+	consider(r.autoAt)
+	consider(r.handAdvanceAt)
+	consider(r.countdownAt)
+	consider(r.idleAt)
+	for i := range r.seats { consider(r.seats[i].graceUntil) }
+	return best, !best.IsZero()
+}</code></pre>
+<p>
+Five (really eight, counting one grace window per seat) independent
+deadlines collapse into one comparison every time the actor loop's
+<code>select</code> is re-entered. The alternative — a
+<code>time.Timer</code> or ticking goroutine per concern — would need its
+own cancellation and reset logic scattered across every place that changes
+one of these deadlines, and would turn the single-<code>select</code>
+simplicity of <code>room.go</code>'s loop into a multi-way fan-in. Because
+<code>armTimer</code> runs unconditionally every iteration, a deadline
+changed by handling one message is automatically picked up on the very next
+loop pass — there's no separate "don't forget to reset the timer" step at
+every call site that mutates a deadline field.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (r *Room) tick() bool {
+	now := time.Now()
+	if !r.idleAt.IsZero() && !now.Before(r.idleAt) {
+		if r.occupiedHumanSeats() == 0 {
+			r.shutdown("idle")
+			return true
+		}
+		r.idleAt = now.Add(r.pacing.IdleTTL)
+	}
+	for i := range r.seats {
+		s := &r.seats[i]
+		if s.graceUntil.IsZero() || now.Before(s.graceUntil) { continue }
+		s.graceUntil = time.Time{}
+		r.expireSeat(i)
+	}
+	if !r.countdownAt.IsZero() && !now.Before(r.countdownAt) {
+		r.countdownAt = time.Time{}
+		r.beginGame()
+		return false
+	}
+	if !r.handAdvanceAt.IsZero() && !now.Before(r.handAdvanceAt) {
+		r.handAdvanceAt = time.Time{}
+		r.advanceHand()
+		return false
+	}
+	if !r.autoAt.IsZero() && !now.Before(r.autoAt) {
+		kind, seat := r.autoKind, r.autoSeat
+		r.clearAuto()
+		r.runAuto(kind, seat)
+	}
+	return false
+}</code></pre>
+<p>
+<code>tick()</code> fires once the timer expires and checks every deadline
+in priority order — idle collection first (it's a whole-room decision), then
+per-seat grace expiry, then countdown, hand-advance, and finally the turn
+clock. Each branch clears the specific deadline it acted on before doing
+anything else, which is what prevents the same deadline firing twice if
+<code>tick</code> is somehow re-entered before the next
+<code>armTimer</code>. Notice <code>autoSeat</code> is captured into a local
+before <code>clearAuto()</code> runs — the seat the deadline was scheduled
+for is fixed at the moment it fires, so a turn that moved on in between
+can't be acted on by a stale reference (guarded again, defensively, inside
+<code>runAuto</code> itself).
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+Same test gap as <code>room.go</code>: this file's priority ordering (idle,
+then grace, then countdown, then hand-advance, then turn clock) is exactly
+the kind of thing an ordering bug could silently break — for instance, two
+deadlines landing in the same tick with the wrong branch executing first —
+and there is no test in the package that drives <code>tick()</code>
+directly with contrived deadline combinations.
+</div>
+</div>
+
+<h2 id="hubgo"><code>room/hub.go</code> — the table registry</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/hub.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Something has to know which room codes exist on this node, hand out fresh
+ones, and clean up after a table closes. <code>Hub</code> is that registry —
+the map every incoming join has to be resolved against before a
+<code>Room</code> actor is even in the picture.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The registry's lock is held only across a map lookup or insert,
+never across game logic.</strong> The type's own comment: "Its lock is held
+only long enough to look up or insert a room pointer — never across game
+logic, which lives entirely inside the room actors. That keeps the map from
+becoming a global bottleneck as table count grows." This is the map-of-actors
+pattern working as intended: <code>Hub.mu</code> only ever protects "does
+this room exist," never "what is this room doing," so lock contention stays
+flat regardless of how much is happening inside any individual table.
+</p>
+<p>
+<strong>A second, separate lock (<code>activeMu</code>) for a completely
+different concern — which table a player currently holds a live seat at.</strong>
+The comment explains why it isn't folded into the room map's own lock: "it
+is written from inside room actor goroutines (via OnSeated/OnVacated), not
+just from Hub's own lookup/insert path." A single lock covering both the
+room map and this cross-actor bookkeeping would force every table's
+actor-goroutine write into contention with every other table's lookup —
+splitting them keeps the two concerns from serializing each other for no
+reason.
+</p>
+<p>
+<strong>Room codes exclude visually ambiguous characters.</strong>
+<code>RoomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"</code> — no
+<code>I</code>, <code>O</code>, <code>0</code>, or <code>1</code>. The
+comment ties it to a real, concrete usability need: "the characters people
+misread when a code is spoken aloud" — matching the exact alphabet the
+Flutter join sheet already generates codes from (module 6/9), so a code one
+player reads out loud over voice chat is one the others can actually type in
+without ambiguity.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (h *Hub) CreateUnique(mode protocol.Mode, auto AutoStart, totalHands int, deal engine.DealConfig) (*Room, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		id := NewRoomCode()
+		h.mu.Lock()
+		if _, taken := h.rooms[id]; taken {
+			h.mu.Unlock()
+			continue
+		}
+		...
+	}
+	return nil, errors.New("room: could not find a free room code")
+}</code></pre>
+<p>
+Quickplay tables (opened by the matchmaker below) get a randomly generated
+code nobody types in, so collisions are handled by simply retrying with a
+fresh one — up to 32 times before giving up outright, on the reasoning
+(from the comment) that "32 collisions in a row means the code space is
+saturated, not that we got unlucky."
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The room-code space is 32<sup>4</sup> ≈ 1.05 million codes, and
+<code>MAX_ROOMS</code> defaults to 50,000 (module 11). By the birthday
+paradox, collision probability rises faster than table count alone suggests
+— at a few thousand simultaneously live tables, <code>CreateUnique</code>
+would start needing multiple attempts noticeably more often, and if a
+deployment ever ran close to its configured <code>MAX_ROOMS</code> ceiling,
+the fixed 32-attempt cap becomes a real risk of <code>CreateUnique</code>
+failing outright (returning <code>ErrCapacity</code> to a quickplay player)
+well before the table count actually reaches capacity. The fix is cheap —
+either lengthen the code for quickplay's internally-generated rooms
+specifically (private-table codes, which players type, are a separate
+concern and should stay short), or raise the retry cap — but nothing in this
+file currently measures or logs how often a retry is needed, so the problem
+would be invisible until players started seeing capacity errors on a
+half-full server.
+</div>
+</div>
+
+<h2 id="lobbygo"><code>room/lobby.go</code> — joining and leaving</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/lobby.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every player who reaches a table — a fresh join, a reconnect, a player
+claiming a specific seat via a resume token — has to be resolved to exactly
+one seat, and every player who leaves has to be handled without breaking the
+table for whoever remains. This file is the whole lifecycle of a seat.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Join resolution is a strict three-tier priority, checked in this
+exact order:</strong> a verified resume-token claim (works even mid-game),
+then "is this same player already sitting somewhere at this table" (a
+reconnect racing the old socket's close), and only then a fresh seat
+allocation.
+</p>
+<pre><code>func (r *Room) applyJoin(req JoinRequest) JoinResult {
+	if seat, ok := r.resumeSeat(req); ok {
+		return r.attach(seat, req, true)
+	}
+	if seat, ok := r.seatOfPlayer(req.Player); ok {
+		return r.attach(seat, req, true)
+	}
+	if r.started {
+		return JoinResult{Err: protocol.ErrGameStarted, ...}
+	}
+	seat, ok := r.allocateSeat(req.Seat)
+	...
+}</code></pre>
+<p>
+Getting this order wrong would be a real, player-visible bug: checking
+"is the game started" before the resume-token check, for instance, would
+lock a legitimately reconnecting player out of a game they were already
+seated in, just because the table had since dealt. Ordering the checks this
+way means a verified claim on a seat always wins over the generic "is this
+table still joinable" rule.
+</p>
+<p>
+<strong>Only one bot-difficulty setting per table, not one per bot seat.</strong>
+</p>
+<pre><code>func (r *Room) tableDifficulty() engine.Difficulty {
+	for i := range r.seats {
+		if r.seats[i].isHumanSeat() && r.seats[i].difficulty != "" {
+			return r.seats[i].difficulty
+		}
+	}
+	return engine.Normal
+}</code></pre>
+<p>
+The first seated human's difficulty preference becomes every bot's
+difficulty at that table — there's no way for one table to have some bots
+easy and others hard. Simpler to reason about and to explain to a player
+("this table is on Hard") at the cost of per-seat customization nobody
+asked for.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (r *Room) evaluateAutoStart() {
+	if r.started || !r.opts.AutoStart { return }
+	humans := r.connectedHumans()
+	if humans < r.MinPlayers() {
+		r.cancelCountdown()
+		return
+	}
+	wait := r.fillWait()
+	if humans >= 4 {
+		wait = r.pacing.StartCountdown
+		if !r.countdownAt.IsZero() && time.Until(r.countdownAt) > wait {
+			r.cancelCountdown()
+		}
+	}
+	r.applyStartCountdown(wait)
+}</code></pre>
+<p>
+Called after <em>every</em> seating change — a join or a leave, not just
+when the table fills up — because the rule quickplay needs cuts both ways:
+a table must never deal one human against three bots, and a countdown
+already running must be cancelled the instant a departure takes the table
+back below minimum. The comment names this directly: "Both directions
+matter, which is why this is re-evaluated on joins <em>and</em> leaves
+rather than only when the table fills up." A full table (four humans)
+additionally gets to skip the fill-wait and use the short start countdown
+instead — there's nobody left to wait for.
+</p>
+<pre><code>func (r *Room) expireSeat(index int) {
+	...
+	s.kind = engine.KindBot
+	s.player = ""
+	s.userID = ""
+	...
+	if r.connectedHumans() == 0 && !r.anySeatInGrace() {
+		r.log.Info("no humans left, closing table")
+		r.Close()
+		return
+	}
+	...
+}</code></pre>
+<p>
+Once a dropped player's reconnect-grace window expires without them coming
+back, their seat converts permanently to a bot — the table keeps playing
+rather than stalling on someone who's gone. If that was the last human, the
+table checks whether any <em>other</em> seat is still inside its own grace
+window before closing outright — a still-in-grace seat is a player who might
+come straight back, and closing the table now would flush their reconnect
+into a brand-new lobby instead of the table they were actually playing.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>applyLeave</code> and <code>applyDisconnect</code> both remove a client from a seat. What's the one real difference in what happens next, and why?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>// applyDisconnect:
+s.graceUntil = time.Now().Add(r.pacing.ReconnectGrace)
+...
+
+// applyLeave:
+r.seats[idx].graceUntil = time.Time{}
+if msg.client != nil { msg.client.Close("normal", "left the table") }</code></pre>
+<p>
+A disconnect (the socket just closed — could be a dropped Wi-Fi signal, an
+app backgrounded, anything involuntary) starts the reconnect-grace timer, so
+the seat is held for the player to come back to. An explicit leave forfeits
+that grace entirely and closes the connection immediately — the comment
+calls it "a deliberate 'I am done'": the player told the table they're
+leaving, so there's no reason to hold the seat open on the chance they
+change their mind.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found beyond the general lack of test coverage already noted for
+this package. The join-priority ordering and the bidirectional
+auto-start re-evaluation are both exactly the kind of subtle-but-correct
+logic that would benefit most from a test suite, but nothing here looks
+wrong on inspection.
+</div>
+</div>
+
+<h2 id="playgo"><code>room/play.go</code> — the publish loop and player intents</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/play.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The largest file in the package, and the one that actually runs a hand once
+it's dealt: turning bid and play frames into engine calls, deciding what
+happens next (a bot's turn, a timeout, a trick clearing), and pushing the
+result to every client. If <code>lobby.go</code> is "who's at the table,"
+this is "the table is playing."
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong><code>publish()</code>'s three steps run in a fixed order for a
+specific reason: schedule, then view, then events.</strong>
+</p>
+<pre><code>func (r *Room) publish() {
+	if !r.started || r.game == nil { return }
+	r.scheduleNextAction()
+	r.fanOutViews()
+	for _, event := range r.game.TakeEvents() {
+		r.onEvent(event)
+	}
+}</code></pre>
+<p>
+The comment states the reasoning plainly: "Scheduling comes first so the
+view can carry the turn deadline the client renders as a countdown. Views
+come before events because the client applies the view as state and the
+events purely as animation." Reversing the first two would mean the view
+frame goes out with no deadline yet computed — the client's countdown ring
+would have nothing to count down to on that frame. Reversing the last two
+would mean a client tries to animate an event (say, a card landing) before
+it has the state that event refers to.
+</p>
+<p>
+<strong>A single derived clock, recomputed from scratch on every publish,
+rather than juggling several independently-scheduled timers per turn.</strong>
+<code>scheduleNextAction</code> always calls <code>clearAuto()</code> first,
+then decides exactly one new deadline based on current phase — hand-over
+wait, trick-linger, bot-think delay, or human turn timeout — mirroring
+<code>deadlines.go</code>'s "one timer" philosophy at the scheduling level,
+not just at the actor-loop level.
+</p>
+<p>
+<strong>A turn-clock timeout only hands a human's seat to autoplay during the
+play phase, never during bidding.</strong>
+</p>
+<pre><code>if kind == autoTurnTimeout {
+	if r.game.Phase != engine.PhaseBidding {
+		r.enterAutoplay(seatIndex)
+	}
+}
+r.takeServerTurn(seatIndex)</code></pre>
+<p>
+The comment explains: "Bidding and play run independent clocks. Missing the
+bid only settles the bid — the seat stays its player's, so they still get a
+full-clocked turn the moment the cards are in play." A player who's simply
+slow to decide a bid (maybe they stepped away for five seconds) gets one
+auto-bid and is straight back to a full turn clock for their first card —
+only someone who keeps missing clocks during actual play gets handed to the
+bot for the rest of the hand.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (r *Room) applyBid(seatIndex, bid int) {
+	r.clearAutoplay(seatIndex)
+	if !r.started {
+		r.sendErr(seatIndex, protocol.ErrGameStarted, ...)
+		return
+	}
+	if !r.game.PlaceBid(seatIndex, bid) {
+		r.sendErr(seatIndex, protocol.ErrNotYourTurn, ...)
+		r.fanOutViews()
+		return
+	}
+	r.publish()
+}</code></pre>
+<p>
+Notice the first line: acting at all — even a bid that turns out to be
+rejected — clears a seat's autoplay flag, on the reasoning that "acting is
+proof enough of presence; no need for a separate awake frame" (a player who
+was in autoplay and taps a card is obviously back, whether or not that
+specific tap was legal). When the engine actually rejects the move (module
+12's <code>PlaceBid</code> returning <code>false</code>), the room resends
+the authoritative view rather than just an error — "so a client that got out
+of step with the table snaps back into line instead of staying wrong,"
+protecting against a client whose local state has drifted from the server's.
+</p>
+<pre><code>func (r *Room) takeServerTurn(seatIndex int) {
+	brain := r.brains[seatIndex]
+	...
+	switch r.game.Phase {
+	case engine.PhaseBidding:
+		if !r.game.PlaceBid(seatIndex, brain.ChooseBid(hand)) {
+			r.log.Warn("server bid rejected", "seat", seatIndex)
+			return
+		}
+	case engine.PhasePlaying:
+		card, ok := brain.ChooseCard(bot.Move{...})
+		if !ok || !r.game.PlayCard(seatIndex, card) {
+			r.log.Error("server move rejected", "seat", seatIndex, "card", card.ID())
+			return
+		}
+	default:
+		return
+	}
+	r.publish()
+}</code></pre>
+<p>
+This is what actually plays a bot's turn, or a dropped/timed-out human's:
+the same <code>bot.Brain</code> the offline mode uses (module 3's Dart
+equivalent, ported to Go — not covered in depth in this course, but reused
+here directly) picks a bid or a card, and the engine is asked to apply it
+exactly the way a human's frame would be. See this file's Improvement note
+for what happens on the two <code>return</code>-without-<code>publish</code>
+paths.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>applyNext</code> (a player's consent to leave the scoreboard) and <code>applyRestart</code> on a quickplay table both use the same <code>readyTally</code> mechanism. Why does a private table's restart skip it entirely?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>func (r *Room) applyRestart(seatIndex int) {
+	if !r.started { return }
+	if r.mode == protocol.ModePrivate {
+		if seatIndex != r.hostSeat {
+			r.sendErr(seatIndex, protocol.ErrNotHost, ...)
+			return
+		}
+		r.restart()
+		return
+	}
+	r.seats[seatIndex].consented = true
+	ready, total, waiting := r.readyTally()
+	if ready >= total { r.restart() }
+	...
+}</code></pre>
+<p>
+A private table has a host — someone who created it and presumably invited
+everyone else — so restarting is that person's unilateral call, the same
+way starting the game was. Quickplay is hostless by design (nobody invited
+anybody), so no single player is entitled to reset a game the others might
+still want to finish; every connected human has to agree first, the exact
+same consent mechanism <code>applyNext</code> uses to advance past a
+hand's scoreboard.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<strong>A rejected server-driven move can stall a table indefinitely, with no
+automatic recovery.</strong> <code>runAuto</code> (in <code>deadlines.go</code>)
+calls <code>r.clearAuto()</code> <em>before</em> calling
+<code>takeServerTurn</code>. If <code>takeServerTurn</code>'s bid or play is
+rejected by the engine — the <code>r.log.Warn("server bid rejected", ...)`
+/ `r.log.Error("server move rejected", ...)</code> branches — the function
+returns without ever calling <code>r.publish()</code>. Because the auto
+deadline was already cleared, and nothing else in that code path schedules a
+new one, <code>nextDeadline()</code> would find no pending turn clock for
+that seat, and the table's timer falls back to its one-hour default with
+that seat simply never acting again — a silent, permanent stall requiring
+manual admin intervention (module 17's dashboard, or restarting the table)
+to notice and fix. This should be rare in practice — the bot brain and the
+engine's own guard clauses make an actual rejection here unlikely — but
+"unlikely" is exactly the class of bug this codebase's own actor-panic
+recovery (this module's <code>room.go</code> note) treats as worth
+defending against elsewhere. A one-line fix — call <code>r.publish()</code>
+(or at minimum re-arm a fallback deadline) on the failure branches too —
+would turn a silent permanent stall into, at worst, one wasted retry cycle.
+This is precisely the kind of bug the missing test suite noted throughout
+this module would be positioned to catch.
+</div>
+</div>
+
+<h2 id="statusgo"><code>room/status.go</code> — the admin's view</h2>
+<div class="filecard">
+<div class="path">backend/internal/room/status.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every client-facing view of a table goes through <code>engine.Game.ViewFor</code>'s
+redaction (module 12) — a seat never sees another seat's cards. An operator
+debugging a stuck table needs the opposite: everything, unredacted. This
+file is that second, privileged read path.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A full, unredacted snapshot — including every seat's actual
+hand — deliberately breaks the redaction rule the rest of the system
+enforces everywhere else.</strong> The field comment says it outright:
+"<code>Hands</code> holds every seat's remaining cards, ids only. An admin
+may see what a player holds; that is the point of the dashboard." This is
+not an oversight; it's a distinct trust boundary. A player's own client is
+untrusted by design (it must never receive another seat's cards), while the
+admin dashboard (module 17) is, by construction, only reachable with the
+operator's admin token (module 11's <code>AdminToken</code>) — a completely
+different audience with a completely different need.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type statusMsg struct{ reply chan Status }
+
+func (r *Room) Snapshot() Status {
+	reply := make(chan Status, 1)
+	if !r.post(statusMsg{reply: reply}) {
+		return Status{ID: r.id, Mode: r.mode, Closed: true}
+	}
+	select {
+	case s := <-reply:
+		return s
+	case <-r.closed:
+		return Status{ID: r.id, Mode: r.mode, Closed: true}
+	}
+}</code></pre>
+<p>
+Same request/reply pattern as <code>Join</code> in <code>message.go</code> —
+a message posted to the actor's inbox, answered on a private channel — so
+building a status snapshot still only ever happens on the actor's own
+goroutine, reading live fields directly with no lock needed, and copying
+everything into a plain struct before handing it back so nothing in the
+reply aliases actor-owned memory a caller could race against.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found — this file is the one part of the package that already
+has real test coverage (<code>status_test.go</code>), and the redaction
+trade-off is a deliberate, well-justified design choice rather than a gap.
+</div>
+</div>
+
+<h2 id="recorder">Persistence hand-off: <code>recorder.go</code> &amp; <code>gamerecord.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/room/recorder.go, backend/internal/room/gamerecord.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A finished game needs to end up in Postgres (module 16) without the table
+that produced it ever waiting on a database call — the same
+"database problems must never stop a game" rule from
+<code>docs/PERSISTENCE.md §5</code> that module 11's config file names
+directly. <code>gamerecord.go</code> builds the scoreboard incrementally as
+a hand is played; <code>recorder.go</code> is the bounded, non-blocking
+queue that gets a finished record off the actor goroutine and onto disk.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The scoreboard is built incrementally, event by event, not
+reconstructed from engine state at the end.</strong> This is the exact same
+constraint the Dart client's <code>GameRecorder</code> (module 9) is built
+around: <code>engine.Game.Bids</code> and <code>TricksWon</code> are cleared
+on every new deal, so by <code>GameOver</code> there's nothing left to
+recover a full history from — each hand's row has to be captured as that
+hand ends, from the very same <code>HandOver</code> event the room already
+fans out to clients. Two independent implementations (a Dart client
+recording its own offline games, a Go server recording networked ones)
+converged on the identical constraint-driven design.
+</p>
+<p>
+<strong>A bounded queue that drops on overflow, not one that blocks the
+actor or grows without limit.</strong>
+</p>
+<pre><code>func (r *Recorder) Submit(rec db.GameRecord) {
+	if !r.enabled() || r.stopped.Load() { return }
+	select {
+	case r.queue <- rec:
+		gameRecordQueueDepth.Set(float64(len(r.queue)))
+	default:
+		gameRecordsDropped.Inc()
+		r.log.Warn("dropping a game record: the recorder queue is full", ...)
+	}
+}</code></pre>
+<p>
+The comment on the queue size explains the reasoning: "a backlog of hundreds
+of games means the database has been gone for a long time, and the useful
+response then is to shed load loudly rather than to hoard records in
+memory." <code>Submit</code> is called directly from a room actor's
+goroutine — the same goroutine running the table — so it must never block:
+a full queue drops the newest record with a logged warning and an
+incremented metric rather than making a table's players wait on a database
+that might be down for an hour.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type gameLog struct {
+	active    bool
+	startedAt time.Time
+	seats  [4]db.SeatRecord
+	hands  []db.HandRecord
+	tricks []db.TrickRecord
+	trick  []db.TrickPlay
+}</code></pre>
+<p>
+<code>active</code> is the "double-record guard" — GameOver, a restart, and
+the room closing early all funnel through the same
+<code>finishRecording</code>, and the comment is explicit that only the
+first one to actually run sees <code>active == true</code>; every other path
+becomes a harmless no-op. This is what makes it safe to call
+<code>abandonRecording()</code> (a thin wrapper around
+<code>finishRecording(false, nil)</code>) unconditionally from
+<code>room.go</code>'s <code>shutdown</code> — a table that closes mid-game
+still gets its "abandoned" row per <code>docs/PERSISTENCE.md §2.3</code>, and
+a table that already finished normally simply does nothing the second time.
+</p>
+<pre><code>func (r *Recorder) write(rec db.GameRecord) {
+	const attempts = 2
+	for attempt := 1; attempt <= attempts; attempt++ {
+		...
+		id, _, err := r.store.RecordGame(ctx, rec)
+		switch {
+		case err == nil:
+			gamesRecorded.WithLabelValues(string(rec.Mode)).Inc()
+			return
+		case errors.Is(err, db.ErrDisabled):
+			return
+		case attempt < attempts:
+			r.log.Warn("game record write failed, retrying", ...)
+		default:
+			gameRecordsFailed.Inc()
+			r.log.Error("giving up on a game record", ...)
+		}
+	}
+}</code></pre>
+<p>
+One retry, then give up — deliberately not an unbounded retry loop, on the
+same "this is history, not gameplay" reasoning the Dart
+<code>GameUploader</code> (module 9) applies to its own retry queue: losing
+one game record is a real but bounded cost, and a worker stuck retrying a
+single record forever would eventually back the whole queue up regardless.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found in these two files specifically — this is a textbook
+write-behind pattern (bounded queue, non-blocking submit, capped retries,
+graceful drain on shutdown) applied consistently with the same philosophy
+the Dart upload queue uses. <code>recorder_test.go</code> exists and covers
+this path, unlike most of the rest of the package.
+</div>
+</div>
+
+<h2 id="brokergo"><code>match/broker.go</code> — quickplay seating</h2>
+<div class="filecard">
+<div class="path">backend/internal/match/broker.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Quickplay needs to put a player who just wants "a game, any game" at a
+table with other people asking for the same thing — without a separate
+matchmaking queue subsystem, and without ever seating one lonely human
+against three bots.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>No anonymous queue at all — a quickplay seeker is seated at a real
+room the moment they ask.</strong> The package comment: "A player asking for
+a quickplay game is put into a real table straight away, alongside whoever
+else is waiting, and the table deals itself once enough people are sitting
+at it. That is what lets players see each other's names while they wait
+instead of watching a counter." The alternative — a classic matchmaking
+queue that holds players in an abstract waiting list and assembles a table
+only once it's decided who's playing together — would need its own separate
+"leave the queue" path distinct from leaving a table. Here, there's only one
+concept: you're either at a table or you're not, so leaving is just leaving,
+with no separate cancel flow to keep in sync.
+</p>
+<p>
+<strong>Separate buckets per hand-count variant, and within a bucket, always
+try the oldest table first.</strong>
+</p>
+<pre><code>type Broker struct {
+	...
+	open map[int][]*room.Room // keyed by handsPerGame
+}
+
+func (b *Broker) Seat(req room.JoinRequest, handsPerGame int, deal engine.DealConfig) (*room.Room, room.JoinResult) {
+	...
+	for _, table := range b.open[handsPerGame] {
+		res := table.Join(req)
+		if res.Err == "" { return table, res }
+	}
+	table, err := b.hub.CreateUnique(...)
+	...
+}</code></pre>
+<p>
+A 3-hand quickplay seeker and a 5-hand seeker must never land at the same
+table — the bucket keyed on <code>handsPerGame</code> guarantees that
+structurally rather than by a runtime check. Within one bucket, always
+trying the oldest still-filling table before opening a new one is what
+keeps four simultaneous seekers converging on one table instead of
+scattering across four half-empty ones — the comment's own framing: "a
+single table fills up before a second is opened."
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (b *Broker) prune() {
+	for handsPerGame, tables := range b.open {
+		kept := tables[:0]
+		for _, table := range tables {
+			if table.Accepting() { kept = append(kept, table) }
+		}
+		for i := len(kept); i < len(tables); i++ { tables[i] = nil }
+		b.open[handsPerGame] = kept
+	}
+}</code></pre>
+<p>
+Every call to <code>Seat</code> first prunes tables that have already dealt
+or closed, using each room's own atomic <code>Accepting()</code> flag
+(module 12's <code>room.go</code>: <code>accepting atomic.Bool</code>) —
+notably a value the broker can read without any round trip through the
+actor's message inbox, since it's specifically designed to be safe from any
+goroutine. The <code>tables[i] = nil</code> tail-clearing after the
+in-place filter is a small but real Go idiom: without it, the underlying
+array would keep holding references to closed rooms just because the slice
+header no longer counts them, quietly preventing them from being garbage
+collected.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found. The one thing to flag is the same package-wide gap: no
+test file exists for <code>match/broker.go</code> either — the bucketing and
+oldest-first packing logic here is exactly the kind of behavior a unit test
+(construct a broker, seat several fake requests, assert which table each
+lands on) could pin down cheaply, and nothing currently does.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does this package use an actor (one goroutine per table, message-passing) instead of a struct guarded by a mutex?</summary>
+<div class="answer">
+It makes concurrent-access bugs structurally impossible rather than merely
+avoided by discipline — there is only ever one goroutine that can touch a
+table's state, so there is nothing to race and nothing to remember to lock.
+The cost is indirection: every external operation becomes "build a message,
+post it, maybe wait for a reply" instead of a direct call.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>publish()</code> schedule the next action before fanning out views, and fan out views before releasing events?</summary>
+<div class="answer">
+The view frame needs to carry the newly-computed turn deadline for the
+client's countdown, so scheduling has to happen first. Views come before
+events because the client treats a view as authoritative state and an event
+as pure animation on top of it — animating an event before the state it
+refers to has arrived would be animating against stale state.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does a socket disconnect start a reconnect-grace timer, while an explicit "leave" does not?</summary>
+<div class="answer">
+A disconnect could be involuntary — a dropped signal, a backgrounded app —
+so the seat is held in case the player comes back. An explicit leave is the
+player deliberately saying they're done, so there's nothing to hold open
+for; the grace window is forfeited immediately.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>What real, concrete failure mode does the "clearAuto runs before takeServerTurn, and takeServerTurn can fail without calling publish" pattern create?</summary>
+<div class="answer">
+A rejected server-driven bid or play move returns without re-arming any
+deadline for that seat. Since the previous deadline was already cleared,
+nothing schedules a new one — the table's timer falls back to a one-hour
+default and that seat simply stops acting, a silent permanent stall with no
+automatic recovery.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="12-go-engine-port.html">← Module 12: Engine Port to Go</a>
+<a href="14-websocket-edge.html">Module 14: WebSocket Edge →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

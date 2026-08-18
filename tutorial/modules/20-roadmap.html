@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20. Roadmap: Prototype to Production — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m20">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part IV — Finish · Module 20 of 20</p>
+<h1>Roadmap: From Prototype to Production</h1>
+<p class="lede">
+Every module in this course carried an Improvement Note when a real
+weakness existed in the exact code being taught. This module collects all
+of them — plus a handful of project-wide gaps that don't belong to any
+single file — into one prioritized list, organized the way an engineering
+team would actually triage a backlog: what's missing, what breaks under
+growth, what breaks under stress, what's hard to maintain, what's slow, and
+what's fragile. Every item below cites the real file it lives in. None of
+this is hypothetical — it's what reading the actual source, module by
+module, surfaced.
+</p>
+
+<p class="lede">
+<strong>How to read the priority tags:</strong>
+<span class="priority high">High</span> — a real player-facing failure mode
+under realistic conditions, or a security-relevant gap.
+<span class="priority medium">Medium</span> — a real gap that needs a
+specific, uncommon trigger, or degrades gracefully but imperfectly.
+<span class="priority low">Low</span> — a genuine improvement with a narrow
+or low-severity blast radius.
+</p>
+
+<h2 id="missing-features">Missing Features</h2>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/httpapi/auth.go:176-209</div>
+<h4>Account upgrade (Google / Facebook / Apple sign-in) is a reserved 501 stub <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> A player who wants to move their guest account to a new phone via a real login provider hits a "coming soon" error — the entire linking flow is unimplemented. The handler's own TODO comment lays out all five implementation steps in detail (verify the Firebase ID token, map to a db.Provider, call the already-built store.LinkIdentity, handle the conflict case, return the session) — the schema and store methods are ready; only the handler body is missing.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Implement the five steps the TODO comment already specifies, starting with Firebase Admin SDK token verification — this is scoped and ready to build, not a design problem.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/room/room.go (Game field); no snapshot/rehydrate anywhere in db or room</div>
+<h4>Live tables exist only in process memory, with no way to survive a restart <span class="priority high">High</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> A deploy, a crash, or an orchestrator-initiated pod replacement loses every in-progress game on that node — module 18's graceful-shutdown sequence finishes and records completed hands, but any hand mid-play at the moment of shutdown is simply gone, and reconnecting players find no table to rejoin. This was foreshadowed as early as module 2's Dart engine (no serialization of live state, only the redacted view) and confirmed true all the way through the Go port — nothing in db/store.go's interface, or anywhere else in the backend, persists an in-progress game's full state.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A periodic or event-driven snapshot of live Game state (module 12) to Redis or Postgres, with a rehydrate path a room actor runs on startup for tables it's expected to still own — a substantial feature, not a quick patch, and the reason it's flagged High despite requiring real design work.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/cmd/loadtest/main.go</div>
+<h4>The load-testing tool has no failure-injection mode <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> The tool proves steady-state move latency scales, but never exercises the reconnect, timeout, and autoplay-handoff paths modules 13 and 14 invest the most engineering effort in — those are unit-tested in isolation (ws/resilience_test.go, ws/autoplay_test.go) but never measured under realistic concurrent load.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Add a configurable disconnect/reconnect injection rate to the existing tool, reusing its already-real WebSocket clients.</p>
+</div>
+
+<h2 id="scalability">Scalability</h2>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/net/remote_session.dart:394-401</div>
+<h4>Reconnect backoff has no random jitter <span class="priority high">High</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> A server restart or brief network partition drops many clients simultaneously; every one of them schedules its first retry at exactly 1 second, the second at exactly 2 seconds, and so on, all in lockstep — a synchronized retry storm hitting the server the moment it comes back, exactly when it's least able to absorb a spike.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Add randomized jitter to each backoff step (a standard, well-known fix — e.g. multiply the delay by a random factor in a fixed range) so reconnects spread out instead of arriving in lockstep.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/room/hub.go (CreateUnique, RoomCodeAlphabet)</div>
+<h4>Room-code collision retries are capped independent of how full the code space actually is <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> The code space is 32⁴ ≈ 1.05 million codes; MAX_ROOMS defaults to 50,000. By the birthday paradox, collision probability rises faster than table count alone suggests — as a deployment approaches its configured room ceiling, CreateUnique's fixed 32-attempt cap becomes a real risk of failing outright (an ErrCapacity to a quickplay player) before the server is actually full, with nothing logging how often a retry was needed to make the problem visible.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Lengthen the code specifically for quickplay's internally-generated rooms (player-typed private codes are a separate, shorter-is-better concern), or raise the retry cap and log retry counts so the problem is visible before it causes failures.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/deploy/docker-compose.yml</div>
+<h4>No CPU or memory limits on any service in the "production-shaped" compose stack <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> An unbounded Postgres or Redis container under real load has nothing here stopping it from consuming all of the host's memory, taking the game server down with it regardless of how carefully main.go's own shutdown sequence is written.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Add Compose's deploy.resources.limits to each service — though real production resource limits ultimately belong in whatever orchestrator config (Kubernetes, ECS) an actual deployment uses instead of this local/dev stack.</p>
+</div>
+
+<h2 id="robustness">Robustness</h2>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/ws/server.go:134-149, backend/internal/httpapi/api.go:268-284</div>
+<h4>clientIP trusts unauthenticated proxy headers with no trusted-proxy allowlist, duplicated in two independent files <span class="priority high">High</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Both the WebSocket and REST edges resolve a caller's address from X-Real-IP / X-Forwarded-For unconditionally, with no check that the request actually arrived through a known, trusted load balancer. An attacker connecting directly (bypassing any real proxy) can forge a fresh fake address on every request, defeating MaxConnsPerIP (module 14) and the REST rate limiter's per-IP bucket (module 17) simultaneously — the exact connection-exhaustion and abuse protections these mechanisms exist to provide.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Only trust these headers when the immediate peer address is itself a configured, trusted proxy IP; fall back to the raw socket address otherwise. Extract the (currently duplicated) function into a shared package so the fix only has to happen once.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/room/play.go (takeServerTurn), backend/internal/room/deadlines.go (runAuto)</div>
+<h4>A rejected server-driven move can stall a table indefinitely with no automatic recovery <span class="priority high">High</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> runAuto clears the table's pending deadline before calling takeServerTurn. If the bot brain's chosen bid or card is rejected by the engine — logged as "server bid rejected" / "server move rejected" — the function returns without ever calling r.publish(). Because the deadline was already cleared and nothing else schedules a new one, that seat simply stops acting: a silent, permanent stall requiring manual admin intervention (the module 17 dashboard, or restarting the table) to notice and fix.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Call r.publish() (or at minimum re-arm a fallback deadline) on the failure branches too, turning a silent permanent stall into, at worst, one wasted retry cycle.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/config/config.go:214-272 (envInt, envFloat, envBool, envDuration, envDurationList4)</div>
+<h4>Malformed environment variables are silently discarded with no log line <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> A typo'd config value — MAX_ROOMS=5oo, a malformed PLAY_TIMEOUTS list — boots the server successfully and quietly runs with the default instead of the operator's intended override, with nothing anywhere logging that the override was ignored. The misconfiguration is invisible until it causes a confusing symptom much later.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A one-line log.Printf on the parse-failure branch of each helper, at effectively zero cost.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/engine/game.go (Game struct doc comment)</div>
+<h4>Game's single-goroutine-ownership contract is documented but not enforced or tested <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> "Exactly one goroutine owns an instance" is correct today because every real caller (the room actor, module 13) happens to follow the rule — but nothing catches a future caller that doesn't, short of manually running Go's race detector against a test that actually exercises concurrent access, and none of game_test.go's 425 lines currently do.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Add a test that deliberately exercises concurrent access under -race to lock the invariant in, even though the actor-model architecture means it should never trigger in production.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/audio/audio_controller.dart (every catch (_) block)</div>
+<h4>Every audio exception is swallowed identically with zero logging <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> A genuinely unavailable audio plugin looks exactly the same as a typo'd asset path or a real bug in this code — a developer who breaks something here gets total silence, with no debug-build signal to point at the cause.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Log the caught exception at debug level even while still degrading gracefully in release builds — costs nothing in production, saves real debugging time in development.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/main.dart:12-29</div>
+<h4>No top-level error handling around async startup <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> If IdentityStore.open() or building the ApiClient/GameUploader throws (a corrupt on-disk settings file, for instance), runApp is never reached — the user sees a blank screen with no crash report and no fallback UI.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A runZonedGuarded wrapper with a minimal error screen, or a try/catch that falls back to fresh in-memory defaults rather than propagating the exception past main().</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/net/game_uploader.dart:206-208</div>
+<h4>GameUploader silently drops the oldest queued game past its 50-entry cap <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> A player who genuinely plays offline for an extended stretch (a long flight, an extended dead zone) loses history with zero warning once the queue exceeds 50 unsynced games — contradicting the queue's own framing as a reliable delivery mechanism.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Surface a lightweight, dismissable notice when the cap is actually hit, so a player at least knows history stopped accumulating rather than assuming everything synced.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/db/postgres_games.go (validateRecord)</div>
+<h4>ClientGameID has no independent validation inside the db package itself <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Module 17's REST upload handler enforces a 128-character cap before a client-uploaded game reaches this function, but RecordGame and validateRecord have no defense of their own — any future or internal caller that isn't that one HTTP handler could insert an arbitrarily large or malformed value with nothing in this package stopping it.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Add the same length/shape check directly in validateRecord, at the layer that actually owns the uniqueness guarantee, rather than relying on every future caller to remember it.</p>
+</div>
+
+<h2 id="maintainability">Maintainability</h2>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/room/ (8 of 10 .go files with no matching _test.go)</div>
+<h4>The room package — the actor loop, lobby, scheduling, and matchmaking core — has almost no test coverage <span class="priority high">High</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Only recorder.go and status.go have matching test files; room.go, message.go, deadlines.go, lobby.go, play.go, and match/broker.go do not. This is precisely the package where the actor-model panic recovery, single-timer scheduling, join-priority ordering, and autoplay handoff all live — exactly the kind of concurrency-adjacent logic that's easy to get subtly wrong and hard to verify by inspection alone. The rejected-server-move stall bug documented under Robustness above is a concrete example of the class of bug this gap would have caught.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Start with a room_test.go that constructs a real actor and drives it through Join/Action/a timeout tick — the ws and db packages (both over 1,000 lines of tests) prove this team already knows how to test exactly this class of code well elsewhere.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/config/, backend/internal/protocol/, backend/internal/match/, backend/internal/store/ (no _test.go in any of the four directories)</div>
+<h4>Four backend packages have zero test coverage <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Confirmed by directory listing — none of these four packages has a single test file. store/registry.go in particular contains genuinely tricky distributed-systems logic (SETNX claims, a compare-and-delete Lua release script, a heartbeat loop) with real edge cases (module 16's Redis-outage findings) that unit tests could pin down far more cheaply than production incidents will.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Prioritize store/registry.go and protocol/protocol.go first — the former for its distributed-systems subtlety, the latter because it's the wire-contract boundary every client depends on.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">repo root — no .github/workflows or any CI configuration found</div>
+<h4>No CI/CD pipeline exists anywhere in the repository <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Confirmed by search — there is no automated gate that runs go test, go vet, or the Flutter test suite on a commit or pull request. Every safety net this course has praised (the ws and db packages' large test suites, the golden-file cross-language contract test) only protects a codebase that someone remembers to run it against — nothing enforces that today.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A minimal workflow running go test ./... and flutter test on every push would immediately start protecting the investment already made in this codebase's existing tests.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/net/local_session.dart (LocalSession), frontend/lib/net/lan_host_session.dart, backend/internal/room/</div>
+<h4>Three independent hand-written implementations of "run a Call Break table" must stay behaviorally in sync <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> LocalSession, LanHostSession, and the Go room actor each independently implement pacing, turn-timeout, and scheduling logic. The engine itself is shared in two of the three (module 2's CallBreakGame), which narrows the risk, but the scheduling logic around it is written three separate times with no shared abstraction — a behavioral difference between any two would be a real, easy-to-introduce bug with nothing but manual testing to catch it.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Not a quick fix — would require extracting a shared, language-appropriate scheduling abstraction, which is a genuine design project rather than a patch.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/net/local_session.dart (TablePacing), backend/internal/config/config.go (pacing defaults)</div>
+<h4>Table pacing constants are hand-duplicated between Dart and Go with no shared source of truth <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Editing PLAY_TIMEOUTS in the backend's env config without touching the Dart constant silently desyncs the offline and networked feel — a networked table's turn clock stops matching what a solo game trained a player to expect.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A generated or checked-in shared constants file (even just a comment pointing each side at the other, checked by a lightweight cross-language test) would catch drift before it ships.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/ui/screens/table_screen.dart (3,209 lines)</div>
+<h4>The main table screen file is large enough to be its own maintainability risk <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Screen-level orchestration (session lifecycle, the build skeleton) is mixed with a large number of private presentation widgets (_AutoplayBanner, _ThrowFlight, _DealOverlay, _ConnectionState, LobbyPanel and its sub-widgets, and more) that don't need to live in the same file — a genuinely large surface for any single contributor to hold in their head at once.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Split the private widgets out into frontend/lib/ui/widgets/, leaving this file as pure screen-level orchestration — a mechanical refactor with low risk, since the widgets are already private and self-contained.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/engine/card.go (package doc comment)</div>
+<h4>The engine package's "faithful port" doc comment overstates its own accuracy <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> The comment claims every exported symbol has a named Dart counterpart, but roughly a third of card.go — the entire deal-preset system (ShuffleKind, DealStyle, DealConfig, balancedDeal) — has no Dart equivalent at all, since it's a server-only feature. A reader who trusts the comment and goes looking for its Dart counterpart will find nothing and have to guess whether that's a missing port or a deliberate addition.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A one-line addendum to the package comment: "except the deal-preset system, which is server-only."</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/engine/event.go (Event interface)</div>
+<h4>Go's Event interface lacks the compile-time exhaustiveness Dart's sealed GameEvent gets for free <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Nothing in this package currently does a type switch over Event, so the risk is purely forward-looking — but the day some future code needs to special-case one event type via a type switch, adding a new event variant later would not force that switch to be revisited the way Dart's sealed class would, unlike in the Dart engine (module 2).</p>
+<p class="roadmap-row"><b>Fix direction:</b> No action needed today; worth a comment at the interface definition warning future authors of a type switch to add a default case that panics or logs, so a missed variant fails loudly rather than silently.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/db/postgres.go (MaxConnIdleTime, MaxConnLifetime)</div>
+<h4>Postgres pool idle/lifetime timeouts are hardcoded while pool size is configurable <span class="priority low">Low</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> DBMaxConns is exposed as an environment variable (module 11), but the 30-minute idle timeout and 1-hour connection lifetime that defend against cloud providers silently dropping idle connections are fixed constants — an operator tuning this for a specific managed Postgres offering's own recycling behavior needs a code change and rebuild to do it.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Expose both as two more envDuration-backed config fields alongside DBMaxConns — the values already exist as named constants in one place.</p>
+</div>
+
+<h2 id="performance">Performance</h2>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/store/registry.go (Owner)</div>
+<h4>The Redis room-ownership lookup sits on the synchronous join path with up to 500ms of latency risk <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Owner() is called directly from the private and quickplay-resume join paths (module 14), bounded by a 500ms timeout per call. Under a degraded-but-still-responding Redis (not a clean outage, which fails fast and gracefully per module 16's own design), every single private join can pay up to half a second of added latency before falling through to "treat as local."</p>
+<p class="roadmap-row"><b>Fix direction:</b> A shorter per-call timeout with a circuit breaker that stops calling Redis entirely after a run of slow responses, rather than paying the full timeout on every join during a degraded period.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/engine/golden_test.go, backend/testdata/ (only view_frames.json exists)</div>
+<h4>The cross-language wire-contract safety net covers view frames only, not event frames <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> Both view and event frames are decoded by the same "reads keys unconditionally and throws on the unexpected" style on the Dart side, but only view frames have a checked-in golden file and a matching cross-language decode test. An accidental change to an event's field names or types (in event.go) would have the identical runtime-crash blast radius as a view change, with no regression test to catch it before it shipped.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Extend goldenViews's exact pattern to capture one frame per event type, reusing the mechanism already proven to work for views.</p>
+</div>
+
+<h2 id="reliability">Reliability</h2>
+
+<div class="roadmap-item">
+<div class="path">backend/cmd/server/main.go (shutdown sequence), backend/internal/room/room.go (CloseAll)</div>
+<h4>Total shutdown duration is unbounded and can exceed a container orchestrator's SIGKILL grace period <span class="priority high">High</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> The shutdown sequence is srv.Shutdown (bounded by one 20-second ShutdownGrace window), then hub.CloseAll() — which waits unconditionally on every room's &lt;-r.Done() with no timeout of its own — then recorder.Shutdown (bounded by a second, separate 20-second window). If even one room actor is slow to exit, or table count is large, CloseAll can run indefinitely; even the ordinary case's two full 20-second windows can exceed Kubernetes' commonly-used 30-second default terminationGracePeriodSeconds. A SIGKILL arriving mid-CloseAll abandons every table that hadn't finished tearing down — precisely the mid-trick teardown this entire five-step sequence exists to prevent, defeated by its own total duration.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Thread a single overall deadline through all three phases, shrinking each phase's remaining share as time is spent, so total shutdown time is bounded by one number an operator can configure to actually fit their orchestrator's real grace period.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/store/registry.go (heartbeat, ownerTTL)</div>
+<h4>An extended Redis outage longer than ownerTTL can let a claim lapse while the node still hosts that room <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> If Redis is unreachable for longer than the 60-second ownerTTL while a node is still up and genuinely hosting a table, that claim silently expires from Redis's point of view even though nothing is wrong with the node holding it. A second node could then successfully claim the same room code if a player happened to open a private table under an identical 4-character code elsewhere during that window, briefly recreating the double-table problem the registry exists to prevent.</p>
+<p class="roadmap-row"><b>Fix direction:</b> A genuinely narrow edge case requiring a sustained, unhealthy-but-not-fully-down Redis; worth monitoring for via a metric on claim-lapse events rather than a structural fix, given how rare the triggering condition is.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">backend/internal/httpapi/admin.go (adminPage), backend/internal/obs/obs.go (/metrics)</div>
+<h4>The admin dashboard shell and the metrics endpoint are both reachable without authentication <span class="priority medium">Medium</span></h4>
+<p class="roadmap-row"><b>Failure scenario:</b> adminPage's HTML shell is deliberately unauthenticated (a bearer token can't be attached to a plain browser navigation) but still leaks the existence and structure of the admin surface to reconnaissance. More concretely, /metrics is mounted on the exact same public port as game traffic with no gate at all — unlike /admin's API routes, which are constant-time-token-checked — so anyone reaching the server can scrape live room and player counts and per-error-code rates.</p>
+<p class="roadmap-row"><b>Fix direction:</b> Bind /metrics to a second, non-public port, or gate it behind the same admin token module 17 already has available. The admin shell's exposure is a smaller, more defensible residual risk given it carries no real data.</p>
+</div>
+
+<div class="roadmap-item">
+<div class="path">frontend/lib/net/game_uploader.dart, backend/internal/room/hub.go (CreateUnique) — see also the Robustness and Scalability entries above</div>
+<h4>Cross-reference: several items above are reliability risks under exactly the conditions a growing player base would create</h4>
+<p class="roadmap-row">The reconnect thundering-herd risk, the room-code collision cap, and the rejected-server-move stall are all, at their core, reliability problems that only manifest at scale — listed under Scalability and Robustness above rather than duplicated here, but worth reading together: this codebase's graceful-degradation philosophy (a database problem never stops a game, a Redis problem never stops a join) is consistently well executed for the failure modes its authors anticipated, and each of the gaps in this roadmap is a failure mode that same philosophy didn't yet get applied to.</p>
+</div>
+
+<h2>What this course covered — and what it didn't</h2>
+<p>
+This roadmap consolidates real findings from real code, module by module —
+not a generic "add more tests" checklist. A few honest limits worth naming:
+several packages (<code>bot</code>, the Go port of module 3's Dart bot brain;
+<code>settings</code>, the runtime-tunable defaults store referenced from
+<code>main.go</code>) were used and referenced throughout Part III but
+never given their own filecard, because the build-order this course follows
+prioritized the files every other module actually depends on. If you're
+continuing past this course, those are natural next places to read with the
+same PURPOSE/DECISION/EXPLANATION lens this course modeled throughout.
+</p>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="19-build-it-yourself.html">← Module 19: Build It Yourself</a>
+<a href="../glossary.html">Glossary →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

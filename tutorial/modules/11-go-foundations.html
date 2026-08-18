@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11. Go Backend Foundations — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m11">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 11 of 20</p>
+<h1>Go Backend Foundations</h1>
+<p class="lede">
+Part III starts here. Before any networking or game logic, the server needs
+two things every other package will depend on: a way to turn environment
+variables into settings (<code>config</code>), and a shared definition of
+what a JSON message over the wire actually looks like (<code>protocol</code>).
+Neither package imports anything from the rest of the backend — that's
+deliberate, and it's this module's main thread.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">Flutter app (Part II, done) — RemoteSession speaks this wire format</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">config, protocol ◀ you are here</text>
+  <text x="32" y="98" fill="#9db0a4">env → Config · JSON frame shapes + validation, no other package imported</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">engine (module 12) · room (13) · ws (14) · auth (15)</text>
+  <text x="32" y="154" fill="#9db0a4">db (16) · httpapi (17) · obs (18)</text>
+  <text x="32" y="172" fill="#9db0a4">Everything above imports config and/or protocol; neither imports them back</text>
+</svg>
+</div>
+
+<h2 id="config"><code>config/config.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/config/config.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every tunable the server has — the port it listens on, turn clocks, rate
+limits, database and Redis addresses, the JWT signing secret — has to come
+from somewhere at process start. This file is that single place: it reads
+environment variables, applies sane defaults, and hands every other package
+one populated <code>Config</code> struct instead of each package calling
+<code>os.Getenv</code> on its own.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Environment variables, not a config file.</strong> The package
+comment states the goal directly: "Every field has a default that makes
+<code>go run ./cmd/server</code> work with no environment at all, so local
+development needs no setup file." The concrete alternative — a YAML or JSON
+config file — would need a path convention (where does the server look?), a
+parser dependency, and a way to layer environment-specific overrides on top
+of it. Environment variables need none of that, and they're exactly what
+Docker, Kubernetes, and every common PaaS already inject natively. The
+trade-off: no comments, no nesting, no validation until <code>Load()</code>
+actually runs — a config file could be checked by a linter before the
+process even starts.
+</p>
+<p>
+<strong>Unsafe defaults fail loud instead of being silently guessed.</strong>
+<code>JWTSecret</code> is the clearest example (lines 146–155): in
+development, a missing secret gets a random one generated per process start
+— tokens simply stop working on restart, which is a mild inconvenience while
+iterating. In production (<code>IsProduction()</code> true), the exact same
+missing value is a hard startup error. The alternative — generating a random
+secret in production too — would boot successfully and then invisibly
+invalidate every issued token on every restart or every horizontally-scaled
+replica, which is a far worse failure to debug than a process that refuses
+to start.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type Config struct {
+	Addr      string
+	Env       string // "development" or "production"
+	...
+	JWTSecret []byte
+	AdminToken string
+
+	BotThinkMin    time.Duration
+	BotThinkExtra  time.Duration
+	TrickLinger    time.Duration
+	StartCountdown time.Duration
+
+	BidTimeout time.Duration
+	PlayTimeouts [4]time.Duration
+	...
+}</code></pre>
+<p>
+One flat struct, no nested sub-configs. The comment above the pacing fields
+is worth reading literally: "Defaults mirror <code>TablePacing</code> in the
+Flutter client (<code>frontend/lib/net/local_session.dart</code>) so a
+networked table feels the same as the offline one" — the same pacing values
+you already saw as Dart constants in <a href="05-session-offline.html">module
+5</a> reappear here as Go <code>time.Duration</code> defaults, independently
+declared. <code>PlayTimeouts</code> is a fixed 4-element array indexed by
+how many cards are already down in the current trick, so whoever leads a
+trick gets the most time to think and the last player to follow gets the
+least.
+</p>
+<pre><code>func Load() (Config, error) {
+	c := Config{
+		Addr:             env("ADDR", ":8080"),
+		...
+		MaxRooms:         envInt("MAX_ROOMS", 50_000),
+		MsgRatePerSecond: envFloat("MSG_RATE_PER_SECOND", 20),
+		...
+	}
+	if port := os.Getenv("PORT"); port != "" {
+		c.Addr = ":" + port
+	}
+	...
+	return c, c.validate()
+}</code></pre>
+<p>
+<code>Load()</code> populates every field from a typed helper
+(<code>env</code>, <code>envInt</code>, <code>envBool</code>,
+<code>envDuration</code>, ...) that reads one environment variable and falls
+back to a default if it's unset. <code>PORT</code> — what most PaaS
+providers inject automatically — is checked afterward and overrides
+<code>ADDR</code> if present, so the same binary works whether you set
+<code>ADDR=:9000</code> yourself or deploy somewhere that sets
+<code>PORT</code> for you.
+</p>
+<pre><code>func (c Config) validate() error {
+	if c.MaxRooms <= 0 {
+		return fmt.Errorf("config: MAX_ROOMS must be positive")
+	}
+	...
+	if c.IsProduction() && len(c.AllowedOrigins) == 0 {
+		return fmt.Errorf("config: ALLOWED_ORIGINS is required in production")
+	}
+	return nil
+}</code></pre>
+<p>
+<code>validate()</code> is the second half of the "fail loud" philosophy:
+every invariant the rest of the server assumes holds (positive rate limits,
+a database URL if persistence is required, allowed CORS origins in
+production) is checked exactly once, at startup, in one place — not
+re-checked defensively throughout the codebase every time a field is read.
+</p>
+
+<details class="try">
+<summary>Try it yourself — before looking, guess what happens if you set <code>MAX_ROOMS=abc</code> (not a number) in the environment and start the server.</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}</code></pre>
+<p>
+Nothing visibly happens. <code>strconv.Atoi("abc")</code> fails, the
+<code>if</code> guard on <code>err == nil</code> is false, and the function
+silently falls through to <code>return def</code> — <code>MaxRooms</code>
+quietly becomes <code>50_000</code>, exactly as if <code>MAX_ROOMS</code> had
+never been set at all. There is no log line, no error, nothing in
+<code>validate()</code> to catch it, because from <code>validate()</code>'s
+point of view the value is perfectly valid — it's just not the value whoever
+set the environment variable meant to provide. See this module's
+Improvement note.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+Every <code>env*</code> helper (<code>envInt</code>, <code>envFloat</code>,
+<code>envBool</code>, <code>envDuration</code>, <code>envDurationList4</code>
+— lines 214–272) silently discards a value that fails to parse and falls
+back to the default, with no log line anywhere in the package. A deployment
+config with a typo — <code>MAX_ROOMS=5oo</code>, or a malformed
+<code>PLAY_TIMEOUTS</code> list — boots successfully and quietly runs with
+defaults instead of the operator's intended override. This is exactly the
+kind of bug that's invisible in every environment except the one where the
+default happens to be wrong: staging behaves fine because the default is
+close enough, and the misconfiguration only surfaces as a mystery in
+production. A one-line <code>log.Printf</code> on the parse-failure branch of
+each helper would make this loud instead of silent, at effectively zero
+cost. There is also no test file in this package (confirmed:
+<code>backend/internal/config/</code> contains only <code>config.go</code>) —
+this parsing behavior, and the production-vs-development branches in
+<code>Load()</code>, are entirely unverified by anything but manual
+inspection.
+</div>
+</div>
+
+<h2 id="protocol"><code>protocol/protocol.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/protocol/protocol.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The Flutter client and the Go server are two independent codebases in two
+different languages that have to agree, byte for byte, on what a JSON
+message means. This file is that agreement written down in code: every
+frame type name, every field, every validation rule a client-sent frame must
+pass before any game logic ever sees it.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Optional fields are pointers, not zero-valued primitives.</strong>
+<code>Bid *int</code>, not <code>Bid int</code>. The struct's own comment
+explains why: "so 'absent' and 'zero' stay distinguishable — a bid of 0 is a
+different thing from no bid at all." A plain <code>int</code> can't tell you
+whether the client sent <code>{"bid": 0}</code> or omitted the field
+entirely — both decode to zero. A pointer that's <code>nil</code> means
+"wasn't there"; a pointer to <code>0</code> means "there, and it's zero."
+The alternative would be a separate boolean flag next to every optional
+field (<code>HasBid bool</code>, <code>Bid int</code>) — it works, but
+doubles the field count for the same information a pointer already carries
+for free.
+</p>
+<p>
+<strong>Validation happens once, at decode time, not scattered through the
+game logic that consumes the result.</strong> <code>DecodeClient</code>
+(below) is the single boundary: anything it returns without an error is
+guaranteed to have a known type, in-bounds strings, and the required fields
+for that type already present. Every package downstream — <code>room</code>,
+<code>ws</code> — can trust a <code>ClientFrame</code> completely rather than
+re-checking "does this bid frame actually have a bid?" at every call site.
+</p>
+<p>
+<strong><code>DefaultHandsPerGame = 5</code> is declared here independently,
+not imported from the engine's own constant.</strong> The comment is explicit
+about why: "protocol has zero internal dependencies and stays that way, so
+this is not derived from that constant." The engine package could easily
+export <code>engine.HandsPerGame</code> for this file to import — but doing
+so would make the wire-format package depend on the game-rules package,
+coupling two things that should be free to change independently. The
+trade-off is named directly in the comment: two numbers, in two packages,
+that have to be kept in sync by a human remembering to update both.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type ClientFrame struct {
+	Type string `json:"type"`
+	V    int    `json:"v,omitempty"`
+
+	Room         string `json:"room,omitempty"`
+	Mode         Mode   `json:"mode,omitempty"`
+	...
+	Bid  *int   `json:"bid,omitempty"`
+	Card string `json:"card,omitempty"`
+	...
+}</code></pre>
+<p>
+One struct holds every possible field of every frame type the client can
+send — <code>join</code>, <code>bid</code>, <code>play</code>, and so on all
+share it, each frame only populating the fields relevant to its
+<code>Type</code>. This is a "union by convention" rather than a Go-native
+tagged union (Go has no sealed enum like the Dart <code>GameEvent</code>
+hierarchy from <a href="02-game-engine.html">module 2</a>); the type-specific
+validation below is what enforces the convention.
+</p>
+<pre><code>func DecodeClient(data []byte) (ClientFrame, error) {
+	if len(data) > MaxFrameBytes {
+		return ClientFrame{}, fmt.Errorf(...)
+	}
+	var f ClientFrame
+	if err := json.Unmarshal(data, &f); err != nil {
+		return ClientFrame{}, fmt.Errorf(...)
+	}
+	switch f.Type {
+	case TypeJoin:
+		f.Room = strings.ToUpper(strings.TrimSpace(f.Room))
+		if f.Room == "" { return f, errors.New(...) }
+		if len([]rune(f.Room)) > MaxRoomRunes { return f, errors.New(...) }
+		f.Name = SanitizeName(f.Name)
+		...
+	case TypeBid:
+		if f.Bid == nil { return f, errors.New("protocol: bid needs a value") }
+	...
+	default:
+		return f, fmt.Errorf("%w: %q", errUnknownType, f.Type)
+	}
+	return f, nil
+}</code></pre>
+<p>
+Three layers of defense, in order: a hard size cap
+(<code>MaxFrameBytes = 4096</code>) rejects oversized junk before it's even
+parsed as JSON; <code>json.Unmarshal</code> rejects malformed JSON; and the
+type switch enforces per-type invariants — a <code>bid</code> frame without
+a bid value, a <code>join</code> with an empty or too-long room code, and an
+entirely unrecognized <code>Type</code> string are all rejected here, before
+any of it reaches the room actor built in module 13.
+</p>
+<pre><code>func SanitizeName(name string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f { return -1 }
+		return r
+	}, name)
+	cleaned = strings.TrimSpace(cleaned)
+	runes := []rune(cleaned)
+	if len(runes) > MaxNameRunes {
+		cleaned = string(runes[:MaxNameRunes])
+	}
+	if cleaned == "" { return "Guest" }
+	return cleaned
+}</code></pre>
+<p>
+Notice what <code>SanitizeName</code> does <em>not</em> do: it never
+rejects a frame over a bad name. Control characters are stripped, length is
+clamped, and an empty result becomes <code>"Guest"</code> — every input
+produces <em>some</em> valid output. This is the same graceful-degradation
+house style you saw for storage and audio in modules 7 and 8: a display name
+is cosmetic, so the correct response to a bad one is to clean it up, never
+to lock a player out of a card game over what they typed.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The duplicated <code>DefaultHandsPerGame</code> constant is a named,
+deliberate trade-off (see Decision above) rather than an oversight — but it's
+still a real drift risk with nothing enforcing it. If the engine's hand-count
+default ever changed in <code>backend/internal/engine/</code> without a
+matching edit here, <code>protocol.go</code> would keep resolving unspecified
+joins to the old value with no compiler error, no test failure, and no
+runtime signal — just tables silently created with the wrong hand count.
+There is no test in this package (only <code>protocol.go</code> and
+<code>server.go</code> exist under <code>backend/internal/protocol/</code>,
+no <code>_test.go</code> file) that cross-checks this constant against the
+engine's, which is the kind of guard that would turn a silent-drift bug into
+a loud, immediate one.
+</div>
+</div>
+
+<h2 id="server"><code>protocol/server.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/protocol/server.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Where <code>protocol.go</code> defines what the client sends, this file
+defines what the server sends back — the <code>joined</code>,
+<code>lobby</code>, <code>view</code>, <code>event</code>, <code>error</code>
+and <code>pong</code> frame shapes — and the functions that build and encode
+them, in one place next to the client-facing contract they implement.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong><code>EncodeView</code> splices JSON manually instead of wrapping the
+view in a struct with an embedded <code>Type</code> field.</strong>
+</p>
+<pre><code>func EncodeView(v *engine.View) ([]byte, error) {
+	body, err := json.Marshal(v)
+	if err != nil { return nil, err }
+	out := make([]byte, 0, len(body)+16)
+	out = append(out, `{"type":"view",`...)
+	out = append(out, body[1:]...)
+	return out, nil
+}</code></pre>
+<p>
+The comment names the reason directly: "The view's own keys are hoisted to
+the top level, which is the shape <code>RemoteSession._onMessage</code>
+reads: it passes the whole message straight to
+<code>GameView.fromJson</code>." The straightforward alternative — define a
+Go struct embedding <code>*engine.View</code> plus a <code>Type</code>
+field, and marshal that — would need Go's embedding-plus-JSON-tag machinery
+to actually flatten the keys the way the Dart side expects, or a second
+full marshal pass. This instead marshals the view once, then does string
+surgery: write the literal prefix <code>{"type":"view",</code>, then append
+everything from the marshaled view <em>except its opening brace</em>
+(<code>body[1:]</code>), which only works because a JSON object's marshaled
+form is guaranteed to start with <code>{</code>. It's a real performance
+win — one marshal instead of two, for what module 2 already told you is a
+comparatively large payload — at the cost of an invariant that's true today
+but isn't checked by the type system.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func NewJoined(seat int, room string, isHost bool, playerID, guest, resume string, reconnected bool) Joined {
+	return Joined{
+		Type: TypeJoined, Seat: seat, Room: room, IsHost: isHost,
+		PlayerID: playerID, GuestToken: guest, ResumeToken: resume,
+		Reconnected: reconnected,
+	}
+}</code></pre>
+<p>
+<code>Joined</code> carries the two tokens a client needs to keep playing
+across reconnects — a <code>GuestToken</code> identifying the player, and a
+<code>ResumeToken</code> identifying this specific seat (module 15 builds
+where these actually come from). <code>NewError</code> and
+<code>NewRedirect</code> follow the same pattern: a plain constructor
+function over a raw struct literal, so every call site gets the same
+required fields in the same order rather than risking a forgotten
+<code>Type</code> string.
+</p>
+<pre><code>func mustEncode(v map[string]any) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic("protocol: static frame failed to encode: " + err.Error())
+	}
+	return data
+}</code></pre>
+<p>
+<code>Countdown</code>, <code>AutoplayChanged</code>, <code>ReadyState</code>
+and <code>SeatChange</code> all funnel through <code>mustEncode</code>, which
+panics rather than returning an error. That's a deliberate narrowing: every
+call site passes a literal <code>map[string]any</code> built entirely from
+plain JSON-safe types (strings, ints, bools) known at compile time — there is
+no possible runtime input that makes <code>json.Marshal</code> fail on one of
+these, so a panic here can only mean a programmer wrote a genuine bug (for
+example, accidentally putting a channel or a function value in the map),
+which is exactly the class of error a panic is supposed to catch loudly
+during development rather than have every caller check an error that can
+never actually occur.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>EncodeEvent</code> wraps an engine event. What does it need to inject that the event itself doesn't carry?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>func EncodeEvent(e engine.Event) ([]byte, error) {
+	body := e.Wire()
+	body["type"] = TypeEvent
+	return json.Marshal(body)
+}</code></pre>
+<p>
+The frame envelope's <code>"type": "event"</code> key. <code>e.Wire()</code>
+(the Go engine's equivalent of the Dart <code>GameEvent</code> hierarchy's
+own JSON shape from module 2) returns the event's own fields as a map, but
+has no idea it's about to be wrapped in a wire frame — so
+<code>EncodeEvent</code> injects the outer envelope's <code>type</code> key
+into that same map before marshaling, the same top-level-hoisting shape
+<code>EncodeView</code> uses.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>EncodeView</code>'s byte-splicing (<code>body[1:]</code>) depends on an
+invariant that's true by construction today — <code>engine.View</code>
+marshals to a JSON object, so its encoded form always starts with
+<code>{</code> — but nothing enforces that invariant at compile time, and
+there is no test file in this package
+(<code>backend/internal/protocol/</code> has no <code>_test.go</code>) that
+locks it in. If a future change gave <code>engine.View</code> a custom
+<code>MarshalJSON</code> that could, under some condition, marshal to
+<code>null</code> (a nil pointer, for instance) or an array, this function
+wouldn't error — it would silently slice the wrong bytes off a string that
+isn't the JSON object it assumes, producing a frame that fails to decode on
+the Dart side with no clear signal at the point where the bad frame was
+actually built. A short unit test asserting
+<code>json.Marshal(&engine.View{})[0] == '{'</code>, or simply switching to
+struct embedding despite the extra marshal cost, would remove the risk
+entirely.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does the server fail to start in production with no <code>JWT_SECRET</code>, but generate a random one silently in development?</summary>
+<div class="answer">
+A random secret regenerated on every restart would boot successfully in
+production and then invisibly invalidate every previously issued token —
+a much worse failure to diagnose than a process that simply refuses to
+start. In development the same behavior is a minor, expected inconvenience
+while iterating, so it's allowed.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why is <code>Bid</code> declared as <code>*int</code> instead of <code>int</code> on <code>ClientFrame</code>?</summary>
+<div class="answer">
+A plain <code>int</code> can't distinguish "the client sent a bid of 0"
+from "the client sent no bid at all" — both decode to the zero value. A
+pointer's <code>nil</code> means absent; a pointer to <code>0</code> means
+present and zero, which a bid of zero legitimately can be.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>protocol.go</code> redeclare <code>DefaultHandsPerGame = 5</code> instead of importing the engine's own constant, and what does that decision cost?</summary>
+<div class="answer">
+Importing it would make the protocol package depend on the engine package,
+coupling the wire-format definition to the game-rules implementation. The
+cost, named directly in the code's own comment, is that the two values now
+have to be kept in sync by hand — nothing catches it if they drift apart.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>What does <code>DecodeClient</code> guarantee about any <code>ClientFrame</code> it returns without an error, and why does that matter to the packages downstream?</summary>
+<div class="answer">
+That the frame's type is one of the known types, its strings are within
+their length limits, and the required fields for that specific type are
+present. It matters because every downstream package (room, ws) can then
+trust a decoded frame completely instead of re-validating it at every call
+site — validation happens exactly once, at the boundary.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="10-lan.html">← Module 10: LAN Multiplayer</a>
+<a href="12-go-engine-port.html">Module 12: Engine Port to Go →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

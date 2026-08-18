@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17. REST API & Admin Dashboard — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m17">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 17 of 20</p>
+<h1>REST API &amp; Admin Dashboard</h1>
+<p class="lede">
+The socket carries play; everything request/response-shaped — signing in,
+reading a profile, listing history, uploading a solo game, and an
+operator's live dashboard — lives in <code>httpapi</code>. This module
+covers the wire contract (<code>wire.go</code>), the error vocabulary
+(<code>errors.go</code>), the middleware chain that every route runs
+through (<code>api.go</code>), REST's own rate limiter
+(<code>limit.go</code>), the one endpoint a client fully controls
+(<code>games.go</code>'s upload handler), and the admin token gate
+(<code>admin.go</code>).
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">ApiClient / GameUploader (Flutter, module 9) — REST caller</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">httpapi ◀ you are here — mounted beside /ws on the same mux</text>
+  <text x="32" y="98" fill="#9db0a4">Never blocks play: every route degrades to 503 with no database</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">db.Store (16) — every handler's actual read/write path</text>
+  <text x="32" y="154" fill="#9db0a4">auth.Signer (15) — verifies every session token, mints admin's own compare</text>
+  <text x="32" y="172" fill="#9db0a4">room.Hub (13) — what the admin dashboard actually reads live</text>
+</svg>
+</div>
+
+<h2 id="wirego"><code>httpapi/wire.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/httpapi/wire.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The REST equivalent of module 11's <code>protocol.go</code>: every JSON
+shape that crosses this boundary, collected in one file, mirroring
+<code>docs/API.md</code> block for block, so no handler ever writes a
+response body by hand.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Timestamps are formatted explicitly, never left to
+<code>time.Time</code>'s default marshaller.</strong>
+</p>
+<pre><code>func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }</code></pre>
+<p>
+The file comment names why: "<code>time.Time</code>'s own marshaller emits
+nanoseconds and a numeric offset, neither of which the document promises."
+Go's default JSON encoding of a <code>time.Time</code> is technically valid
+RFC 3339 but includes sub-second precision and whatever offset the value
+happens to carry — accurate, but not what the documented contract commits
+to. Formatting explicitly here is what keeps every timestamp the client
+receives shaped exactly as promised, regardless of what precision or
+timezone happened to be attached to the underlying Go value.
+</p>
+<p>
+<strong><code>statsJSON</code> deliberately omits every derived figure —
+win rate, average score, bid accuracy — exactly as <code>db.Stats</code>
+(module 16) does.</strong> The comment: "the client derives them, so the two
+can never disagree." The same "never store what can be computed" principle
+from module 16 crosses the wire boundary unchanged — this file could have
+computed and included a <code>winRate</code> field for convenience, but
+doing so would create a second place that number could go stale relative to
+its own inputs.
+</p>
+<p>
+<strong><code>uploadSeatJSON.UserID</code> is decoded, on purpose, even
+though the documented contract says it must never be sent.</strong> This is
+the one deliberate exception to <code>decodeBody</code>'s general "unknown
+fields are always safe to ignore" policy (covered under <code>api.go</code>
+below): a client that includes a <code>userId</code> in an upload isn't
+committing an unknown-field mistake Go should silently swallow — it's
+attempting something the server needs to actively refuse and explain, which
+<code>games.go</code>'s validation does. Decoding the field is what makes
+that refusal possible at all.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func nullableID(id string) *string {
+	if id == "" { return nil }
+	return &id
+}
+
+func score(f float64) float64 { return math.Round(f*100) / 100 }</code></pre>
+<p>
+Two small, consistently-applied conventions run through every constructor in
+this file: an empty id (a bot seat, or a human the server couldn't
+attribute — module 13's redaction-adjacent concept, applied here to
+identity rather than cards) becomes JSON <code>null</code> rather than an
+empty string, and every float that reaches a client is rounded to two
+decimals — matching the <code>numeric(6,2)</code> column module 16's schema
+actually stores it in, so a client never has to look at
+<code>13.199999999999999</code>, a float-representation artifact that was
+never really part of the data.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found. This package is, like <code>ws</code> (module 14) and
+<code>db</code> (module 16), genuinely well tested —
+<code>api_test.go</code> runs to 1,560 lines, the single largest test file
+anywhere in this backend. The pattern holds again: code at an external-facing
+edge gets careful test coverage in this codebase; the purely internal
+orchestration layer (module 13's <code>room</code> package) remains the
+outlier.
+</div>
+</div>
+
+<h2 id="errorsgo"><code>httpapi/errors.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/httpapi/errors.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every non-2xx response this package ever sends needs the same shape, and
+every one of the handful of ways a <code>db.Store</code> call can fail
+(module 16's sentinel errors) needs to become the exact same wire error
+every time, regardless of which of dozens of call sites hit it.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The error body is an object, not a bare string, specifically so it
+can grow without becoming a breaking change.</strong>
+</p>
+<pre><code>type errorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	ExistingUserID string `json:"existingUserId,omitempty"`
+}</code></pre>
+<p>
+The comment: "the reserved conflict response for <code>POST /v1/auth/link</code>
+adds <code>existingUserId</code> beside the code, and a client that ignores
+unknown keys keeps working either way." This is the identical
+additive-fields-are-safe philosophy module 11's protocol package states for
+the WebSocket wire format, applied to REST error responses — a field can be
+added to this envelope in the future without every existing client breaking,
+because nothing about the shape itself changed, only what's present in one
+specific error case.
+</p>
+<p>
+<strong><code>db.ErrDisabled</code> maps to <code>503</code>, not
+<code>500</code>.</strong> The comment: "persistence being off is a
+supported deployment (PERSISTENCE.md §5), not a fault." This distinction —
+between "the operator chose not to configure a database" and "something
+genuinely broke" — is the REST-facing expression of the exact same Nop-store
+philosophy module 16 builds the whole persistence layer around: a 503 tells
+a client (and an on-call engineer reading a status-code dashboard) "this is
+an expected, configured state," where a 500 would wrongly suggest a bug.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func storeError(w http.ResponseWriter, log *slog.Logger, op string, err error) {
+	switch {
+	case errors.Is(err, db.ErrDisabled):
+		writeError(w, http.StatusServiceUnavailable, codePersistenceDisabled, msgDisabled)
+	case errors.Is(err, db.ErrNotFound):
+		writeError(w, http.StatusNotFound, codeNotFound, msgNotFound)
+	case errors.Is(err, db.ErrConflict):
+		writeError(w, http.StatusConflict, codeConflict, ...)
+	default:
+		log.Error("store call failed", "op", op, "err", err)
+		writeError(w, http.StatusInternalServerError, codeInternal, msgInternal)
+	}
+}</code></pre>
+<p>
+Every handler in this package that touches the store funnels its error
+through this one function rather than writing its own status code — the
+comment notes only the unexpected, <code>default</code> branch is worth an
+error-level log line, since the three named cases above it are "ordinary
+outcomes," not bugs. This is the REST-layer counterpart to module 16's
+<code>Postgres.fail</code>: two different translation functions, at two
+different boundaries, both converting a small internal error vocabulary into
+whatever the layer above actually needs — Go sentinel errors here becoming
+wire error codes, driver errors there becoming Go sentinel errors.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found — a small, single-purpose file doing exactly one
+job (translate errors to responses) consistently across the whole package.
+</div>
+</div>
+
+<h2 id="apigo"><code>httpapi/api.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/httpapi/api.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Everything that has to happen to <em>every</em> request before a handler's
+actual logic runs — panic isolation, logging, the database-not-configured
+short-circuit, authentication, rate limiting — plus the route table that
+decides which handler a request even reaches.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Authentication runs before rate limiting on private routes,
+specifically so the limiter keys on an account, not an address.</strong>
+</p>
+<pre><code>func (s *Server) private(h http.HandlerFunc) http.Handler {
+	return s.recoverPanics(s.logRequest(s.requireStore(s.authenticate(s.limitByUser(h)))))
+}</code></pre>
+<p>
+The comment: "four players behind one café router must not share an
+allowance." Reversing the order — rate-limiting by IP before authenticating —
+would mean every phone on the same Wi-Fi network (a household, an office, a
+café) drained from one shared bucket regardless of how many distinct,
+legitimate accounts were behind it. Authenticating first means the limiter
+sees <code>"u:" + userID</code> — one bucket per real account — for every
+route that requires a session, and only the single unauthenticated route
+(<code>POST /v1/auth/device</code>, via <code>public</code>) has to fall
+back to limiting by address, because there's no account yet to key on.
+</p>
+<p>
+<strong><code>recoverPanics</code> re-panics on one specific, named
+sentinel instead of swallowing every panic uniformly.</strong>
+</p>
+<pre><code>if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+	panic(rec)
+}</code></pre>
+<p>
+The comment: "<code>http.ErrAbortHandler</code> is the documented way to
+abandon a response; it is not a bug and must be re-panicked for the server
+to see it." This is a specific piece of standard-library knowledge encoded
+directly into the recovery logic: Go's own <code>net/http</code> package
+uses a panic with this exact sentinel value as its blessed mechanism for a
+handler to deliberately abandon a response mid-flight, and the HTTP server
+itself is listening for that specific panic to handle the abandonment
+correctly. A recovery handler that caught <em>every</em> panic uniformly —
+the naive, seemingly-safer choice — would actually break that mechanism by
+intercepting it before the standard library ever saw it.
+</p>
+<p>
+<strong>Unknown JSON fields are accepted, not rejected, on every decode.</strong>
+<code>decodeBody</code> uses a plain <code>json.NewDecoder</code>, never
+calling <code>DisallowUnknownFields</code>. The comment: "docs/API.md
+promises that adding a field is safe, and that promise has to hold in both
+directions or a newer client cannot talk to an older server." A stricter
+decoder that rejected any JSON key it didn't recognize would be a real,
+defensible hardening choice in a different system — it can catch a client
+sending garbage it thinks means something. Here, it would break exactly the
+forward-compatibility guarantee the whole wire contract is built around: an
+app update that adds a field to a request would fail against any server
+that hasn't been redeployed yet.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearerToken(r)
+		if !ok { writeError(w, http.StatusUnauthorized, codeUnauthorized, msgUnauthorized); return }
+		userID, err := s.signer.VerifySession(token)
+		if err != nil || userID == "" {
+			s.log.Debug("rejected session token", "path", r.URL.Path, "err", err)
+			writeError(w, http.StatusUnauthorized, codeUnauthorized, msgUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(withUserID(r.Context(), userID)))
+	})
+}</code></pre>
+<p>
+The comment: "Every failure looks the same from outside — a client cannot
+learn whether a token was forged, expired or simply of the wrong kind."
+Every failure path returns the identical <code>401 unauthorized</code> with
+the identical message, and the actual reason is only ever logged at debug
+level server-side — the same principle as module 15's uniform
+<code>ErrWrongKind</code>/<code>ErrExpired</code>/<code>ErrSignature</code>
+treatment, applied at the HTTP layer: a distinguishable error response would
+hand an attacker a free oracle for probing which kind of forgery attempt
+came closest to working.
+</p>
+<pre><code>func (s *Server) requireStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.store.Enabled() {
+			writeError(w, http.StatusServiceUnavailable, codePersistenceDisabled, msgDisabled)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}</code></pre>
+<p>
+Notice this runs before <code>authenticate</code> in both chains — a
+deployment with no database answers 503 to every <code>/v1</code> route
+before it ever tries to verify a token, which is the correct order: there's
+no point checking a credential against a service that has nothing to serve
+regardless of whether it's valid.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>Handler()</code> registers routes like <code>"POST /v1/auth/device"</code> with the method baked into the pattern string. What does that buy over registering just <code>"/v1/auth/device"</code> and checking <code>r.Method</code> inside the handler?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>// Method-qualified patterns mean a GET to a POST-only route is a 405 from
+// the mux rather than something a handler has to check.
+mux.Handle("POST /v1/auth/device", s.public(s.handleDeviceAuth))</code></pre>
+<p>
+Go 1.22's <code>net/http.ServeMux</code> understands method-qualified
+patterns natively — a <code>GET</code> to a route registered only for
+<code>POST</code> gets an automatic <code>405 Method Not Allowed</code>
+straight from the standard library's router, before any of this package's
+own middleware or handler code runs at all. The alternative (registering a
+bare path and checking <code>r.Method == http.MethodPost</code> inside every
+handler) would mean writing that same check, and remembering to write it
+correctly, in every single handler in the package — one more thing that
+could be forgotten or gotten subtly wrong per route.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>clientIP</code> in this file is a byte-for-byte duplicate of
+<code>ws/server.go</code>'s function of the same name (module 14): same
+header-trust order (<code>X-Real-IP</code>, then the first hop of
+<code>X-Forwarded-For</code>, then the raw socket address), same lack of any
+trusted-proxy allowlist. Module 14 already covers the concrete risk in
+depth — an attacker connecting directly, bypassing any real load balancer,
+can spoof either header to make every request look like it's coming from a
+fresh address, defeating <code>limitByIP</code> (this file) and
+<code>ipLimiter</code> (module 14) alike. What's worth adding here is scope:
+this is now confirmed as a systemic pattern across <em>both</em> of this
+server's edges, WebSocket and REST, with the identical logic
+independently duplicated rather than shared from one place — meaning a fix
+also has to happen twice, in two files, unless the function is extracted
+into a shared package first.
+</div>
+</div>
+
+<h2 id="limitgo"><code>httpapi/limit.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/httpapi/limit.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The REST-side rate limiter — the same job module 14's
+<code>ws/limit.go</code> token bucket does for the socket, adapted to a
+protocol with no persistent connection to hang per-caller state off.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Keyed by string in a map, with inline sweeping — not one bucket per
+connection, because REST has no connection.</strong> The comment states the
+contrast directly: "Same shape as the socket's per-connection bucket
+... but keyed by a string, because REST has no connection to hang state
+off." Module 14's bucket got to be lock-free because exactly one goroutine
+(a connection's read pump) ever touched it; here, many concurrent requests
+for the same account or address all share one bucket, so
+<code>keyLimiter</code> needs both a map and a mutex module 14's version
+didn't.
+</p>
+<p>
+<strong>Sweeping stale buckets happens inline, on the request path, rather
+than on a background goroutine.</strong>
+</p>
+<pre><code>// Sweeping happens inline rather than on a background goroutine: a limiter
+// with no goroutine cannot outlive the server that made it, which matters
+// most in tests, where one is built per case.</code></pre>
+<p>
+A background goroutine ticking on its own schedule is the more obvious
+design, but it introduces a lifecycle problem: something has to stop that
+goroutine when the limiter is no longer needed, or it leaks — a real
+annoyance in a test suite that constructs a fresh <code>Server</code> (and
+therefore a fresh limiter) for every test case. Folding the sweep into
+<code>allow()</code> itself, gated by "has it been at least a minute since
+the last sweep," removes the lifecycle question entirely: the limiter is
+just a plain struct with no goroutine of its own, so it's collected exactly
+like any other value the moment nothing references it anymore.
+</p>
+<p>
+<strong>A full minute's worth of requests as the burst allowance, matching
+how REST traffic actually shapes up.</strong> The comment: "the client's
+real traffic is bursty (opening the profile fires three GETs at once) and
+then idle, which is exactly the shape a token bucket forgives." Module 14's
+socket-side bucket defaults to a much tighter 20-per-second rate with a
+40-message burst, appropriate to a steady stream of small game frames; this
+one is sized for a completely different traffic pattern — a screen opening
+that fires a handful of concurrent requests, then nothing for a while.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (l *keyLimiter) sweep(now time.Time) {
+	if now.Sub(l.lastSweep) < sweepEvery { return }
+	l.lastSweep = now
+	for key, b := range l.buckets {
+		if now.Sub(b.last) > idleEviction {
+			delete(l.buckets, key)
+		}
+	}
+}</code></pre>
+<p>
+Called from inside <code>allow()</code>, under the same lock, at most once
+per minute regardless of request volume — the comment on eviction is worth
+noting too: "Anything evicted comes back full, which is correct: a caller
+idle for that long has earned a full bucket anyway." A bucket that's
+disappeared from the map because nobody used it in five minutes is
+indistinguishable, on the next request, from a caller who's never been seen
+before — exactly the right behavior, since both cases deserve a fresh full
+allowance.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found. This is a small, well-adapted variant of the same rate-
+limiting pattern used elsewhere in the codebase, with each difference from
+the socket-side version (the map, the lock, the inline sweep, the burst
+size) traceable to a real, stated constraint specific to REST rather than
+an arbitrary divergence.
+</div>
+</div>
+
+<h2 id="gamesgo"><code>httpapi/games.go</code> — the upload handler</h2>
+<div class="filecard">
+<div class="path">backend/internal/httpapi/games.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Bots and LAN games are played entirely on a device and never touch the
+server live (modules 5 and 10) — the only way one reaches a player's
+history is for the device to upload it after the fact. That makes this
+endpoint unique in the whole package: it's the one place a client supplies
+an entire finished game record, not just a request for something the server
+already knows.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Seat ownership is rewritten from the session, never trusted from the
+payload — and a payload that tries to set it is refused outright, not
+silently corrected.</strong>
+</p>
+<pre><code>if seat.UserID != nil && *seat.UserID != "" {
+	return zero, fmt.Errorf("seats must not carry a userId; your own seat is taken from your session")
+}
+...
+for i := range seats {
+	if seats[i].Seat == yours {
+		seats[i].UserID = userID
+		break
+	}
+}</code></pre>
+<p>
+The comment on <code>uploadSeatJSON.UserID</code> (this module's
+<code>wire.go</code> section) already named the reasoning: a client
+attempting to set this field is "told plainly that seat ownership comes from
+the session, rather than having the field silently dropped and quietly
+believing it worked." This is the one field in the whole upload where
+silently ignoring an unexpected value (the package's normal, generous
+policy) would be actively dangerous — a client bug that thinks it's
+attributing a seat to some other account would otherwise fail invisibly,
+with the developer never finding out their attempt did nothing.
+</p>
+<p>
+<strong>Only <code>bots</code> and <code>lan</code> modes may be uploaded —
+<code>online</code> and <code>private</code> are refused outright.</strong>
+Both of those modes are played on the server, which records them itself
+(module 13's <code>Recorder</code>) — accepting an uploaded "online" result
+here would let any client simply assert it won a match no server ever
+adjudicated, exactly the kind of client-authoritative result module 16's
+<code>Source</code> field (<code>SourceServer</code> vs
+<code>SourceClient</code>) exists to keep separate. Rejecting the mode
+outright, rather than accepting it and marking it client-sourced anyway,
+closes the door entirely rather than relying on every downstream consumer
+remembering never to trust a client-sourced online game.
+</p>
+<p>
+<strong>Validation and record construction happen in one pass, in one
+function, rather than a validate-then-build split.</strong> The comment:
+"the seat that gets the caller's user id is decided in the same pass that
+proves there is exactly one <code>isYou</code> seat, so the two cannot drift
+apart." Splitting this into a separate validation function followed by a
+separate construction function is the more conventional shape — but it
+opens a real, if subtle, risk: two passes over the same data that are
+supposed to agree (which seat is "yours") could theoretically disagree if
+one were ever edited without the other. One function, one loop, closes that
+gap structurally rather than by convention.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>const (
+	maxSeats           = 4
+	maxHandsTotal      = 100
+	maxClientGameIDLen = 128
+	maxDifficultyLen   = 32
+)</code></pre>
+<p>
+Every one of these bounds exists because a client controls this payload
+completely — the comment on <code>maxHandsTotal</code> makes the reasoning
+for that one explicit: "it is multiplied by four to bound the hands array,
+and a client that sends a billion would make that check vacuous. A hundred
+is two decades of the longest format anyone plays." Every numeric or
+string-length limit in this file traces back to the same instinct: bound
+everything a client fully controls, generously enough that no real game
+ever brushes against the limit, tightly enough that a malicious or buggy
+payload can't turn a validation check into a multi-gigabyte allocation.
+</p>
+<pre><code>func parseUploadTime(field, raw string) (time.Time, error) {
+	if raw == "" { return time.Time{}, nil }
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s must be an RFC 3339 timestamp", field)
+	}
+	return t.UTC(), nil
+}</code></pre>
+<p>
+A malformed timestamp is refused outright rather than defaulted to
+<code>now()</code> or silently zeroed — the comment: "a game with a garbled
+clock would sort wrongly in a history list forever, and the client cannot
+fix it afterwards." Once a bad timestamp is committed to the database, the
+player has no way to correct it themselves; rejecting the whole upload at
+the boundary, where the client can actually retry with a fixed value, is
+the only point where this is still fixable.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found — and worth calling back explicitly to module 16's own
+improvement note on <code>db.RecordGame</code>: the
+<code>maxClientGameIDLen</code> check here (128 characters) is exactly the
+defense-in-depth validation this file performs correctly for the one caller
+that goes through it. The gap module 16 identified is specifically that
+this same discipline doesn't also exist independently inside the
+<code>db</code> package itself — this handler is doing its job properly;
+the concern is what protects <code>RecordGame</code> from any caller that
+isn't this handler.
+</div>
+</div>
+
+<h2 id="admingo"><code>httpapi/admin.go</code> — the token gate</h2>
+<div class="filecard">
+<div class="path">backend/internal/httpapi/admin.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A live, human-facing view of every table on this node plus the runtime-
+tunable pacing defaults, for an operator debugging a production issue —
+deliberately independent of the database (module 13's <code>Room.Snapshot</code>
+reads live in-memory state), because, per the file's own comment, "an
+operator needs the dashboard most exactly when something else has gone
+wrong."
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The admin token comparison is constant-time, the same defense
+module 15's <code>auth.Signer</code> uses for HMAC signatures.</strong>
+</p>
+<pre><code>func (s *Server) admin(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearerToken(r)
+		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(s.adminToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, codeUnauthorized, "That admin token is not valid.")
+			return
+		}
+		next(w, r)
+	})
+}</code></pre>
+<p>
+The comment: "the token is a credential an operator typed somewhere; timing
+it must not leak it." Exactly module 15's timing-oracle argument, applied to
+a completely different credential — an admin token is a single static
+secret rather than a signed, structured token, but it's just as vulnerable
+to the same byte-by-byte timing attack a naive comparison would permit.
+</p>
+<p>
+<strong>The dashboard's HTML shell is served without checking the token at
+all — only the data it fetches is gated.</strong>
+</p>
+<pre><code>mux.Handle("GET /admin", s.adminPage())                       // no s.admin(...) wrapper
+mux.Handle("GET /v1/admin/rooms", s.admin(s.handleAdminRooms)) // gated
+</code></pre>
+<p>
+This looks, at a glance, like an oversight — but it follows directly from
+how bearer tokens work: a plain browser navigation to a URL cannot attach an
+<code>Authorization</code> header, so if the shell itself required the
+token to load, there would be no way for an operator's browser to ever
+present it in the first place except through some other mechanism (a cookie,
+a token embedded in the URL) each carrying its own, arguably worse, set of
+risks. The comment states the actual security argument: "The page is a
+shell; every piece of data it shows comes from the API routes above it, so
+the token protects the whole thing rather than just this file." The HTML
+and JavaScript alone contain no player data, no game data, nothing from
+<code>db.Store</code> or <code>room.Hub</code> — real data only starts
+flowing once the page's own JavaScript makes its first authenticated
+<code>fetch()</code> call, at which point it can attach the token exactly
+like any other API client.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (s *Server) adminPage() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("X-Frame-Options", "DENY")
+		_, _ = w.Write(adminUI)
+	})
+}</code></pre>
+<p>
+<code>X-Frame-Options: DENY</code> is a small, specific defense worth
+noticing: it stops this one page from ever being loaded inside an
+<code>&lt;iframe&gt;</code> on another site, which closes off clickjacking —
+tricking an already-logged-in operator into clicking something on the real
+dashboard while believing they're interacting with a different page
+overlaid on top of it. The header is set here, on this one route, rather
+than globally — the rest of the REST API returns JSON, not a renderable
+page, so the same attack doesn't apply to it.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+Serving the dashboard shell without a token is a deliberate, well-reasoned
+choice (see Decision above), not an oversight — but it does still leak the
+existence and internal structure of an admin surface (route names, page
+layout, whatever the embedded JavaScript reveals about the API shape) to
+any unauthenticated request, which a determined attacker could use for
+reconnaissance even though the page carries no real data on its own. This
+is a genuinely low-severity concern given the actual data stays behind the
+constant-time-checked token regardless — worth naming as a real, if minor,
+residual information disclosure rather than a gap that needs fixing.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does authentication run before rate limiting on every private route?</summary>
+<div class="answer">
+So the limiter can key its bucket on the authenticated account rather than
+the caller's IP address — otherwise every device sharing one network
+address (a household, a café) would drain from one shared allowance
+regardless of how many distinct accounts were actually behind it.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does decodeBody accept unrecognized JSON fields instead of rejecting them as a hardening measure?</summary>
+<div class="answer">
+Because docs/API.md promises that adding a field to either side of the wire
+contract is always safe, and that promise has to hold in both directions —
+rejecting unknown fields would break a newer client talking to a server
+that hasn't been redeployed with the field it now sends.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does the game-upload handler refuse a payload that includes a userId on any seat, rather than silently ignoring it the way an unrecognized field elsewhere would be ignored?</summary>
+<div class="answer">
+Because silently dropping it would let a client believe an attempt to
+attribute a seat to some account had succeeded when it actually did nothing
+— a client bug or malicious attempt would fail invisibly. Refusing the
+whole request loudly is the only way the client author finds out
+immediately that seat ownership always comes from the session, never the
+payload.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why is the admin dashboard's HTML shell served without checking the admin token, while every API route it calls is gated?</summary>
+<div class="answer">
+A plain browser navigation cannot attach an Authorization header, so
+requiring the token to load the shell itself would leave no way for a
+browser to ever present it. The shell alone contains no real data — actual
+game and room data only flows once the page's own JavaScript makes its
+first authenticated request, at which point the token gate applies exactly
+like any other API caller.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="16-persistence.html">← Module 16: Persistence</a>
+<a href="18-observability-scaling.html">Module 18: Observability, Scaling & Deploy →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

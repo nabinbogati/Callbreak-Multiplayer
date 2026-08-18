@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15. Auth & Guest Identity — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m15">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 15 of 20</p>
+<h1>Auth &amp; Guest Identity</h1>
+<p class="lede">
+Three kinds of proof a client can carry — "I am this pseudonymous guest,"
+"I hold this specific seat," "I am this signed-in account" — all minted and
+checked by one small, self-contained file with no database and no external
+JWT library. This module builds <code>auth/auth.go</code> in full: it's
+short enough to read in one sitting, and dense enough to reward it.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">ws (14) — resolves guest tokens, verifies resume claims on join/reconnect</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">auth ◀ you are here — one Signer, three token kinds, zero database calls</text>
+  <text x="32" y="98" fill="#9db0a4">HMAC-signed, self-contained: anything holding the secret can verify offline</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">httpapi (17) — verifies session tokens on every REST call</text>
+  <text x="32" y="154" fill="#9db0a4">room (13) — GuestID is the identity a seat is keyed on</text>
+  <text x="32" y="172" fill="#9db0a4">config (11) — JWTSecret is the one key every Signer is built from</text>
+</svg>
+</div>
+
+<h2 id="authgo"><code>auth/auth.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/auth/auth.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every seat, every reconnect, every signed-in account needs a credential a
+client can carry and a server can check without a round trip — a WebSocket
+join has to be verified in microseconds, not with a database lookup for
+every single frame. This file is the entire credential system: mint a
+token, verify a token, nothing else.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A hand-rolled, single-algorithm token format — "a JWT in spirit
+without the algorithm-negotiation footguns."</strong> The package comment
+draws the comparison directly, and it's a real, well-known class of bug it's
+avoiding: general-purpose JWT libraries let the token itself declare which
+signing algorithm was used (including, notoriously, <code>"alg": "none"</code>
+in some historical implementations), and a server that trusts that
+declaration can be tricked into verifying a forged token against the wrong
+check entirely. This format has exactly one algorithm — HMAC-SHA256 — and it
+is a compile-time fact, not something read out of the token being verified.
+The cost of hand-rolling instead of using a library: no interoperability
+with anything expecting a real JWT, and every property (expiry handling,
+signature checking) has to be gotten right here rather than delegated to a
+maintained, widely-audited library.
+</p>
+<p>
+<strong>A <code>Kind</code> discriminator inside every token, checked by
+every <code>Verify*</code> function, so the three token types can never be
+substituted for each other.</strong>
+</p>
+<pre><code>func (s *Signer) VerifySession(token string) (userID string, err error) {
+	c, err := s.verify(token)
+	if err != nil { return "", err }
+	if c.Kind != kindSession {
+		return "", ErrWrongKind
+	}
+	return c.Subject, nil
+}</code></pre>
+<p>
+All three token kinds share the same envelope, the same signature, and
+mostly the same <code>claims</code> struct — a guest token, a resume token,
+and a session token are structurally almost identical (a subject, an
+expiry). Without a kind check, a valid, correctly-signed guest token would
+also pass signature verification as a "session" token, since HMAC alone
+proves nothing about the token's <em>intended purpose</em> — only that the
+server minted it. The package comment states the actual risk this closes:
+"a guest token can never be presented as a session and read someone's
+history." One extra field, checked at every verification, converts three
+overlapping formats into three information-theoretically distinct ones.
+</p>
+<p>
+<strong><code>ResolveGuest</code> fails open, not closed — an invalid guest
+token quietly becomes a fresh identity instead of an error.</strong>
+</p>
+<pre><code>func (s *Signer) ResolveGuest(token string) (id GuestID, minted string) {
+	if token != "" {
+		if existing, err := s.VerifyGuest(token); err == nil {
+			return existing, s.IssueGuest(existing)
+		}
+	}
+	fresh := NewGuestID()
+	return fresh, s.IssueGuest(fresh)
+}</code></pre>
+<p>
+This looks, at first glance, like it contradicts the constant-time-compare
+carefulness elsewhere in this same file — but it's the correct call for what
+a guest identity actually protects. A guest token asserts nothing more than
+"I am the same pseudonymous player as before" — there's no privileged data
+behind it, no account to take over, nothing to steal by forging one badly.
+The comment makes the reasoning explicit: "An expired or forged token is not
+an error the player should see — they simply become someone new, which is
+the correct behaviour for an anonymous guest system." Rejecting a bad guest
+token outright would only punish an ordinary player whose token expired
+after 30 days of not opening the app, for no security benefit at all.
+Compare this to <code>VerifySession</code> just below it, which rejects
+outright on any error — an account genuinely does have something worth
+protecting.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type claims struct {
+	Kind    string `json:"k"`
+	Subject string `json:"s"`
+	Room    string `json:"r,omitempty"`
+	Seat    int    `json:"t,omitempty"`
+	Expires int64  `json:"e"`
+	Nonce   string `json:"n,omitempty"`
+}
+
+func (s *Signer) sign(c claims) string {
+	payload, _ := json.Marshal(c)
+	body := base64.RawURLEncoding.EncodeToString(payload)
+	return body + "." + base64.RawURLEncoding.EncodeToString(s.mac([]byte(body)))
+}</code></pre>
+<p>
+One <code>claims</code> struct covers all three token kinds — a guest token
+only ever populates <code>Kind</code>/<code>Subject</code>/<code>Expires</code>;
+a resume token additionally carries <code>Room</code>/<code>Seat</code>/<code>Nonce</code>;
+a session token is the same shape as a guest token with a different
+<code>Kind</code> and a <code>Subject</code> that's a real account id
+instead of a pseudonymous one. Every token is exactly two base64url segments
+joined by a dot: the JSON claims, and an HMAC-SHA256 signature over those
+exact bytes — abbreviated JWT structure with the middle "header" segment
+(where the alg-confusion problem lives in a real JWT) simply not existing.
+</p>
+<pre><code>func (s *Signer) verify(token string) (claims, error) {
+	body, sig, ok := strings.Cut(token, ".")
+	if !ok || body == "" || sig == "" { return claims{}, ErrMalformed }
+	want, err := base64.RawURLEncoding.DecodeString(sig)
+	...
+	if subtle.ConstantTimeCompare(want, s.mac([]byte(body))) != 1 {
+		return claims{}, ErrSignature
+	}
+	...
+	if s.now().Unix() >= c.Expires {
+		return claims{}, fmt.Errorf("%w at %d", ErrExpired, c.Expires)
+	}
+	return c, nil
+}</code></pre>
+<p>
+The comment on the compare is the whole point of using
+<code>subtle.ConstantTimeCompare</code> instead of Go's ordinary
+<code>==</code> or <code>bytes.Equal</code>: "a timing oracle here would let
+an attacker forge a token byte by byte." A naive byte-by-byte comparison
+that returns as soon as it finds a mismatch takes measurably less time to
+reject a signature that's wrong in its first byte than one that's wrong in
+its last — repeated enough times, that timing difference is a real,
+demonstrated attack (a timing side-channel) that lets an attacker recover a
+valid signature one byte at a time without ever knowing the secret.
+<code>ConstantTimeCompare</code> always takes the same time regardless of
+where the mismatch is.
+</p>
+<p>
+Signer's <code>now</code> field, defaulting to <code>time.Now</code>, is a
+small but deliberate testability seam — nowhere in <code>auth.go</code>
+itself is it swapped, but it's what lets <code>auth_test.go</code> construct
+a <code>Signer</code> whose clock can be advanced deterministically to test
+expiry, instead of a real test having to <code>time.Sleep</code> for actual
+hours to prove a token expires.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>IssueResume</code> generates a random 6-byte nonce for every token, even though two resume tokens for the same seat carry identical <code>Room</code>/<code>Seat</code>/<code>Subject</code> claims otherwise. What actual problem does the nonce solve?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>// The nonce keeps two tokens for the same seat from being byte-identical,
+// so a token re-issued after a reconnect does not collide in logs or caches.
+func (s *Signer) IssueResume(player GuestID, room string, seat int) string {
+	nonce := make([]byte, 6)
+	rand.Read(nonce)
+	return s.sign(claims{ ..., Nonce: base64.RawURLEncoding.EncodeToString(nonce) })
+}</code></pre>
+<p>
+Without it, every resume token minted for the same player, same room, same
+seat, within the same second (so an identical <code>Expires</code> too)
+would encode to the exact same bytes — the <code>claims</code> struct's
+other fields would all be identical, and JSON marshaling is deterministic.
+A player who reconnects several times in quick succession
+(<code>confirmSeat</code>, module 14, re-issues a resume token on every
+successful join) would then present byte-identical tokens across separate
+reconnects — harmless for correctness, since the token still verifies fine,
+but exactly the kind of accidental duplication that makes a cache keyed on
+token value, or a log line grepped for one, misleadingly ambiguous about
+which reconnect it actually belongs to. Six random bytes per issuance
+removes the coincidence entirely.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<strong>No revocation mechanism exists anywhere in this codebase for any
+token kind.</strong> Confirmed by search: there is no "revoke," "blacklist,"
+or "banned" concept anywhere under <code>backend/internal/</code>. Because
+every token here is a stateless, self-contained HMAC signature — the whole
+design's point, and the reason a WebSocket join needs no database round
+trip — the server has no way to invalidate a specific token before its own
+expiry. A stolen session token (30-day <code>SessionTTL</code>) remains
+fully valid for up to 30 days even if the player immediately notices and
+wants to sign out everywhere; there is no server-side operation that could
+stop it, short of rotating the entire server's <code>JWTSecret</code> (module
+11), which would simultaneously invalidate every other player's tokens on
+the whole fleet too — there is also no key-ID field or multi-secret
+verification support, so a secret rotation is an all-or-nothing event with
+no graceful overlap window. This is a real, if narrow, gap for a game where
+account takeover isn't a high-value target today — but it is exactly the
+kind of gap that becomes urgent the moment real-money features, purchases,
+or anything else worth protecting gets added to the account system this
+token type is built to represent. A minimal fix (a short server-side
+deny-list of specific token signatures or subjects, checked in addition to
+the signature/expiry check, with its own short TTL matching the token's
+remaining life) would close this without giving up the no-database-lookup
+property for the overwhelming majority of ordinary, non-revoked tokens.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does this token format have exactly one hard-coded signing algorithm instead of letting the token declare which one to use?</summary>
+<div class="answer">
+Letting a token declare its own algorithm is a well-known real vulnerability
+class in general-purpose JWT implementations — a forged token can claim a
+weaker or absent algorithm and trick a careless verifier into accepting it.
+Hard-coding HMAC-SHA256 as a compile-time fact removes that entire attack
+surface at the cost of losing interoperability with standard JWT tooling.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does every Verify* function check a Kind field, given all three token types already have valid, correctly-signed HMAC signatures?</summary>
+<div class="answer">
+A valid signature only proves the server minted the token — it says nothing
+about which of the three purposes it was minted for, since guest, resume,
+and session tokens share almost the same claims shape. Without the Kind
+check, a genuine guest token would also pass as a valid session token,
+letting a pseudonymous guest read an account's private history.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does ResolveGuest silently mint a fresh identity on an invalid or expired token, while VerifySession rejects outright on the same kind of error?</summary>
+<div class="answer">
+A guest token protects nothing of value beyond continuity with a previous
+anonymous play history — rejecting a bad one would only punish an ordinary
+player whose token simply expired, with no security benefit. A session
+token names a real account with real data behind it, where accepting a
+forged or expired one would be a genuine security failure.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>What's the actual, demonstrated risk that subtle.ConstantTimeCompare defends against, and why doesn't a plain byte comparison do the same job?</summary>
+<div class="answer">
+A naive comparison returns as soon as it hits the first mismatching byte,
+which takes measurably less time than comparing a signature that matches
+further in — repeated many times, that timing difference lets an attacker
+reconstruct a valid signature one byte at a time without ever seeing the
+secret. A constant-time compare always takes the same time regardless of
+where a mismatch occurs, so it leaks nothing through timing.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="14-websocket-edge.html">← Module 14: WebSocket Edge</a>
+<a href="16-persistence.html">Module 16: Persistence (Postgres & Redis) →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

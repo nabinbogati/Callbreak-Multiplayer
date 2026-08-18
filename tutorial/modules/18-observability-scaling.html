@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18. Observability, Scaling & Deploy — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m18">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 18 of 20</p>
+<h1>Observability, Scaling &amp; Deploy</h1>
+<p class="lede">
+The last backend module ties every earlier one together: <code>obs.go</code>
+(logging, metrics, health checks), <code>cmd/server/main.go</code> (the
+actual startup and shutdown sequence that wires up everything modules
+11–17 built), the deploy files (<code>Dockerfile</code>,
+<code>docker-compose.yml</code>), and <code>cmd/loadtest</code> — a tool
+that proves the server holds up under many simultaneous tables by playing
+real games against it, not by guessing.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">config, protocol, engine, room, ws, auth, db, httpapi (11–17)</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">obs, cmd/server ◀ you are here — everything above, wired and running</text>
+  <text x="32" y="98" fill="#9db0a4">cmd/loadtest proves it under load; Dockerfile/compose ship it</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">Part III complete after this module.</text>
+  <text x="32" y="154" fill="#9db0a4">Module 19: build it yourself. Module 20: the roadmap from here.</text>
+</svg>
+</div>
+
+<h2 id="obsgo"><code>internal/obs/obs.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/obs/obs.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+"Is it up, is it busy, is it slow" — three questions an operator needs
+answered without reading source code, answered by structured logs, a
+Prometheus metrics endpoint, and separate liveness/readiness checks, all in
+one small package so no game logic file needs its own instrumentation
+plumbing.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Readiness and liveness are two different signals, not one.</strong>
+</p>
+<pre><code>type Health struct { ready atomic.Bool }
+func (h *Health) Drain() { h.ready.Store(false) }
+func (h *Health) Ready() bool { return h.ready.Load() }</code></pre>
+<p>
+The comment: "a draining node is still alive (it must finish its games) but
+must stop receiving new traffic." <code>/healthz</code> always answers
+<code>200</code> as long as the process is running at all; <code>/readyz</code>
+answers <code>503</code> the moment <code>Drain()</code> is called. This
+distinction is what lets a load balancer or an orchestrator stop routing
+new players to a node that's mid-shutdown, while every other system (a
+process supervisor watching for a crashed process) still correctly sees the
+node as alive and doesn't restart it out from under its own graceful drain
+— covered concretely in <code>main.go</code> below.
+</p>
+<p>
+<strong>Structured JSON logs in production, human-readable text in
+development — chosen by the same <code>Env</code> config field everything
+else in this codebase branches on.</strong>
+</p>
+<pre><code>func NewLogger(level, env string) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLevel(level)}
+	if strings.EqualFold(env, "production") {
+		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+	}
+	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+}</code></pre>
+<p>
+A production log line needs to be machine-parseable — ingested by whatever
+log aggregator a real deployment uses, queried by field, alerted on. A
+developer staring at a terminal while running <code>go run ./cmd/server</code>
+locally needs the opposite: something legible at a glance, without a
+<code>jq</code> pipeline. One function, one branch, serving both audiences
+correctly.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>RoomStep = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "callbreak_room_step_seconds",
+	Help:    "Time a room actor spends handling one message, including fan-out.",
+	Buckets: prometheus.ExponentialBuckets(0.0001, 3, 8),
+})</code></pre>
+<p>
+This is the one histogram in the whole metrics set — the comment on the
+variable block above it explains why the rest are counters and gauges
+instead: "Counters and gauges are cheap enough to update on every message;
+the histograms are deliberately few." A histogram is more expensive to
+record (it has to sort a value into a bucket) and more expensive to store
+and query, so this codebase reserves it for the one number that actually
+needs a distribution rather than a running total: how long a room actor's
+<code>handle</code> (module 13) takes per message, from a fast bid to a
+slower fan-out across four sockets. The buckets themselves are exponential
+— starting at 0.0001 seconds, multiplying by 3 each step, eight buckets —
+appropriate for a latency measurement that could plausibly span three or
+four orders of magnitude between a fast step and a slow one; linear buckets
+would waste most of their resolution on a range that's rarely interesting.
+</p>
+<p>
+Every metric here is a package-level variable, created once via
+<code>promauto</code> at package initialization, rather than a struct
+threaded through every function that needs to record something —
+Prometheus's own idiom (there is exactly one process-wide registry a
+scraper reads from) makes the global genuinely appropriate here, unlike
+most of this codebase's careful avoidance of shared mutable state.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>/metrics</code> is mounted on the same public HTTP mux as
+<code>/ws</code> and every REST route, with no authentication at all —
+unlike <code>/admin</code> (module 17), which is gated behind a
+constant-time-checked token. Anyone who can reach the server's public port
+can scrape <code>callbreak_rooms_active</code>,
+<code>callbreak_players_connected</code>, per-error-code counts, and every
+other operational metric this package exposes, with zero credentials. This
+is common practice in deployments where the metrics port sits behind a
+private network boundary a scraper reaches but the public internet
+doesn't — but this server has no such boundary of its own: <code>/metrics</code>
+shares the exact same address and port
+(<code>cfg.Addr</code>) as the public game traffic, so a deployment that
+doesn't separately firewall or reverse-proxy this path is exposing
+internal operational data (how many tables and players are live right now,
+error rates by code) to the same audience as the game itself. Binding
+metrics to a second, non-public port — or gating it behind the same admin
+token module 17 already has available — would close this without much
+code.
+</div>
+</div>
+
+<h2 id="maingochunk"><code>cmd/server/main.go</code></h2>
+<div class="filecard">
+<div class="path">backend/cmd/server/main.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every module from 11 through 17 built one piece — config, the wire format,
+the engine, the room actor, the socket edge, auth, persistence, the REST
+API. Nothing runs until something constructs all of them in the right order
+and wires their dependencies together. This file is that something, and it
+is also where a signal to stop is turned into an orderly, game-respecting
+shutdown instead of a process that just vanishes.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Two separate contexts — one for the HTTP server, cancelled on
+signal; one for rooms, cancelled deliberately later.</strong>
+</p>
+<pre><code>ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+// Rooms outlive the signal context by design: when a signal arrives we want
+// to drain gracefully, not tear tables down mid-trick, so they get their own
+// cancellable context that is cut only after the drain window.
+roomsCtx, closeRooms := context.WithCancel(context.Background())
+defer closeRooms()</code></pre>
+<p>
+If every room actor (module 13) were built from the same context the HTTP
+server listens on, a <code>SIGTERM</code> would cancel both simultaneously —
+every table's <code>run()</code> loop (module 13's <code>room.go</code>)
+would see <code>ctx.Done()</code> and call <code>shutdown()</code> instantly,
+disconnecting every player mid-trick with no chance for the deliberate,
+staged drain this file actually performs. Splitting the contexts is what
+makes "stop accepting new players, then let existing games finish, then
+shut tables down" possible at all — the rooms' own context isn't cancelled
+until <code>closeRooms()</code> runs, near the very end of the function.
+</p>
+<p>
+<strong>Only <code>DatabaseRequired</code> turns a failed Postgres
+connection into a fatal startup error — the default path logs loudly and
+keeps serving.</strong>
+</p>
+<pre><code>switch {
+case err == nil:
+	store = opened
+case cfg.DatabaseRequired:
+	return fmt.Errorf("connect to postgres: %w", err)
+default:
+	log.Error("PERSISTENCE DISABLED: could not connect to postgres; " +
+		"games will not be recorded and the REST API will answer 503. " +
+		"Set DATABASE_REQUIRED=true to make this fatal instead", "err", err)
+}</code></pre>
+<p>
+This is module 11's <code>DatabaseRequired</code> config flag, module 16's
+Nop-store philosophy, and module 17's 503-not-500 error mapping, all shown
+here as the single concrete decision point where they actually take effect.
+The log line is deliberately loud (<code>Error</code> level, in capitals,
+naming exactly what's lost and exactly which environment variable would
+change the behavior) precisely because — as the comment elsewhere in this
+codebase puts it — "a server quietly recording nothing is exactly the
+failure nobody notices for a week."
+</p>
+<p>
+<strong>Enabling Redis without setting <code>PUBLIC_URL</code> is a hard
+startup failure — the one place this codebase refuses to degrade
+gracefully into "just don't use the feature."</strong>
+</p>
+<pre><code>if cfg.RedisEnabled() {
+	endpoint := cfg.PublicURL
+	if endpoint == "" {
+		return errors.New("PUBLIC_URL is required alongside REDIS_URL: " +
+			"other nodes need an address to redirect players to")
+	}
+	...
+}</code></pre>
+<p>
+Every other optional dependency in this codebase (no database, no admin
+token, no Redis at all) degrades to "that feature simply doesn't run."
+Redis <em>enabled</em> with no <code>PUBLIC_URL</code> is different: this
+node would still register room claims (module 16's <code>Redis.Claim</code>)
+under an empty endpoint string, meaning every other node in the fleet that
+looked this room up would learn "it's elsewhere" with nowhere to actually
+send a player — a registry that's actively wrong is worse than no registry
+at all, which is why this specific misconfiguration fails loudly at boot
+rather than degrading.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>log.Info("shutting down", "grace", cfg.ShutdownGrace)
+health.Drain()                                    // 1. stop new players
+srv.Shutdown(shutdownCtx)                          // 2. stop accepting HTTP/WS upgrades
+hub.CloseAll()                                     // 3. every room finishes and exits
+recorder.Shutdown(drainCtx)                        // 4. flush whatever CloseAll produced
+closeRooms()                                       // 5. cancel the rooms' own context</code></pre>
+<p>
+Five ordered steps, and the comment on step 4 names exactly why it has to
+come after step 3, not before or alongside it: "Only now, with every table
+closed and its final scoreboard submitted, is there a complete set of
+writes to flush. Draining before <code>CloseAll</code> would leave exactly
+the games that ended during shutdown unrecorded." A recorder drained too
+early would flush whatever was queued <em>so far</em> and then stop
+accepting new submissions — silently dropping the handful of games that
+happen to finish during the shutdown window itself, which is precisely the
+subset of games a rushed implementation would be most likely to lose without
+ever noticing.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>hub.Recorder</code> is built and assigned even when the store is a Nop (no database configured at all). Why bother, if <code>Submit</code> on a disabled recorder does nothing?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>// Built even when the store is a Nop, where Submit is a no-op and nothing
+// has to branch.
+recorder := room.NewRecorder(store, log)
+hub.Recorder = recorder</code></pre>
+<p>
+Because the alternative is a conditional: build a recorder only when a
+database exists, and leave <code>hub.Recorder</code> nil otherwise — which
+would push a nil-check onto every room actor that calls
+<code>r.recorder.Submit(rec)</code> (module 13). Module 16's
+<code>Recorder</code> already handles a disabled store internally
+(<code>enabled()</code> returns false, <code>Submit</code> becomes a no-op)
+— so building one unconditionally here means every room actor can call
+<code>Submit</code> without ever asking whether persistence exists. The same
+Null Object pattern as <code>db.Nop</code> itself, one level up.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<strong><code>hub.CloseAll()</code> has no timeout of its own, and the total
+worst-case shutdown time isn't bounded to fit inside any single deadline.</strong>
+The sequence is: <code>srv.Shutdown</code> bounded by one
+<code>cfg.ShutdownGrace</code> window (20 seconds by default, module 11),
+then <code>hub.CloseAll()</code> — which, per module 13's
+<code>room.go</code>, waits unconditionally on every room's
+<code>&lt;-r.Done()</code> with no context or deadline parameter at all —
+then <code>recorder.Shutdown</code> bounded by a <em>second</em>, separate
+20-second window. If even one room actor is slow to exit (a goroutine stuck
+somewhere, or simply many hundreds of tables each taking a moment to tear
+down), <code>hub.CloseAll()</code> can run indefinitely with nothing in this
+file able to interrupt it — and even in the ordinary case, the sum of two
+full 20-second grace windows plus whatever <code>CloseAll</code> takes can
+comfortably exceed the default termination grace period most container
+orchestrators use before sending an unconditional <code>SIGKILL</code>
+(Kubernetes' commonly-used default is 30 seconds). A <code>SIGKILL</code>
+arriving mid-<code>CloseAll</code> would abandon every table that hadn't
+finished tearing down yet — precisely the mid-trick, ungraceful teardown
+this entire five-step sequence exists to prevent, defeated by its own total
+duration exceeding the window the deploying operator actually has to work
+with. Threading a single overall deadline through all three steps —
+shrinking each phase's share as time is spent — would keep the total bounded
+by one number an operator can actually configure to match their
+orchestrator's real grace period.
+</div>
+</div>
+
+<h2 id="deploychunk">Shipping it: <code>deploy/Dockerfile</code> &amp; <code>docker-compose.yml</code></h2>
+<div class="filecard">
+<div class="path">backend/deploy/Dockerfile, backend/deploy/docker-compose.yml</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A minimal, reproducible container image, and a compose stack that runs the
+server alongside real Postgres and Redis instances — "local
+production-shaped," per the compose file's own header comment, so a
+developer can exercise the exact multi-service topology a real deployment
+would have, on one machine.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The container's entrypoint is an exec-form array, specifically so
+the server receives <code>SIGTERM</code> directly rather than through a
+shell that would swallow it.</strong>
+</p>
+<pre><code># The server handles SIGTERM itself: it stops accepting players, drains the
+# tables, then exits. Do not wrap it in a shell, which would swallow the signal.
+ENTRYPOINT ["/usr/local/bin/server"]</code></pre>
+<p>
+This is a direct, concrete link back to <code>main.go</code>'s entire
+graceful-shutdown sequence: Docker (and Kubernetes, and any orchestrator)
+sends <code>SIGTERM</code> to PID 1 inside the container when it wants a
+clean stop. The exec-form <code>ENTRYPOINT</code> (a JSON array) runs the
+binary directly as PID 1; the alternative shell form
+(<code>ENTRYPOINT server</code>) would run <code>/bin/sh -c server</code>
+instead, and a plain shell does not forward signals to the child process it
+launched by default — the Go binary would never see the
+<code>SIGTERM</code> at all, and the five-step drain this module already
+covered would simply never trigger, no matter how carefully it was written.
+</p>
+<p>
+<strong>Postgres gets a named volume; Redis deliberately does not.</strong>
+<code>postgres-data</code> is the only volume in the compose file, and the
+comment explains the asymmetry directly: "Redis is soft state and
+deliberately gets no volume. Postgres is the opposite: accounts and match
+history are the only things in this stack that cannot be regenerated."
+This is the same authoritative-versus-advisory distinction module 16 draws
+between the two stores, expressed here as an infrastructure choice rather
+than application code: Redis's room-ownership registry rebuilds itself from
+each node's own heartbeats within about a minute of a restart (module 16),
+so persisting it across container restarts would buy nothing; Postgres's
+history genuinely cannot be reconstructed from anything else.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>depends_on:
+  postgres:
+    condition: service_healthy
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U callbreak -d callbreak"]
+  ...
+  start_period: 10s</code></pre>
+<p>
+<code>condition: service_healthy</code>, not merely <code>service_started</code>,
+is what makes this wait for real: "the server applies migrations at boot
+[module 16], so it has to wait for Postgres to be accepting queries rather
+than merely for the container to exist." The comment on the healthcheck
+itself flags a specific, easy-to-miss detail: <code>pg_isready</code> with
+no <code>-U</code>/<code>-d</code> flags checks the default root role, which
+can report healthy before Postgres's own entrypoint script has finished
+creating the application's actual database and user — "precisely the
+window the server would otherwise start in" and fail its migration step
+against a database that doesn't exist yet.
+</p>
+<p>
+The Dockerfile's own build stage explains its size choices inline: CGO
+disabled ("the result runs on a scratch-like base" — no dynamic C library
+dependencies to drag into the runtime image), <code>-trimpath</code> and
+stripped debug symbols ("halves the image for a service nobody debugs in
+place"). That last one is a real, named trade-off rather than a free win —
+a shipped image with no debug symbols means a future core dump or live
+debugger session against a running production container needs a separately-
+built debug binary; the Dockerfile accepts that cost deliberately for a
+smaller, faster-to-pull image.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No CPU or memory limits are set on any of the three services in
+<code>docker-compose.yml</code>. For a stack explicitly billed as
+"local production-shaped," this is a real gap for anyone using it as a
+starting template rather than purely a local dev convenience: an unbounded
+Postgres or Redis container under real load has nothing here stopping it
+from consuming all of the host's memory, which would take the game server
+down with it regardless of how carefully <code>main.go</code>'s own
+graceful-shutdown sequence is written. Adding <code>deploy.resources.limits</code>
+(Compose's resource-limit syntax) to each service would be a small,
+low-risk addition, though it does not change the fact that this file is
+explicitly a local/dev artifact rather than the actual production deploy
+manifest — real resource limits ultimately belong in whatever orchestrator
+config (Kubernetes, ECS, or similar) a genuine production deployment would
+use instead of Compose.
+</div>
+</div>
+
+<h2 id="loadtestchunk"><code>cmd/loadtest/main.go</code></h2>
+<div class="filecard">
+<div class="path">backend/cmd/loadtest/main.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A claim like "this server can hold 250 tables" is worthless without a way
+to actually try it — this tool drives real, concurrent games against a
+running server and reports the number that matters to a player: how long a
+move takes to be reflected back.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Every synthetic player is a genuine WebSocket client speaking the
+real protocol and playing only moves the server itself declared legal —
+never a mocked room actor, never a hand-crafted burst of raw frames.</strong>
+The package comment: "a rejected move is a server bug, not a lazy client."
+A load-testing tool that fires arbitrary or randomly-generated frames at the
+server would only ever measure how fast the server rejects garbage — this
+one measures the thing that's actually true of a real Call Break table: a
+bot reads the legal moves the server's own <code>view</code> frame reported
+(module 12's <code>LegalMoveIDs</code>) and picks one of those, so every
+successful move this tool sends is a move a real client's engine would also
+consider legal.
+</p>
+<p>
+<strong>Table creation is deliberately ramped over a window, not fired all
+at once.</strong>
+</p>
+<pre><code>ramp := flag.Duration("ramp", 5*time.Second, "spread table creation over this window")
+...
+// Ramping avoids measuring a thundering herd on connect rather than the
+// steady-state cost of play.</code></pre>
+<p>
+Two very different things could be measured here: how the server handles
+250 tables' worth of simultaneous <code>join</code> frames and WebSocket
+handshakes landing in the same instant (a connection-storm scenario), or how
+it handles 250 tables already up and running, steadily playing (the
+steady-state cost this tool actually wants to measure). Spreading table
+creation over a configurable window separates the two — the number the tool
+reports is about play, not about the handshake burst.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func main() {
+	...
+	run := &run{url: *url, humans: *humans}
+	var wg sync.WaitGroup
+	for i := 0; i < *tables; i++ {
+		if *ramp > 0 { time.Sleep(*ramp / time.Duration(*tables)) }
+		wg.Add(1)
+		go func() { defer wg.Done(); run.playTable() }()
+	}
+	...
+	run.report(*tables, time.Since(start))
+}</code></pre>
+<p>
+One goroutine per table, each running a full game to completion
+(<code>playTable</code>), all recording their move latencies into one
+shared, mutex-protected slice (<code>run.latencies</code>) — a small,
+purpose-built concurrent aggregator, not unlike module 14's per-connection
+token bucket in spirit: simple enough to trust by inspection, doing exactly
+one job. The <code>-humans</code> flag lets an operator simulate anywhere
+from a table with one human and three bots up to all four seats being real
+synthetic clients, since the two produce meaningfully different traffic
+patterns against the room actor (module 13 already covers how
+<code>serverDriven</code> seats and human turn clocks are scheduled
+differently).
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+This tool exercises steady-state play latency well, but nothing in it
+simulates the failure conditions module 13 and module 14 spend the most
+effort handling: a dropped connection mid-game, a reconnect racing a
+timeout, a turn clock actually expiring into autoplay. Those paths are
+covered by module 14's <code>resilience_test.go</code> and
+<code>autoplay_test.go</code> at the unit-test level, but there is no load-
+test equivalent that asks "what happens to move latency across the rest of
+the fleet when 5% of connections are dropped and reconnecting under load" —
+exactly the kind of question that matters most at the scale this tool
+exists to test. Extending it with a configurable disconnect/reconnect
+injection rate would close a real gap between what's unit-tested in
+isolation and what's been measured under realistic concurrent load.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does the server track readiness and liveness as two separate signals instead of one health check?</summary>
+<div class="answer">
+A node mid-graceful-shutdown is still genuinely alive — it has games it
+must finish — but must stop being sent new players. Collapsing the two into
+one check would either restart a perfectly healthy draining node (if tied
+to liveness) or keep routing new players to a node that's trying to shut
+down (if tied to nothing).
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does main.go build the room hub from a separate context than the one cancelled by the SIGTERM signal handler?</summary>
+<div class="answer">
+If every room actor shared the signal-cancelled context, a SIGTERM would
+tear down every table instantly and simultaneously, mid-trick, with no
+graceful drain at all. A separate, later-cancelled context for rooms is
+what makes "stop new players, let games finish, then close tables" possible
+as an ordered sequence instead of one abrupt cutoff.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why must the recorder be drained only after hub.CloseAll(), never before or in parallel?</summary>
+<div class="answer">
+Games that finish during the shutdown window itself are exactly the ones
+still in flight when CloseAll starts — draining the recorder any earlier
+would flush what was already queued and then stop accepting new
+submissions, silently losing the handful of games that happened to end
+during shutdown.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why is a shell-form ENTRYPOINT in the Dockerfile specifically wrong for this server, given how carefully main.go handles shutdown?</summary>
+<div class="answer">
+A shell form runs the binary as a child of /bin/sh rather than as PID 1
+itself, and a plain shell does not forward SIGTERM to its child by default.
+The Go process would never see the signal main.go's entire five-step
+graceful-shutdown sequence depends on, no matter how well that code is
+written.
+</div>
+</details>
+
+</div>
+
+<h2>Part III complete</h2>
+<p>
+Every backend module is now built: config and wire format, the ported
+engine, the room actor and matchmaking, the WebSocket edge, auth,
+persistence, the REST API and admin dashboard, and now the operational
+layer that logs, measures, ships, and gracefully stops all of it. Module 19
+is a hands-on challenge to rebuild pieces of this yourself; module 20
+collects every improvement note from this course into one prioritized
+roadmap.
+</p>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="17-rest-admin.html">← Module 17: REST API & Admin Dashboard</a>
+<a href="19-build-it-yourself.html">Module 19: Build It Yourself →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

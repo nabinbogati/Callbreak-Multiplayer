@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6. Core Table UI — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m06">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 6 of 20</p>
+<h1>Core Table UI</h1>
+<p class="lede">
+This is the milestone module: by the end of it, <code>flutter run</code> shows
+a real, playable game against bots on your screen. It wires
+<code>home_screen.dart</code>'s mode picker to a <code>LocalSession</code>
+(module 5), and renders it with <code>table_screen.dart</code> and its two
+foundational card widgets.
+</p>
+
+<p style="font-size:0.85rem;color:var(--text-dim)">
+<strong>Scope note:</strong> <code>table_screen.dart</code> is 3,209 lines —
+by far the largest file in the project (flagged in the Roadmap, module 20, as
+a maintainability concern in its own right). This module covers its
+orchestration pattern in depth with real excerpts and exact line numbers, not
+every widget inside it line-by-line. <code>playing_card_view.dart</code> and
+<code>hand_fan.dart</code>, the two files under it that do the most
+interesting work, are covered in full.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="32" fill="#4fd68c" font-weight="bold">UI ◀ you are here — home_screen, table_screen, hand_fan, playing_card_view</text>
+  <text x="32" y="48" fill="#9db0a4">First fully playable milestone: flutter run → real game vs bots</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="88" fill="#4fd68c">GameSession ✓ — session.dart, local_session.dart</text>
+  <rect x="20" y="122" width="440" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="144" fill="#4fd68c">Engine ✓ · Bot ✓</text>
+  <text x="32" y="160" fill="#9db0a4">card.dart, rules.dart, game.dart, bot.dart</text>
+</svg>
+</div>
+
+<h2 id="wiring">Wiring a mode to a session</h2>
+<div class="filecard">
+<div class="path">frontend/lib/ui/screens/home_screen.dart:839–889</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Something has to translate "the player tapped vs Bots" into an actual running
+game. This function is that single translation point — the one place in the
+codebase where a <code>GameMode</code> becomes a concrete
+<code>GameSession</code> implementation and gets handed to the screen that
+renders it.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>One function, branching on mode, that constructs the concrete session
+and pushes <code>TableScreen</code> with it</strong> — rather than, say,
+<code>TableScreen</code> itself deciding what kind of session to build from a
+mode parameter. Keeping session construction in the caller (here) and letting
+<code>TableScreen</code> only ever accept an already-built
+<code>GameSession</code> (module 5's contract) is what keeps the screen honestly
+ignorant of which mode it's rendering — it's the same decision as module 5's
+session abstraction, paid off at the call site.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>Future&lt;void&gt; startTable(BuildContext context, GameMode mode) async {
+  final settings = SettingsScope.of(context);
+
+  if (mode.isOffline) {
+    final details = await showJoinSheet(context, mode: mode);
+    if (details == null || !context.mounted) return;
+    _push(context, LocalSession(
+      playerName: settings.playerName,
+      difficulty: settings.difficulty,
+      mode: mode,
+      animationSpeed: settings.animationSpeed,
+      handsPerGame: details.handsPerGame ?? handsPerGame,
+    ));
+    return;
+  }
+  ...
+}
+
+void _push(BuildContext context, GameSession session) {
+  Navigator.of(context).push(
+    MaterialPageRoute&lt;void&gt;(builder: (_) =&gt; TableScreen(session: session)),
+  );
+}</code></pre>
+<p>
+<code>mode.isOffline</code> (defined in module 5's <code>session.dart</code> as
+<code>this == GameMode.bots</code>) is the entire branch that decides "build a
+<code>LocalSession</code>, no server talk at all." Every setting the offline
+game needs — player name, bot difficulty, animation speed, match length — comes
+straight from <code>AppSettings</code> (module 7) and the just-collected
+<code>details</code> from a join sheet, then flows into
+<code>LocalSession</code>'s constructor exactly as built in module 5. Notice
+<code>_push</code> — the function every branch eventually calls — takes the
+<em>abstract</em> <code>GameSession</code> type, not a specific subclass: that's
+what makes this the one place in the whole app that ever needs to know which
+concrete session type exists for which mode.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness in this exact function — it's a thin, honest dispatcher. (The
+online/LAN branches it also contains are covered in modules 9 and 10.)
+</div>
+</div>
+
+<h2 id="playingcardview"><code>ui/widgets/playing_card_view.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/ui/widgets/playing_card_view.dart:9–80</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every screen that shows a card — the hand fan, the felt, the scoreboard replay
+— needs the same visual card, just at different sizes (a 54pt hand card, a
+44pt table card). Without one shared widget, each of those would drift
+visually out of sync over time exactly the way <code>tokens.dart</code>
+(module 4) exists to stop colours from drifting.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Every internal measurement is a ratio of the widget's own
+<code>width</code> parameter (e.g. <code>width * (14 / 54)</code>) rather than
+going through <code>Metrics.s()</code> (module 4) directly inside this
+widget.</strong> This keeps <code>PlayingCardView</code> genuinely
+size-agnostic — hand this same widget class a width of 54 or 44 and every
+padding, border, and font size scales proportionally with it, with zero
+special-casing. The trade-off: the ratios themselves
+(<code>7/54</code>, <code>6/54</code>, <code>14/54</code>...) are "magic
+numbers" baked from the original 54pt design reference with no named constant
+explaining what each one represents — you have to trust the comment
+("Every internal measurement is derived from <code>width</code>") and infer the
+rest from the numbers themselves.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>final radius = width * (7 / 54);
+final pad = width * (6 / 54);
+...
+Text(card.label, style: AppText.bold(width * (14 / 54), inkColor)),
+SizedBox(height: width * (2 / 54)),
+Text(card.suit.symbol, style: AppText.bold(width * (16 / 54), inkColor)),</code></pre>
+<p>
+Whatever <code>width</code> is passed in, the corner radius is always
+7/54ths of it, the padding 6/54ths, and so on — so a card drawn at any size
+looks like a uniformly scaled photograph of the same card, never a
+differently-proportioned redraw. The caller (<code>HandFan</code>, next) is
+what actually decides <em>which</em> width to pass, using
+<code>Metrics.s()</code> upstream — this widget itself only knows about its
+own local proportions.
+</p>
+
+<details class="try">
+<summary>Try it yourself — why is <code>dimmed</code> implemented as an <code>Opacity</code> wrapper around the whole card, rather than, say, changing the card's own colours to greyed-out versions?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>return Opacity(
+  opacity: dimmed ? 0.45 : 1,
+  child: Container(...),
+);</code></pre>
+<p>
+One <code>Opacity</code> wrapper dims everything inside uniformly — face
+colour, ink, border, shadow — with a single value, regardless of which
+<code>CardStyle</code> (module 4) is active. Hand-picking a "dimmed" variant of
+every one of the six card-face palettes would be six times the work for a
+purely cosmetic state, with no functional benefit.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No functional weakness — the trade-off flagged above (unexplained scaling
+ratios) is a minor readability cost, not a correctness or robustness one.
+</div>
+</div>
+
+<h2 id="handfan"><code>ui/widgets/hand_fan.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/ui/widgets/hand_fan.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The player's hand isn't just a static row of cards — it has to lay out
+13 overlapping cards that reflow as cards are played, show which ones are
+legal to play right now, and accept either a tap or a drag-upward gesture to
+throw one. This file is all of that in one place, so <code>table_screen.dart</code>
+only has to hand it a hand and a set of legal ids and get playable cards back.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A card's pressed/dragged state is tracked by card <em>id</em>
+(<code>_pressedCardId</code>), not by list index.</strong> A card's index in
+the hand shifts every time another card is played and removed — tracking by
+id means the fan stays visually correct across a rebuild even if the pressed
+card's position in the list changed. The cost is one extra lookup
+(<code>widget.cards.indexWhere(...)</code>, line 151) every build to resolve
+the id back to a current index.
+</p>
+<p>
+<strong>Both tap-to-play and drag-to-play are supported simultaneously, with
+drag release triggered the instant the threshold is crossed rather than on
+finger-lift.</strong> The alternative — commit only when the finger actually
+lifts — reads as laggy for a fast, decisive flick. The cost is real gesture
+complexity: <code>_FanCard</code> tracks tap-down, tap-up, tap-cancel,
+drag-start, drag-update and drag-end as six separate callbacks, each with its
+own guard against double-firing (the <code>_thrown</code> flag), because a
+real touch gesture can transition between "might be a tap" and "is now a drag"
+mid-stream.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Fan layout — spacing differs by orientation on purpose
+(lines 108–139):</strong></p>
+<pre><code>final spacing = n &lt;= 1
+    ? 0.0
+    : m.isPortrait
+    ? (widget.cardWidth * 0.55).clamp(0.0, fillSpacing)
+    : fillSpacing.clamp(0.0, widget.cardWidth * 0.7);</code></pre>
+<p>
+Per the comment above this line: portrait rarely has enough width for 13 cards
+laid edge-to-edge, so it keeps the traditional overlapping fan at a fixed
+55%-of-card-width spacing. Landscape has width to spare, so spacing grows
+toward filling the available space — but capped at 70% of a card's width, so
+at least 30% always stays overlapped, which is what keeps the fan reading as
+one hand instead of a loose row of individual cards.
+</p>
+<p><strong>Throwing a card — commit on threshold, not on release
+(lines 378–389):</strong></p>
+<pre><code>void _onVerticalDragUpdate(DragUpdateDetails details) {
+  if (!_canDrag || !_dragging || _thrown) return;
+  setState(() { _dragOffset += details.delta; });
+  // Release as soon as the card has moved far enough, without waiting for
+  // the finger to actually lift — a decisive enough flick should commit
+  // right away rather than requiring the user to also let go.
+  if (-_dragOffset.dy &gt;= widget.dragThreshold) {
+    _throwCard();
+  }
+}</code></pre>
+<p>
+<code>dragThreshold</code> itself (set by the parent
+<code>HandFan.build</code>, module 5's sibling file) is <code>cardHeight * 0.3</code>
+— relative to the card's own rendered size, not a fixed pixel count, so "far
+enough to throw" feels the same whether the card is rendered small (portrait,
+many cards) or large (landscape). Once <code>_throwCard()</code> sets
+<code>_thrown = true</code>, every subsequent drag callback's guard clause
+(<code>if (... || _thrown) return;</code>) becomes a no-op — the card is
+already on its way out and nothing here should touch its state again.
+</p>
+
+<details class="try">
+<summary>Try it yourself — the comment on <code>_throwCard()</code> explains a real, previously-fixed visual bug. Read it, then guess what the bug looked like before the fix.</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>void _throwCard() {
+  _thrown = true;
+  _dragging = false;
+  // Deliberately not touching _pressed or _dragOffset here: the parent's
+  // state update (from onPlay, below) removes this card from the hand in
+  // the very same frame, so this widget is about to be unmounted outright.
+  // Resetting the zoom/lift/drag transforms first — as this used to do —
+  // meant they'd animate back toward the resting slot for a frame or two
+  // before disappearing, reading as the card snapping back into place
+  // before vanishing. ...
+  widget.onPlay?.call(widget.card, _releasePosition);
+}</code></pre>
+<p>
+Before this fix, resetting the drag offset/zoom state before notifying the
+parent meant the widget briefly re-rendered at its resting position — snapping
+back — for a frame or two before the parent's rebuild actually removed it from
+the hand. The fix is to change nothing about this widget's own visual state
+and let it simply vanish mid-throw, which reads as one continuous motion
+instead of a snap-then-disappear.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No functional weakness found — the gesture-state machine here is unusually
+well-commented for exactly the subtle interaction bugs (tap-vs-drag race,
+snap-back-then-vanish) that this class of UI code tends to hide. Worth
+studying as an example of documenting <em>why</em>, not <em>what</em>.
+</div>
+</div>
+
+<h2 id="tablescreen"><code>ui/screens/table_screen.dart</code> — orchestration</h2>
+<div class="filecard">
+<div class="path">frontend/lib/ui/screens/table_screen.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Everything built so far in Part II needs one place to actually come together
+on screen: subscribe to the session's view and events, render the felt, the
+seats, the hand, the bid panel, the scoreboard, and react to the session
+telling it something happened (a card played, a reconnect, a hand dealt).
+<code>TableScreen</code> is that place — the single widget every mode's table
+renders through.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>One <code>TableScreen</code>, driven purely by the
+<code>GameSession</code> abstraction, instead of a separate screen per mode</strong>
+(an <code>OfflineTableScreen</code>, <code>OnlineTableScreen</code>, etc). This is
+where module 5's whole session-abstraction decision cashes out: because every
+mode implements the same <code>GameSession</code> contract, one screen renders
+all of them, and any bug fix or visual change here benefits every mode at once.
+The one place mode-specific behaviour leaks back in is explicit type checks
+like <code>widget.session is RemoteSession</code> (line 196) and the
+<code>_isRealSession</code> getter (lines 216–219) — a deliberate, narrow
+exception, not a general pattern used throughout the file.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Subscribing to the session (lines 193–231):</strong></p>
+<pre><code>void initState() {
+  super.initState();
+  final session = widget.session;
+  _rejoined = session is RemoteSession &amp;&amp; session.resumeToken != null;
+  session.addListener(_onSessionChanged);
+  _eventsSub = session.events.listen(_onGameEvent);
+  if (_isRealSession) {
+    _maybeStartDeal();
+  }
+}
+
+@override
+void dispose() {
+  _autoPlayTimer?.cancel();
+  _presenceTimer?.cancel();
+  _eventsSub?.cancel();
+  AudioController.instance?.stopDeal();
+  widget.session.removeListener(_onSessionChanged);
+  widget.session.dispose();
+  super.dispose();
+}</code></pre>
+<p>
+This is the ChangeNotifier + Stream pattern from module 5, consumed exactly as
+that module predicted: <code>addListener(_onSessionChanged)</code> for "the
+view changed, rebuild," and a separate <code>StreamSubscription</code> on
+<code>events</code> for one-shot happenings (this is where sound effects are
+triggered, per the comment on <code>_eventsSub</code>: "Fired from the
+session's event stream so it covers local throws, bots and remote plays
+alike" — one listener, working identically no matter which
+<code>GameSession</code> implementation is behind it). <code>dispose()</code>
+tears down in the mirrored order: cancel timers and the event subscription
+first, then unsubscribe from the notifier, and — notably —
+<code>widget.session.dispose()</code> is called from <em>here</em>, the
+screen, not by whoever constructed the session. <code>TableScreen</code> takes
+ownership of the session's lifecycle the moment it's handed one.
+</p>
+<p>
+The <code>_isRealSession</code> check (lines 216–219) exists specifically so
+widget tests can hand <code>TableScreen</code> a plain, hand-built
+<code>GameSession</code> stub with an already-dealt view and skip the dealing
+flourish animation entirely — a real accommodation for testability, called out
+directly in the doc comment above it.
+</p>
+
+<p><strong>The build skeleton (lines 595–650, abbreviated):</strong></p>
+<pre><code>Widget build(BuildContext context) {
+  final session = widget.session;
+  final gameOver = session.view?.phase == GamePhase.gameOver;
+  final debugNetwork = switch (session) {
+    NetworkSession n =&gt; n,
+    _ =&gt; null,
+  };
+  final resuming = debugNetwork?.isResuming ?? false;
+  final showTable = session.isReady || (resuming &amp;&amp; session.view != null);
+
+  return PopScope(
+    canPop: false,
+    onPopInvokedWithResult: _handleBackGesture,
+    child: Scaffold(
+      body: MetricsScope(
+        builder: (context) {
+          final m = Metrics.of(context);
+          return Backdrop(
+            ...
+            child: SafeArea(
+              child: Listener(
+                behavior: HitTestBehavior.translucent,
+                onPointerDown: _handleTouch,
+                child: Stack(children: [
+                  Positioned.fill(
+                    child: showTable ? _TableBody(session: session, ...) : ...,
+                  ),
+                ]),
+              ),
+            ),
+          );
+        },
+      ),
+    ),
+  );
+}</code></pre>
+<p>
+Read the <code>showTable</code> line closely — it's the exact place module 5's
+<code>NetworkSession.isResuming</code> earns its existence: a session that's
+mid-reconnect (<code>resuming</code>) with a <code>view</code> still in hand
+keeps showing the last-known table instead of blanking to a loading spinner,
+"so the table is never swapped for a blank page," per the comment right above
+it. The outer <code>Listener</code> wrapping literally everything exists so
+<em>any</em> touch on the table — not just a card tap — counts as "the player
+is still here" and can cancel autoplay (module 5's <code>wakeUp()</code>), which
+is why it's <code>HitTestBehavior.translucent</code>: it must see every touch
+without stealing any of them from the widgets underneath.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The file's size itself is the improvement note: at 3,209 lines,
+<code>table_screen.dart</code> mixes screen-level orchestration (session
+lifecycle, build skeleton) with a large number of private presentation widgets
+that don't need to live in the same file (<code>_AutoplayBanner</code>,
+<code>_ThrowFlight</code>, <code>_DealOverlay</code>, <code>_ConnectionState</code>,
+<code>LobbyPanel</code> and its sub-widgets, and more — all defined in this one
+file per the class listing surveyed for this module). Splitting the
+self-contained overlay/animation widgets into their own files under
+<code>ui/widgets/</code> (as <code>felt_table.dart</code>, <code>seat_view.dart</code>
+etc. already are) would make each piece independently testable and reviewable
+without touching a 3,000+ line file, at the cost of a one-time, mechanically
+risky refactor across a file this central. See the Roadmap (module 20) for
+this listed as a maintainability item.
+</div>
+</div>
+
+<h2>Try it — get the game running</h2>
+<pre><code>cd frontend
+flutter pub get
+flutter run -d chrome   # or a connected device/emulator
+</code></pre>
+<p>
+Tap "vs Bots" on the home screen. You should be dealt a hand, be able to bid,
+and play a full game against three bots end to end — the first fully playable
+milestone of this project.
+</p>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>startTable</code> construct the concrete <code>GameSession</code> subtype (<code>LocalSession</code>, <code>RemoteSession</code>...) in <code>home_screen.dart</code> rather than inside <code>TableScreen</code> itself?</summary>
+<div class="answer">
+So <code>TableScreen</code> never needs to know which mode it's rendering — it
+only ever depends on the abstract <code>GameSession</code> contract from
+module 5. Keeping construction at the call site is what makes one screen able
+to render every mode identically.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>PlayingCardView</code> computes its proportions from its own <code>width</code> parameter rather than calling <code>Metrics.s()</code> internally. Why does that make it more reusable, not less?</summary>
+<div class="answer">
+It decouples the widget from any particular scale — hand it width 54 for a
+hand card or 44 for a table card and every internal measurement follows
+proportionally, with the caller (not this widget) deciding the actual size via
+<code>Metrics</code>. If it called <code>Metrics.s()</code> internally, it
+would be baking in one specific design-pixel reference rather than staying a
+size-agnostic ratio.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does dragging a card in <code>HandFan</code> commit the throw the instant the drag crosses a distance threshold, instead of waiting for the finger to lift?</summary>
+<div class="answer">
+Because a decisive, fast flick crosses the threshold well before the finger
+actually lifts, and waiting for the lift anyway would make a confident gesture
+feel laggy. Committing at the threshold is what makes a quick flick feel
+instantly responsive, at the cost of needing an explicit <code>_thrown</code>
+guard so no later drag callback can act on a card already on its way out.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>TableScreen</code> is one shared screen for every game mode, but it still contains a few explicit <code>is RemoteSession</code>/<code>is NetworkSession</code> checks. Does that contradict the session-abstraction decision from module 5?</summary>
+<div class="answer">
+Not quite — it's the same narrow exception module 5's <code>NetworkSession</code>
+subclass already anticipated: capability that only networked sessions have
+(reconnect state, resume tokens) genuinely doesn't exist on <code>LocalSession</code>,
+so a type check to reach it is the honest cost of that design, used sparingly
+and only where that capability is actually needed — not scattered as a general
+per-mode branching pattern through the rest of the screen.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="05-session-offline.html">← Module 5: Sessions & Offline Play</a>
+<a href="07-app-state.html">Module 7: Persistent App State →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

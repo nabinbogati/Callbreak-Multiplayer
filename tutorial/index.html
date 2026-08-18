@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build Call Break — Interactive Rebuild Course</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body data-page="overview">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Overview</p>
+<h1>Build Call Break From Scratch</h1>
+<p class="lede">
+A hands-on course that rebuilds the real <code>CallbreakMultiplayer</code> project —
+a Flutter card-game client and its Go multiplayer backend — one file at a time,
+in the order a competent developer actually wrote it. Every code excerpt in this
+course is copied verbatim from the real project on your disk; nothing here is
+invented for teaching purposes.
+</p>
+
+<h2>What this project is, in plain English</h2>
+<p>
+Call Break is a 4-player trick-taking card game (similar to Spades/Whist family
+games). This project is a full client-server implementation of it:
+</p>
+<ul>
+<li>A <strong>Flutter app</strong> (Android/iOS/web/desktop from one codebase) that
+can be played three ways: solo against bots entirely offline, over the internet
+against strangers or friends ("quickplay" / private rooms), or against nearby
+devices over local Wi-Fi with no internet at all ("LAN mode").</li>
+<li>A <strong>Go server</strong> that is the single source of truth once a game is
+networked: it holds the real deck, decides which moves are legal, and tells each
+player only what they're allowed to see.</li>
+</ul>
+<p>
+The interesting design idea that shapes the whole codebase: <strong>the rules of
+the game are written twice, once in Dart and once in Go</strong> — deliberately,
+so the same rules can run fully offline on a phone <em>and</em> be enforced
+authoritatively by a server, and the two are tested against each other so they
+can never quietly disagree.
+</p>
+
+<h2>Architecture — the pieces and how they fit</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 960 620" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="13">
+  <!-- Flutter client outer -->
+  <rect x="20" y="20" width="430" height="580" rx="10" fill="#1b2620" stroke="#2a3a32"/>
+  <text x="40" y="46" fill="#4fd68c" font-weight="bold" font-size="14">FLUTTER CLIENT (frontend/lib)</text>
+
+  <rect x="40" y="60" width="390" height="70" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="80" fill="#e7efe9" font-weight="bold">UI</text>
+  <text x="52" y="98" fill="#9db0a4" font-size="11">ui/screens, ui/widgets</text>
+  <text x="52" y="114" fill="#9db0a4" font-size="11">table_screen, home_screen, felt_table…</text>
+
+  <rect x="40" y="142" width="390" height="90" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="162" fill="#e7efe9" font-weight="bold">GameSession (net/session.dart)</text>
+  <text x="52" y="180" fill="#9db0a4" font-size="11">one abstract contract, three implementations:</text>
+  <text x="52" y="196" fill="#7fd8ff" font-size="11">LocalSession — solo vs bots, no network</text>
+  <text x="52" y="212" fill="#7fd8ff" font-size="11">RemoteSession — talks to the Go server</text>
+  <text x="52" y="226" fill="#7fd8ff" font-size="11">LanHostSession — this phone is the server</text>
+
+  <rect x="40" y="248" width="390" height="70" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="268" fill="#e7efe9" font-weight="bold">Engine (engine/*.dart) — pure Dart</text>
+  <text x="52" y="286" fill="#9db0a4" font-size="11">card.dart, rules.dart, game.dart</text>
+  <text x="52" y="302" fill="#9db0a4" font-size="11">no Flutter imports, no I/O — a state machine</text>
+
+  <rect x="40" y="330" width="185" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="350" fill="#e7efe9" font-weight="bold" font-size="12">bots/bot.dart</text>
+  <text x="52" y="368" fill="#9db0a4" font-size="11">heuristic opponent</text>
+
+  <rect x="245" y="330" width="185" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="257" y="350" fill="#e7efe9" font-weight="bold" font-size="12">state/</text>
+  <text x="257" y="368" fill="#9db0a4" font-size="11">settings, identity, resume</text>
+
+  <rect x="40" y="398" width="185" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="418" fill="#e7efe9" font-weight="bold" font-size="12">audio/</text>
+  <text x="52" y="436" fill="#9db0a4" font-size="11">music + sfx</text>
+
+  <rect x="245" y="398" width="185" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="257" y="418" fill="#e7efe9" font-weight="bold" font-size="12">net/api_client.dart</text>
+  <text x="257" y="436" fill="#9db0a4" font-size="11">REST: auth, profile, history</text>
+
+  <rect x="40" y="466" width="390" height="60" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="486" fill="#e7efe9" font-weight="bold" font-size="12">net/game_uploader.dart</text>
+  <text x="52" y="504" fill="#9db0a4" font-size="11">offline queue: uploads finished games when back online</text>
+
+  <rect x="40" y="536" width="390" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="52" y="562" fill="#e7efe9" font-size="12">net/lan_discovery.dart — UDP broadcast to find a host on Wi-Fi</text>
+
+  <!-- Arrow client -> server -->
+  <line x1="450" y1="177" x2="510" y2="177" stroke="#4fd68c" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="455" y="167" fill="#4fd68c" font-size="11">WebSocket, JSON</text>
+
+  <line x1="450" y1="427" x2="510" y2="427" stroke="#7fd8ff" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="455" y="417" fill="#7fd8ff" font-size="11">HTTPS REST</text>
+
+  <!-- Go server outer -->
+  <rect x="510" y="20" width="430" height="440" rx="10" fill="#1b2620" stroke="#2a3a32"/>
+  <text x="530" y="46" fill="#4fd68c" font-weight="bold" font-size="14">GO SERVER (backend/internal)</text>
+
+  <rect x="530" y="60" width="390" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="542" y="80" fill="#e7efe9" font-weight="bold" font-size="12">ws/ — websocket edge</text>
+  <text x="542" y="98" fill="#9db0a4" font-size="11">upgrade, auth, rate-limit, route to a room</text>
+
+  <rect x="530" y="128" width="185" height="76" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="542" y="148" fill="#e7efe9" font-weight="bold" font-size="12">room/ — room actor</text>
+  <text x="542" y="164" fill="#9db0a4" font-size="11">1 goroutine per table</text>
+  <text x="542" y="180" fill="#9db0a4" font-size="11">owns all its state,</text>
+  <text x="542" y="196" fill="#9db0a4" font-size="11">no shared locks</text>
+
+  <rect x="735" y="128" width="185" height="76" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="747" y="148" fill="#e7efe9" font-weight="bold" font-size="12">match/broker.go</text>
+  <text x="747" y="164" fill="#9db0a4" font-size="11">quickplay seating —</text>
+  <text x="747" y="180" fill="#9db0a4" font-size="11">groups strangers onto</text>
+  <text x="747" y="196" fill="#9db0a4" font-size="11">a shared table</text>
+
+  <rect x="530" y="216" width="390" height="60" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="542" y="236" fill="#e7efe9" font-weight="bold" font-size="12">engine/ — Go port of frontend/lib/engine</text>
+  <text x="542" y="254" fill="#9db0a4" font-size="11">same rules, tested case-for-case against the Dart engine</text>
+
+  <rect x="530" y="288" width="185" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="542" y="308" fill="#e7efe9" font-weight="bold" font-size="12">auth/</text>
+  <text x="542" y="326" fill="#9db0a4" font-size="11">guest identity, resume tokens</text>
+
+  <rect x="735" y="288" width="185" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="747" y="308" fill="#e7efe9" font-weight="bold" font-size="12">httpapi/</text>
+  <text x="747" y="326" fill="#9db0a4" font-size="11">REST: auth, profile, admin</text>
+
+  <rect x="530" y="356" width="390" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="542" y="376" fill="#e7efe9" font-weight="bold" font-size="12">obs/ — logging, metrics, health</text>
+  <text x="542" y="394" fill="#9db0a4" font-size="11">/healthz /readyz /metrics</text>
+
+  <!-- db/store -->
+  <rect x="530" y="424" width="185" height="30" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="542" y="444" fill="#e7efe9" font-size="11">db/ (Postgres client)</text>
+  <rect x="735" y="424" width="185" height="30" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="747" y="444" fill="#e7efe9" font-size="11">store/ (Redis registry)</text>
+
+  <line x1="622" y1="460" x2="622" y2="500" stroke="#e8b64f" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="827" y1="460" x2="827" y2="500" stroke="#e8b64f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="530" y="504" width="185" height="60" rx="8" fill="#221a12" stroke="#e8b64f"/>
+  <text x="542" y="528" fill="#e8b64f" font-weight="bold" font-size="12">PostgreSQL</text>
+  <text x="542" y="546" fill="#9db0a4" font-size="11">accounts, match history</text>
+
+  <rect x="735" y="504" width="185" height="60" rx="8" fill="#221a12" stroke="#e8b64f"/>
+  <text x="747" y="528" fill="#e8b64f" font-weight="bold" font-size="12">Redis</text>
+  <text x="747" y="546" fill="#9db0a4" font-size="11">advisory room registry</text>
+  <text x="747" y="560" fill="#9db0a4" font-size="10">(multi-node routing only)</text>
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#4fd68c"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+<p style="font-size:0.85rem;color:var(--text-dim)">
+Both PostgreSQL and Redis are optional — the server starts and plays full games
+with neither configured (see <a href="modules/16-persistence.html">Module 16</a>).
+</p>
+
+<h2>Tech stack, and why each piece was picked</h2>
+<table>
+<tr><th>Layer</th><th>Choice</th><th>Why</th></tr>
+<tr><td>Client framework</td><td>Flutter / Dart</td><td>One codebase compiles to Android, iOS, web, Linux, macOS, Windows — this game targets phones and desktops from the same UI code.</td></tr>
+<tr><td>Client state</td><td><code>ChangeNotifier</code> + <code>Stream</code> (Flutter/Dart stdlib)</td><td>No external state-management package (no Provider/Riverpod/Bloc) — the app is small enough that stdlib primitives are enough, and it avoids a dependency the whole team would need to learn.</td></tr>
+<tr><td>Client↔server wire format</td><td>Hand-written JSON over one <dfn class="term" title="A single long-lived TCP connection that lets client and server send messages to each other at any time, in either direction, without the request/response back-and-forth of plain HTTP.">WebSocket</dfn></td><td>A trick-taking game is a stream of small, frequent, bidirectional events (bid, play, turn clock) — a perfect fit for a persistent socket over request/response HTTP polling.</td></tr>
+<tr><td>Server language</td><td>Go</td><td>Cheap goroutines make "one goroutine per game table" affordable at thousands of tables; a static binary with no runtime deploys trivially.</td></tr>
+<tr><td>Server concurrency model</td><td>Actor per room (<code>internal/room</code>)</td><td>Each table's state is touched by exactly one goroutine, so turn ordering is correct by construction — no mutexes on the hot path.</td></tr>
+<tr><td>Persistence</td><td>PostgreSQL, optional</td><td>Match history/accounts are relational and low-volume; the server is fully playable with it absent, which keeps local dev dependency-free.</td></tr>
+<tr><td>Cross-node routing</td><td>Redis, optional</td><td>Only needed once you run more than one server process; advisory, not authoritative — an outage degrades routing, never gameplay.</td></tr>
+</table>
+
+<h2>Prerequisites</h2>
+<ul>
+<li>Comfortable with basic programming (variables, functions, classes, HTTP) in <em>any</em> language — this course assumes you're new to Flutter, Dart, Go, and this project's specific patterns, and defines every term the first time it's used (see the <a href="glossary.html">Glossary</a>).</li>
+<li>Flutter SDK installed (<code>flutter doctor</code> green) — for Part I &amp; II.</li>
+<li>Go 1.26+ installed, or Docker (the project's <code>scripts/go.sh</code> falls back to the <code>golang:1.26</code> image automatically) — for Part III.</li>
+<li>A terminal and a text editor. No IDE required, though VS Code + the Flutter/Go extensions are the smoothest.</li>
+</ul>
+
+<h2>Learning outcomes</h2>
+<p>By the end you will be able to:</p>
+<ul>
+<li>Rebuild every layer of this project from an empty folder, in the order its real dependencies demand.</li>
+<li>Explain <em>why</em> each non-trivial decision was made — actor-per-room, dual-language engine, optional persistence, session abstraction — against a concrete alternative that was not chosen.</li>
+<li>Locate this project's real weak points (cited to exact files) and know, with a concrete starting direction, how you'd fix each one before it needs to be production-grade.</li>
+</ul>
+
+<h2>How this course is organised</h2>
+<p>
+Twenty modules, in real build order — the order in which each file's actual
+dependencies (not folder alphabetisation) make it buildable. Every file or
+function introduced follows the same four-part structure: <strong>PURPOSE</strong>
+(why it must exist), <strong>DECISION</strong> (why this approach over a real
+alternative), <strong>EXPLANATION</strong> (a line-by-line walkthrough), and,
+where this project has a known weak spot in that exact code, an
+<strong>IMPROVEMENT NOTE</strong>. Before most non-trivial code is shown, you get
+a "try it yourself" prompt with the real solution behind a toggle. Each module
+ends with a few conceptual checkpoint questions.
+</p>
+<p>
+Part I and II build the Flutter app to a fully playable offline game before any
+server exists — exactly the order the real project was built in. Part III then
+builds the Go backend as a port of what you already built in Dart. Part IV is a
+build-from-memory challenge and a prioritised list of this project's real gaps.
+</p>
+
+<div class="mark-complete">
+<a href="modules/01-cards-and-rules.html" style="text-decoration:none">
+<button style="background:var(--accent);color:#06210f;border:none;border-radius:8px;padding:12px 22px;font-weight:700;cursor:pointer;font-size:0.95rem;">Start Module 1 →</button>
+</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "./";</script>
+<script src="js/app.js"></script>
+</body>
+</html>

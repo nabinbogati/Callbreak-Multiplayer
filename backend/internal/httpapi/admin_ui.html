@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Break — Operations</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c222c;
+    --border: #2a3341;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  a { color: var(--accent); }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .5px; }
+  header .spacer { flex: 1; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  #conn { padding: 3px 8px; border-radius: 10px; font-size: 12px; }
+  #conn.ok { color: var(--green); border: 1px solid var(--green); }
+  #conn.err { color: var(--red); border: 1px solid var(--red); }
+  #conn.idle { color: var(--muted); border: 1px solid var(--border); }
+  button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font: inherit; font-size: 12px;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover { background: #388bfd; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=text], input[type=password], select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit; font-size: 12px;
+  }
+  main { padding: 16px 20px 60px; max-width: 1600px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .card .n { font-size: 22px; font-weight: 600; }
+  .card .l { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; margin-top: 2px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tabs button.on { border-color: var(--accent); color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+  .panel h2 { margin: 0; padding: 10px 14px; font-size: 13px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; background: var(--panel-2); white-space: nowrap; }
+  tr.room-row { cursor: pointer; }
+  tr.room-row:hover td { background: var(--panel-2); }
+  tr.detail td { background: var(--bg); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+  .tag.playing { color: var(--green); border-color: var(--green); }
+  .tag.bidding { color: var(--yellow); border-color: var(--yellow); }
+  .tag.handOver { color: var(--purple); border-color: var(--purple); }
+  .tag.gameOver { color: var(--red); border-color: var(--red); }
+  .tag.lobby { color: var(--muted); }
+  .tag.online { color: var(--accent); border-color: var(--accent); }
+  .tag.private { color: var(--purple); border-color: var(--purple); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+  .dot.on { background: var(--green); }
+  .dot.off { background: var(--red); }
+  .dot.bot { background: var(--muted); }
+  .seat { white-space: nowrap; }
+  .seat .who { font-weight: 600; }
+  .seat .sub { color: var(--muted); font-size: 11px; }
+  .cardset { display: flex; flex-wrap: wrap; gap: 3px; }
+  .mini { display: inline-block; min-width: 22px; text-align: center; padding: 1px 3px; border-radius: 4px; border: 1px solid var(--border); font-size: 11px; background: var(--bg); }
+  .mini.red { color: #ff7b72; }
+  .mini.small { border-color: transparent; padding: 0 1px; min-width: 0; background: transparent; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .kv { font-size: 12px; }
+  .kv div { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+  .kv .k { color: var(--muted); }
+  form.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px 20px; padding: 14px; }
+  .fld label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .fld .hint { color: var(--muted); font-size: 10px; margin-top: 3px; }
+  .fld input, .fld select { width: 100%; }
+  .fld .pt-row { display: flex; gap: 6px; }
+  .fld .pt-row input { flex: 1; min-width: 0; }
+  .actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; }
+  #toast { position: fixed; bottom: 18px; right: 18px; padding: 10px 16px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); font-size: 12px; max-width: 420px; display: none; z-index: 20; }
+  #toast.show { display: block; }
+  #toast.ok { border-color: var(--green); }
+  #toast.err { border-color: var(--red); }
+  #login { max-width: 420px; margin: 12vh auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 28px; }
+  #login h1 { font-size: 16px; margin-top: 0; }
+  #login p { color: var(--muted); font-size: 12px; }
+  .muted { color: var(--muted); }
+  .right { text-align: right; }
+  .count { color: var(--muted); font-size: 11px; padding: 4px 14px; }
+  .mono { font-size: 11px; color: var(--muted); }
+  .row-badge { display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Call Break · Operations</h1>
+  <span class="meta" id="clock"></span>
+  <span class="spacer"></span>
+  <span id="conn">—</span>
+  <button id="refresh">Refresh</button>
+  <label class="meta"><input type="checkbox" id="auto" checked> auto 4s</label>
+</header>
+
+<div id="login">
+  <h1>Admin access</h1>
+  <p>Enter the server's <code>ADMIN_TOKEN</code>. It is sent with every request and kept only in this browser's local storage.</p>
+  <form id="loginForm">
+    <input type="password" id="tokenInput" autocomplete="off" style="width:100%; margin-bottom:10px" placeholder="Admin token">
+    <button type="submit" class="primary" style="width:100%">Open dashboard</button>
+  </form>
+  <p id="loginErr" class="muted" style="color:var(--red); display:none">That token was rejected.</p>
+</div>
+
+<main id="app" style="display:none">
+  <div class="cards" id="summary"></div>
+
+  <div class="tabs">
+    <button class="on" data-tab="rooms" onclick="showTab('rooms')">Tables</button>
+    <button data-tab="history" onclick="showTab('history')">History</button>
+    <button data-tab="settings" onclick="showTab('settings')">Settings</button>
+  </div>
+
+  <section id="tab-rooms">
+    <div class="panel">
+      <h2>Active tables <span class="count" id="roomCount"></span></h2>
+      <div style="overflow-x:auto">
+        <table id="rooms"></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-history" style="display:none">
+    <div class="panel">
+      <h2>Match history <span class="count" id="histMeta"></span></h2>
+      <div style="padding:10px 14px; display:flex; gap:12px; align-items:center; border-bottom:1px solid var(--border); flex-wrap:wrap">
+        <label class="meta">mode
+          <select id="histMode" onchange="histReset()">
+            <option value="">all</option><option>bots</option><option>private</option><option>online</option><option>lan</option>
+          </select>
+        </label>
+        <label class="meta">source
+          <select id="histSource" onchange="histReset()">
+            <option value="">all</option><option value="server">server</option><option value="client">client</option>
+          </select>
+        </label>
+        <span style="flex:1"></span>
+        <button id="histNewer" onclick="histPage(false)">← Newer</button>
+        <button id="histOlder" onclick="histPage(true)">Older →</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table id="history"></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-settings" style="display:none">
+    <div class="panel">
+      <h2>Runtime defaults <span class="count" id="settingsMeta"></span></h2>
+      <form class="settings" id="settingsForm"></form>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+
+let token = localStorage.getItem("cbAdminToken") || "";
+let rooms = [];
+let settings = null;
+let timer = null;
+const expanded = new Set();
+
+const SUITS = { S: {s:"♠", r:false}, H: {s:"♥", r:true}, D: {s:"♦", r:true}, C: {s:"♣", r:false} };
+
+function login() { $("#login").style.display = ""; $("#app").style.display = "none"; }
+function boot() {
+  if (!token) { login(); return; }
+  $("#login").style.display = "none";
+  $("#app").style.display = "";
+  refreshAll();
+  schedule();
+}
+function schedule() {
+  clearInterval(timer);
+  if ($("#auto").checked) timer = setInterval(refreshAll, 4000);
+}
+
+function setConn(cls, text) {
+  const el = $("#conn");
+  el.className = cls;
+  el.textContent = text;
+}
+
+function api(path, opts) {
+  opts = opts || {};
+  const headers = opts.headers || {};
+  headers["Authorization"] = "Bearer " + token;
+  headers["Accept"] = "application/json";
+  if (opts.body) headers["Content-Type"] = "application/json";
+  return fetch(path, { method: opts.method || "GET", headers, body: opts.body })
+    .then(async (r) => {
+      const body = r.status === 204 ? null : await r.json().catch(() => null);
+      if (!r.ok) {
+        const msg = body && body.error ? body.error.message : "HTTP " + r.status;
+        if (r.status === 401) throw { auth: true, msg };
+        throw { msg };
+      }
+      return body;
+    });
+}
+
+function toast(msg, kind) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show " + (kind || "ok");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.className = "", 3600);
+}
+
+function refreshAll() {
+  refreshRooms().catch(handleErr);
+  refreshSettings().catch(() => {});
+}
+
+function handleErr(e) {
+  if (e && e.auth) {
+    setConn("err", "unauthorized");
+    toast("Token rejected. Sign in again.", "err");
+    localStorage.removeItem("cbAdminToken");
+    token = "";
+    login();
+    return;
+  }
+  setConn("err", "offline");
+  toast(e && e.msg ? e.msg : "Could not reach the server.", "err");
+}
+
+function refreshRooms() {
+  return api("/v1/admin/rooms").then((data) => {
+    rooms = data.rooms || [];
+    setConn("ok", "live · " + rooms.length + " tables");
+    renderSummary(data.summary);
+    renderRooms();
+  });
+}
+
+function fmtClock() {
+  const d = new Date();
+  return d.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function renderSummary(s) {
+  if (!s) return;
+  const cards = [
+    ["Tables", s.rooms], ["In play", s.started], ["In lobby", s.lobby],
+    ["Humans seated", s.humans], ["Connected", s.humansConnected],
+    ["Bots", s.bots], ["Quickplay filling", s.quickplayFilling],
+  ];
+  $("#summary").innerHTML = cards.map(([l, n]) =>
+    `<div class="card"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("");
+}
+
+function cardHTML(id, big) {
+  if (!id) return "";
+  const r = id.slice(0, -1), s = id.slice(-1);
+  const suit = SUITS[s];
+  const cls = suit.r ? "red" : "";
+  const width = big ? "mini" : "mini small";
+  return `<span class="${width} ${cls}">${r}${suit.s}</span>`;
+}
+
+function seatTag(seat) {
+  if (!seat.occupied) return `<span class="muted">—</span>`;
+  const dot = seat.kind === "bot" ? "bot" : (seat.connected ? "on" : "off");
+  const parts = [];
+  parts.push(`<span class="dot ${dot}"></span><span class="who">${esc(seat.name)}</span>`);
+  if (seat.isHost) parts.push(`<span class="tag">host</span>`);
+  if (seat.autoplay) parts.push(`<span class="tag" style="color:var(--yellow);border-color:var(--yellow)">auto</span>`);
+  if (!seat.connected && seat.kind === "human") parts.push(`<span class="tag" style="color:var(--red);border-color:var(--red)">away</span>`);
+  const sub = [seat.seat, seat.kind];
+  if (seat.difficulty) sub.push(seat.difficulty);
+  if (seat.bid != null) sub.push("bid " + seat.bid);
+  sub.push("tricks " + seat.tricksWon);
+  if (seat.userId) sub.push(esc(seat.userId).slice(0, 8));
+  return `<div class="seat">${parts.join(" ")}<div class="sub">${sub.join(" · ")}</div></div>`;
+}
+
+function renderRooms() {
+  const tbl = $("#rooms");
+  $("#roomCount").textContent = "· " + rooms.length;
+  if (!rooms.length) {
+    tbl.innerHTML = "<tr><td class='muted'>No active tables.</td></tr>";
+    return;
+  }
+  let html = `<thead><tr>
+    <th>Code</th><th>Mode</th><th>State</th><th>Hand</th><th>Turn</th>
+    <th>Seats</th><th>Bids</th><th>Trick</th><th>Scores</th><th>Since</th>
+  </tr></thead><tbody>`;
+  for (const r of rooms) {
+    const phase = r.phase || "lobby";
+    const state = `<span class="tag ${phase}">${phase}</span>` + (r.started ? "" : " <span class='tag'>lobby</span>");
+    const turn = r.turn != null ? `<span class="seat"><div class="who">${esc(seatName(r, r.turn))}</div><div class="sub">#${r.turn}</div></span>` : "—";
+    const bids = r.bids.map((b) => b == null ? "·" : b).join(" ");
+    const trick = (r.trick || []).map((t) => cardHTML(t.card)).join("");
+    const scores = r.totals.map((t) => Math.round(t * 10) / 10).join(" / ");
+    const since = r.startedAt ? ago(r.startedAt) : (r.accepting ? "open" : "closed");
+    const hand = r.started ? `${r.handIndex + 1}/${r.totalHands}` : "—";
+    html += `<tr class="room-row" onclick="toggleRoom('${r.id}')" data-id="${r.id}">
+      <td><b>${esc(r.id)}</b></td>
+      <td><span class="tag ${r.mode}">${r.mode}</span></td>
+      <td>${state}</td>
+      <td>${hand}</td>
+      <td>${turn}</td>
+      <td>${seatsHTML(r)}</td>
+      <td>${bids}</td>
+      <td>${trick || "—"}</td>
+      <td>${scores}</td>
+      <td class="mono">${since}</td>
+    </tr>`;
+  }
+  html += "</tbody>";
+  tbl.innerHTML = html;
+  // Re-open any table the operator was looking at, so the auto-refresh does
+  // not slam their detail pane shut every four seconds.
+  for (const id of expanded) {
+    const row = document.querySelector(`tr.room-row[data-id="${id}"]`);
+    if (!row) continue;
+    const tr = document.createElement("tr");
+    tr.className = "detail";
+    const td = document.createElement("td");
+    td.colSpan = 10;
+    td.innerHTML = roomDetail(rooms.find((x) => x.id === id));
+    tr.appendChild(td);
+    row.after(tr);
+  }
+}
+
+function seatName(r, seat) {
+  const s = r.seats[seat];
+  return s && s.occupied ? s.name : "seat " + seat;
+}
+
+function seatsHTML(r) {
+  return r.seats.filter((s) => s.occupied).map((s) => seatTag(s)).join("");
+}
+
+function toggleRoom(id) {
+  const row = document.querySelector(`tr.room-row[data-id="${id}"]`);
+  const open = row.nextElementSibling && row.nextElementSibling.classList.contains("detail");
+  if (open) {
+    row.nextElementSibling.remove();
+    expanded.delete(id);
+    return;
+  }
+  expanded.add(id);
+  const r = rooms.find((x) => x.id === id);
+  const tr = document.createElement("tr");
+  tr.className = "detail";
+  const td = document.createElement("td");
+  td.colSpan = 10;
+  td.innerHTML = roomDetail(r);
+  tr.appendChild(td);
+  row.after(tr);
+}
+
+function roomDetail(r) {
+  const turnClock = r.turnClock && r.turnClock.kind !== "none"
+    ? `${r.turnClock.kind} · seat ${r.turnClock.seat} · until ${fmt(r.turnClock.at)}`
+    : "none";
+  return `
+  <div class="grid2">
+    <div>
+      <div class="kv">
+        <div><span class="k">Code</span><span><b>${esc(r.id)}</b></span></div>
+        <div><span class="k">Mode</span><span>${r.mode}</span></div>
+        <div><span class="k">Phase</span><span>${r.phase || "lobby"}</span></div>
+        <div><span class="k">Accepting joins</span><span>${r.accepting ? "yes" : "no"}</span></div>
+        <div><span class="k">Hand</span><span>${r.started ? (r.handIndex + 1) + " / " + r.totalHands : "—"}</span></div>
+        <div><span class="k">Dealer</span><span>${r.dealer != null ? seatName(r, r.dealer) + " (#" + r.dealer + ")" : "—"}</span></div>
+        <div><span class="k">Turn</span><span>${r.turn != null ? seatName(r, r.turn) + " (#" + r.turn + ")" : "—"}</span></div>
+        <div><span class="k">Turn clock</span><span>${turnClock}</span></div>
+        <div><span class="k">Trick</span><span>#${r.trickNumber} ${r.awaitingTrickClear ? "(clearing)" : ""} ${r.lastTrickWinner != null ? "· won by " + seatName(r, r.lastTrickWinner) : ""}</span></div>
+        <div><span class="k">Trick cards</span><span><span class="cardset">${(r.trick || []).map((t) => cardHTML(t.card, true)).join("") || "—"}</span></span></div>
+        <div><span class="k">Countdown</span><span>${fmt(r.countdownAt) || "—"}</span></div>
+        <div><span class="k">Hand advance</span><span>${fmt(r.handAdvanceAt) || "—"}</span></div>
+        <div><span class="k">Idle collect</span><span>${fmt(r.idleCollectAt) || "—"}</span></div>
+        <div><span class="k">Started</span><span>${fmt(r.startedAt) || "—"}</span></div>
+        <div><span class="k">Last activity</span><span>${fmt(r.lastActive)}</span></div>
+        <div><span class="k">Min players / fill wait</span><span>${r.minPlayers} / ${r.fillWait}</span></div>
+      </div>
+      <div class="kv" style="margin-top:10px">
+        <div style="justify-content:flex-start"><span class="k">Hands per seat</span></div>
+        ${r.seats.map((s, i) => `
+          <div><span class="k">Seat ${i} · ${s.occupied ? esc(s.name) : "empty"} · ${s.occupied ? (s.kind + (s.difficulty ? "/" + s.difficulty : "")) : ""}</span>
+          <span class="cardset">${(r.hands && r.hands[i] || []).map((c) => cardHTML(c, true)).join("") || "—"}</span></div>`).join("")}
+      </div>
+    </div>
+    <div>
+      <div class="kv">
+        <div style="justify-content:flex-start"><span class="k">Seats</span></div>
+        ${r.seats.map((s) => s.occupied ? `
+          <div style="display:block">
+            <div>${seatTag(s)} <span class="mono">${esc(s.playerId)} ${s.userId ? "· " + esc(s.userId) : ""}</span></div>
+            <div class="muted" style="font-size:11px">grace until ${fmt(s.graceUntil) || "—"} · confirmed ${s.confirmed ? "yes" : "no"}</div>
+          </div>` : `<div class="muted">Seat ${s.seat}: empty</div>`).join("")}
+      </div>
+      <div class="kv" style="margin-top:10px">
+        <div><span class="k">Round scores</span></div>
+        ${r.seats.map((s, i) => `<div><span class="k">Seat ${i}</span><span>${(r.roundScores[i] || []).map((x) => Math.round(x * 10) / 10).join(", ") || "—"}</span></div>`).join("")}
+        <div><span class="k">Rankings</span><span>${(r.rankings || []).map((k) => "#" + (k.seat + 1) + "=" + Math.round(k.total * 10) / 10).join(" ") || "—"}</span></div>
+      </div>
+      <div class="kv" style="margin-top:10px">
+        <div style="justify-content:flex-start"><span class="k">Table pacing</span></div>
+        ${pacingRows(r.pacing)}
+      </div>
+    </div>
+  </div>`;
+}
+
+function pacingRows(p) {
+  if (!p) return `<div class="muted">—</div>`;
+  const rows = [
+    ["Bot think", p.botThinkMin + " + " + p.botThinkExtra],
+    ["Trick linger", p.trickLinger], ["Bid timeout", p.bidTimeout],
+    ["Play timeouts", p.playTimeouts.join(" / ")],
+    ["Reconnect grace", p.reconnectGrace], ["Hand advance wait", p.handAdvanceWait],
+    ["Idle TTL", p.idleTTL], ["Start countdown", p.startCountdown], ["Deal grace", p.dealGrace],
+  ];
+  return rows.map(([k, v]) => `<div><span class="k">${k}</span><span>${v}</span></div>`).join("");
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function ago(iso) {
+  if (!iso) return "";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 0) return iso;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s ago";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m ago";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.floor(h / 24) + "d ago";
+}
+
+function fmt(iso) {
+  if (!iso) return null;
+  return new Date(iso).toISOString().slice(0, 19).replace("T", " ");
+}
+
+// ----------------------------------------------------------------- settings
+
+const SFIELDS = [
+  ["botThinkMin", "Bot think (min)"],
+  ["botThinkExtra", "Bot think (extra)"],
+  ["trickLinger", "Trick linger"],
+  ["startCountdown", "Start countdown"],
+  ["bidTimeout", "Bid timeout"],
+  ["playTimeouts", "Play timeouts (leader → last)"],
+  ["reconnectGrace", "Reconnect grace"],
+  ["handAdvanceWait", "Hand advance wait"],
+  ["roomIdleTTL", "Room idle TTL"],
+  ["dealGrace", "Deal grace"],
+  ["matchFillWait", "Match fill wait"],
+  ["matchMinPlayers", "Match min players"],
+];
+
+function refreshSettings() {
+  return api("/v1/admin/settings").then((data) => {
+    settings = data;
+    const meta = [];
+    meta.push("source: " + data.source);
+    meta.push(data.persistence ? "persisted" : "not persisted");
+    if (data.updatedAt) meta.push("updated " + fmt(data.updatedAt));
+    $("#settingsMeta").textContent = "· " + meta.join(" · ");
+    renderSettingsForm();
+  });
+}
+
+function renderSettingsForm() {
+  if (!settings) return;
+  // Never rebuild the form while the operator is typing in it — the
+  // auto-refresh runs every few seconds and would clobber their edits.
+  const active = document.activeElement;
+  if (active && $("#settingsForm").contains(active)) return;
+  if ($("#tab-settings").style.display === "none" && !settings._rendered) {
+    // defer the first render until the tab is shown
+    return;
+  }
+  settings._rendered = true;
+  const s = settings.settings;
+  const f = $("#settingsForm");
+  let html = "";
+  for (const [key, label] of SFIELDS) {
+    if (key === "playTimeouts") {
+      const inputs = s.playTimeouts.map((v, i) =>
+        `<input type="text" data-k="playTimeout${i}" value="${esc(v)}">`).join("");
+      html += `<div class="fld"><label>${label}</label>
+        <div class="pt-row">${inputs}</div>
+        <div class="hint">e.g. 10s, 8s, 6s, 5s — one per trick position.</div></div>`;
+    } else if (key === "matchMinPlayers") {
+      html += `<div class="fld"><label>${label}</label>
+        <select data-k="matchMinPlayers">${[1, 2, 3, 4].map((n) =>
+          `<option value="${n}" ${n === s.matchMinPlayers ? "selected" : ""}>${n} human(s)</option>`).join("")}
+        </select>
+        <div class="hint">Quickplay deals below this only with bots on the rest.</div></div>`;
+    } else {
+      html += `<div class="fld"><label>${label}</label>
+        <input type="text" data-k="${key}" value="${esc(s[key])}">
+        <div class="hint">e.g. 5s, 250ms, 2m0s.</div></div>`;
+    }
+  }
+  html += `<div class="actions">
+    <button type="submit" class="primary">Save settings</button>
+    <span class="muted">Changes apply to tables created afterwards. Live tables keep their pacing.</span>
+  </div>`;
+  f.innerHTML = html;
+}
+
+$("#settingsForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const body = {};
+  let ok = true;
+  const clear = (msg) => { toast(msg, "err"); ok = false; };
+  for (const [key, label] of SFIELDS) {
+    if (key === "playTimeouts") {
+      const vals = [0, 1, 2, 3].map((i) =>
+        document.querySelector(`[data-k="playTimeout${i}"]`).value.trim());
+      if (vals.some((v) => !v)) return clear("Play timeouts must all be filled.");
+      body.playTimeouts = vals;
+    } else if (key === "matchMinPlayers") {
+      body.matchMinPlayers = parseInt(document.querySelector('[data-k="matchMinPlayers"]').value, 10);
+    } else {
+      const v = document.querySelector(`[data-k="${key}"]`).value.trim();
+      if (!v) return clear(label + " cannot be empty.");
+      body[key] = v;
+    }
+  }
+  if (!ok) return;
+  api("/v1/admin/settings", { method: "PUT", body: JSON.stringify(body) })
+    .then(() => {
+      toast("Settings saved.");
+      const a = document.activeElement;
+      if (a) a.blur();
+      return refreshSettings();
+    })
+    .catch(handleErr);
+});
+
+// ----------------------------------------------------------------- history
+
+// History is paginated and user-driven, so it is loaded on demand rather than
+// on the auto-refresh timer: an auto-refresh would clobber whichever page the
+// operator is looking at.
+const hist = {
+  games: [], next: "", cursor: "", prev: [], loaded: false,
+};
+function loadHistory() {
+  const params = new URLSearchParams();
+  const mode = $("#histMode").value;
+  const source = $("#histSource").value;
+  if (mode) params.set("mode", mode);
+  if (source) params.set("source", source);
+  if (hist.cursor) params.set("cursor", hist.cursor);
+  const qs = params.toString();
+  return api("/v1/admin/games" + (qs ? "?" + qs : "")).then((data) => {
+    hist.games = data.games || [];
+    hist.next = data.nextCursor || "";
+    hist.loaded = true;
+    renderHistory();
+    histMeta();
+  });
+}
+
+function histReset() {
+  hist.cursor = "";
+  hist.prev = [];
+  loadHistory().catch(handleErr);
+}
+
+// histPage(true) goes older (follow nextCursor), histPage(false) goes newer.
+function histPage(older) {
+  if (older) {
+    if (!hist.next) return;
+    hist.prev.push(hist.cursor);
+    hist.cursor = hist.next;
+  } else {
+    if (!hist.prev.length) return;
+    hist.cursor = hist.prev.pop();
+  }
+  loadHistory().catch(handleErr);
+}
+
+function histMeta() {
+  const total = hist.games.length;
+  $("#histMeta").textContent = "· " + total +
+    (hist.next ? "+" : "") + (hist.cursor ? " · paged" : " · latest");
+  $("#histOlder").disabled = !hist.next;
+  $("#histNewer").disabled = !hist.prev.length;
+}
+
+function renderHistory() {
+  const tbl = $("#history");
+  if (!hist.games.length) {
+    tbl.innerHTML = "<tr><td class='muted'>No recorded games.</td></tr>";
+    return;
+  }
+  let html = `<thead><tr>
+    <th>Finished</th><th>Mode</th><th>Source</th><th>Room</th><th>Hands</th>
+    <th>Players</th><th>Duration</th><th>Status</th>
+  </tr></thead><tbody>`;
+  for (const g of hist.games) {
+    const players = (g.players || []).slice().sort((a, b) => a.seat - b.seat)
+      .map((p) => {
+        const dot = p.isBot ? "bot" : "on";
+        return `<div class="seat"><span class="dot ${dot}"></span><span class="who">${esc(p.displayName)}</span> ` +
+          `<span class="sub">${Math.round(p.finalScore * 10) / 10} pts · place ${p.place || "—"}</span></div>`;
+      }).join("");
+    const status = g.completed
+      ? `<span class="tag" style="color:var(--green);border-color:var(--green)">complete</span>`
+      : `<span class="tag" style="color:var(--yellow);border-color:var(--yellow)">abandoned</span>`;
+    html += `<tr class="room-row" onclick="histToggle('${g.id}')" data-game="${g.id}">
+      <td class="mono">${fmt(g.finishedAt)}</td>
+      <td><span class="tag ${g.mode}">${g.mode}</span></td>
+      <td><span class="tag">${g.source}</span></td>
+      <td>${esc(g.roomCode) || "—"}</td>
+      <td>${g.handsTotal}</td>
+      <td>${players}</td>
+      <td class="mono">${g.startedAt ? duration(g.startedAt, g.finishedAt) : "—"}</td>
+      <td>${status}</td>
+    </tr>`;
+  }
+  html += "</tbody>";
+  tbl.innerHTML = html;
+}
+
+function histToggle(id) {
+  const row = document.querySelector(`tr.room-row[data-game="${id}"]`);
+  const open = row.nextElementSibling && row.nextElementSibling.classList.contains("detail");
+  if (open) {
+    row.nextElementSibling.remove();
+    return;
+  }
+  const tr = document.createElement("tr");
+  tr.className = "detail";
+  const td = document.createElement("td");
+  td.colSpan = 8;
+  td.innerHTML = '<div class="muted" style="padding:14px">Loading…</div>';
+  tr.appendChild(td);
+  row.after(tr);
+  api("/v1/admin/games/" + encodeURIComponent(id))
+    .then((d) => { td.innerHTML = histDetail(d); })
+    .catch(handleErr);
+}
+
+function histDetail(d) {
+  const g = d.game;
+  const hands = d.hands || [];
+  const players = (g.players || []).slice().sort((a, b) => a.seat - b.seat);
+  const bySeat = {};
+  for (const p of players) bySeat[p.seat] = p;
+
+  // Header row: one column per seat.
+  let head = "<tr><th style='min-width:120px'>Hand</th>";
+  for (const p of players) {
+    head += `<th>${esc(p.displayName)}${p.isBot ? " · bot" : ""}</th>`;
+  }
+  head += "</tr>";
+
+  const handCount = Math.max(1, Math.max(...hands.map((h) => h.handIndex + 1), 0));
+  let rows = "";
+  for (let i = 0; i < handCount; i++) {
+    rows += `<tr><td>#${i + 1}</td>`;
+    for (const p of players) {
+      const h = hands.find((x) => x.handIndex === i && x.seat === p.seat);
+      rows += h
+        ? `<td><span class="tag">bid ${h.bid}</span> tricks ${h.tricksWon} ` +
+          `<span class="mono">${Math.round(h.scoreDelta * 10) / 10} (${Math.round(h.runningTotal * 10) / 10})</span></td>`
+        : `<td class="muted">—</td>`;
+    }
+    rows += "</tr>";
+  }
+
+  let foot = "<tr style='border-top:2px solid var(--border)'><td><b>Final</b></td>";
+  for (const p of players) {
+    foot += `<td><b>${Math.round(p.finalScore * 10) / 10}</b> <span class="mono">place ${p.place || "—"}</span></td>`;
+  }
+  foot += "</tr>";
+
+  return `
+  <div style="padding:14px">
+    <div class="kv" style="margin-bottom:10px">
+      <div><span class="k">Game</span><span>${esc(g.id)}</span></div>
+      <div><span class="k">Mode / source</span><span>${g.mode} · ${g.source}</span></div>
+      <div><span class="k">Room</span><span>${esc(g.roomCode) || "—"}</span></div>
+      <div><span class="k">Started</span><span>${fmt(g.startedAt)}</span></div>
+      <div><span class="k">Finished</span><span>${fmt(g.finishedAt)}</span></div>
+      <div><span class="k">Duration</span><span>${g.startedAt ? duration(g.startedAt, g.finishedAt) : "—"}</span></div>
+    </div>
+    <table style="width:100%">${head}${rows}${foot}</table>
+  </div>`;
+}
+
+function duration(a, b) {
+  const ms = new Date(b).getTime() - new Date(a).getTime();
+  if (ms < 0) return "";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  return h + "h " + (m % 60) + "m";
+}
+
+// ---------------------------------------------------------------- plumbing
+
+$("#loginForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const t = $("#tokenInput").value.trim();
+  if (!t) return;
+  token = t;
+  localStorage.setItem("cbAdminToken", t);
+  refreshRooms()
+    .then(() => {
+      $("#login").style.display = "none";
+      $("#app").style.display = "";
+      refreshSettings().catch(() => {});
+      schedule();
+    })
+    .catch((err) => {
+      if (err && err.auth) {
+        localStorage.removeItem("cbAdminToken");
+        token = "";
+        $("#loginErr").style.display = "";
+        setConn("idle", "—");
+      } else {
+        handleErr(err);
+      }
+    });
+});
+
+function showTab(name) {
+  document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
+  $("#tab-rooms").style.display = name === "rooms" ? "" : "none";
+  $("#tab-history").style.display = name === "history" ? "" : "none";
+  $("#tab-settings").style.display = name === "settings" ? "" : "none";
+  if (name === "settings") renderSettingsForm();
+  if (name === "history" && !hist.loaded) loadHistory().catch(handleErr);
+}
+
+$("#refresh").addEventListener("click", () => {
+  refreshAll().catch(handleErr);
+  if ($("#tab-history").style.display !== "none") loadHistory().catch(handleErr);
+});
+$("#auto").addEventListener("change", schedule);
+
+setInterval(() => { $("#clock").textContent = fmtClock(); }, 1000);
+boot();
+</script>
+</body>
+</html>

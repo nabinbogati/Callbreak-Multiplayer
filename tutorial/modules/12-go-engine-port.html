@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12. Engine Port to Go — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m12">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 12 of 20</p>
+<h1>Engine Port to Go</h1>
+<p class="lede">
+The Go server needs its own copy of the rules — it cannot import Dart code,
+and it must never trust a client to enforce them. This module builds
+<code>engine/card.go</code>, <code>engine/rules.go</code>,
+<code>engine/game.go</code>, <code>engine/event.go</code> and
+<code>engine/json.go</code>: a second, independent implementation of exactly
+what modules 1 and 2 built in Dart, plus the test strategy
+(<code>golden_test.go</code>) that keeps the two from silently drifting
+apart.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">Dart engine (module 1–2) — card.dart, rules.dart, game.dart</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">Go engine ◀ you are here — card.go, rules.go, game.go, event.go, json.go</text>
+  <text x="32" y="98" fill="#9db0a4">Independent implementation, kept honest by golden_test.go</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">room actor (module 13) — the only caller of *Game</text>
+  <text x="32" y="154" fill="#9db0a4">Never concurrent-safe: one goroutine owns one Game</text>
+  <text x="32" y="172" fill="#9db0a4">ViewFor(seat) is the one door state leaves through</text>
+</svg>
+</div>
+
+<h2 id="cardgo"><code>engine/card.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/engine/card.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Same job as <a href="01-cards-and-rules.html">module 1</a>'s
+<code>card.dart</code>: a card type, a stable wire id, a full deck, and a way
+to shuffle and deal it — except now it's the version the server actually
+trusts, because a client's own idea of what cards it holds is never taken on
+faith.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The Go version is not a 1:1 port — it's a superset.</strong> The
+package comment at the top of this file claims: "It is a faithful port of
+the Dart engine ... Every exported symbol below has a named counterpart in
+the Dart source." That's true for <code>Card</code>, <code>Suit</code>,
+<code>FullDeck</code>, <code>SortForDisplay</code> — but
+<code>ShuffleKind</code>, <code>DealStyle</code>, <code>DealConfig</code>,
+<code>DealConfigFromPreset</code>, and the entire <code>riffle</code> /
+<code>overhand</code> / <code>balancedDeal</code> machinery (lines 175–444,
+roughly a third of this file) have no counterpart in
+<code>frontend/lib/engine/card.dart</code> at all — that file's own
+<code>dealHands</code> is three lines: shuffle the full deck with Dart's
+built-in <code>List.shuffle</code>, then cut it into four 13-card blocks.
+Real, verified by grep against the Dart source: no match for
+<code>ShuffleKind</code>, <code>DealStyle</code>, <code>riffle</code>,
+<code>balancedDeal</code> anywhere in <code>card.dart</code>. See this
+file's Improvement note.
+</p>
+<p>
+<strong>Why the extra machinery exists at all:</strong> the deal presets
+(<code>fair</code> / <code>physical</code> / <code>balanced</code>) are a
+player-facing table option, chosen at join time and carried on the wire by
+<code>protocol.ClientFrame.Deal</code> (module 11). Only the server deals
+cards for a networked table, so only the server needs to know how to deal
+them three different ways — the Dart client's offline mode
+(<code>LocalSession</code>, module 5) never offered this choice, so its
+<code>card.dart</code> never needed it.
+</p>
+<p>
+<strong>Rejection sampling for <code>balancedDeal</code>, not a
+deterministic "fix" of an unbalanced hand.</strong> The comment on
+<code>balancedDeal</code> explains the reasoning: "Rejection sampling keeps
+every returned deal uniformly random subject to the balance constraint — the
+strength filter is the only bias." The alternative — directly constructing a
+"balanced" hand by hand-picking cards to spread evenly — would be simpler
+code but would introduce a much stronger, harder-to-reason-about bias than
+"reject and re-roll a genuinely random deal until it happens to be close
+enough," capped at 60 attempts so a pathological run can't loop forever.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type Card struct {
+	Rank int
+	Suit Suit
+}
+func (c Card) ID() string { return RankLabel(c.Rank) + c.Suit.Code() }</code></pre>
+<p>
+<code>Card</code> is a plain comparable struct (no pointers, no interfaces)
+specifically so it can be a map key and compared with <code>==</code> — the
+same "hand-rolled equality" idea Dart's <code>PlayingCard</code> needed a
+manual <code>==</code> override for in module 1, except Go structs get
+value equality for free when every field is itself comparable.
+<code>ID()</code> produces the exact same wire string Dart's
+<code>PlayingCard.id</code> does (<code>"AS"</code>, <code>"10H"</code>),
+which is what keeps a card played on one side of the wire recognizable on
+the other.
+</p>
+<pre><code>func DealConfigFromPreset(preset string) DealConfig {
+	switch preset {
+	case "physical":
+		return DealConfig{Shuffle: ShuffleRiffle, Style: DealBatched}
+	case "balanced":
+		return DealConfig{Shuffle: ShuffleBalanced, Style: DealRoundRobin}
+	default:
+		return DefaultDealConfig()
+	}
+}</code></pre>
+<p>
+This is the function <code>protocol.ResolveDeal</code> (module 11) hands off
+to: a wire string picked by the player becomes a concrete
+shuffle-plus-distribution pair. Notice the same graceful-degradation pattern
+as everywhere else in this codebase — an unrecognized preset string falls
+through to the fair default rather than erroring.
+</p>
+<pre><code>func riffle(deck []Card, rng *rand.Rand) {
+	n := len(deck)
+	cut := n/2 + rng.IntN(9) - 4
+	...
+	run := 1 + rng.IntN(3)
+	...
+}</code></pre>
+<p>
+<code>riffle</code> and <code>overhand</code> simulate the two classic
+physical shuffles — cutting the deck near the middle and interleaving small
+runs from each half, or lifting small packets off the top and stacking them
+on a new pile — purely for the "feel" of a hand-shuffled deck. Both are run
+several passes in a row (<code>shuffleDeck</code>) because a single riffle
+pass is a well-known weak shuffle; repeating it is what makes it
+practically fair despite imitating something imperfect.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>handStrength</code> weights trump cards more than plain ones. Before looking, guess the formula's shape and why trumps might be weighted roughly double.</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>func handStrength(hand []Card) int {
+	s := 0
+	for _, c := range hand {
+		v := c.Rank - MinRank // 0..12
+		if c.IsTrump() {
+			v = v*2 + 6
+		}
+		s += v
+	}
+	return s
+}</code></pre>
+<p>
+Every card contributes its rank above the minimum (0 to 12), but a trump
+card's contribution is doubled and bumped by a flat 6 — reflecting that in
+Call Break, spades are permanent trumps that can win a trick even when they
+weren't led, so holding them is worth substantially more than holding a
+plain high card of the same rank. This is only used to measure a hand for
+the balanced-deal filter — it never influences bidding or play.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+This file's own package comment ("faithful port ... every exported symbol
+below has a named counterpart in the Dart source") is not accurate for
+roughly a third of its content — the entire deal-preset system has no Dart
+equivalent (verified above). That's not a bug in the code itself, but it is
+a real maintainability trap for whoever reads that comment first and then
+goes looking in <code>card.dart</code> for
+<code>DealConfigFromPreset</code>'s counterpart, finds nothing, and has to
+guess whether that's a missing port or an intentional addition. A one-line
+addendum to the package comment — "except the deal-preset system, which is
+server-only" — would close the gap between what the comment promises and
+what the file actually contains.
+</div>
+</div>
+
+<h2 id="rulesgo"><code>engine/rules.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/engine/rules.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The actual Call Break rulebook, encoded as functions: what you're allowed to
+play, who wins a trick, how a hand is scored. This is the part of the port
+that has to be <em>exactly</em> right — a divergence here between Dart and
+Go means the server would reject a move the offline mode allows, or score a
+hand differently than the client predicts.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong><code>Round1</code> uses <code>math.Round</code>, deliberately, over
+Go's more common truncating conversion.</strong> The comment is explicit:
+"The rounding must match Dart's <code>(raw * 10).round() / 10</code>, whose
+<code>.round()</code> ties away from zero — which is exactly
+<code>math.Round</code>'s behaviour." A careless port might reach for
+<code>int(raw*10)</code>, which truncates toward zero rather than rounding —
+subtly wrong for exactly the negative and half-way values a losing bid's
+score (a straight negative number) would produce. Choosing the specific
+standard-library function whose rounding rule matches Dart's, rather than
+hand-rolling one, is what makes the two languages agree on the same score
+for the same hand.
+</p>
+<p>
+<strong><code>LegalMoves</code> is a pure function of a hand and a trick,
+not a method on <code>Game</code>.</strong> This mirrors the same choice
+made in <code>rules.dart</code> (module 1): keeping the rules engine free of
+any table state means it can be called standalone — from
+<code>Game.LegalMovesFor</code>, from a future bot, or from a test — without
+constructing a whole game first.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func LegalMoves(hand []Card, trick []TrickPlay) []Card {
+	if len(trick) == 0 { ... } // leading is free
+	led := trick[0].Card.Suit
+	inSuit := OfSuit(hand, led)
+	if len(inSuit) > 0 {
+		// must follow suit, and beat the best card of that suit if able ("heading")
+		...
+	}
+	// void in the led suit: must trump, and overtrump if the trick is already trumped
+	...
+}</code></pre>
+<p>
+Identical three-tier logic to Dart's version, walked in module 1: leading is
+unrestricted; holding the led suit, you must follow it and beat the best
+card of that suit already down if any of your cards can ("heading");
+holding none of the led suit, you must trump, and overtrump an already-
+trumped trick if you're able to. Only unable to overtrump may you discard
+freely.
+</p>
+<pre><code>func TrickWinner(trick []TrickPlay) int {
+	led := trick[0].Card.Suit
+	var contenders []TrickPlay
+	for _, p := range trick {
+		if p.Card.IsTrump() { contenders = append(contenders, p) }
+	}
+	if len(contenders) == 0 {
+		for _, p := range trick {
+			if p.Card.Suit == led { contenders = append(contenders, p) }
+		}
+	}
+	best := contenders[0]
+	for _, p := range contenders[1:] {
+		if p.Card.Rank > best.Card.Rank { best = p }
+	}
+	return best.Seat
+}</code></pre>
+<p>
+Any trump beats any non-trump regardless of what was led, so the contender
+pool is every trump played if there's at least one, and otherwise every
+card of the led suit; the highest rank among the contenders wins.
+<code>WouldWin</code> (used by the bot in module 3's Dart equivalent, and
+reused server-side) reuses this exact function by constructing a hypothetical
+trick with the candidate card appended under sentinel seat <code>-1</code>,
+rather than duplicating the winner logic — the same "ask the real function a
+hypothetical question" pattern <code>rules.dart</code> used.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found in this file. It is pure, has no I/O, no shared state, and
+is covered by <code>rules_test.go</code> (264 lines) — the kind of code this
+port strategy is supposed to produce.
+</div>
+</div>
+
+<h2 id="gamego"><code>engine/game.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/engine/game.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The state machine itself — the Go counterpart to Dart's
+<code>CallBreakGame</code> from module 2. It owns one table's phase, hands,
+bids, trick, and running scores, and exposes exactly two ways in
+(<code>PlaceBid</code>, <code>PlayCard</code>) and one way for state to leave
+(<code>ViewFor</code>).
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Explicitly not safe for concurrent use — by contract, not by
+mutex.</strong> The doc comment on <code>Game</code> states it directly: "It
+is not safe for concurrent use: exactly one goroutine (the room actor) owns
+an instance." The alternative — a <code>sync.Mutex</code> guarding every
+field, so any goroutine could call <code>PlayCard</code> safely — is the
+more conventional Go answer to shared mutable state. This codebase instead
+commits to the actor model built in module 13: one goroutine per table owns
+its <code>*Game</code> completely, and every external request is a message
+sent to that goroutine, never a direct concurrent call. The payoff is that
+none of this file needs locks, and none of its logic has to reason about
+interleaving — at the cost that the invariant is enforced by convention and
+code review, not by the compiler or a runtime check.
+</p>
+<p>
+<strong>Mutating methods return <code>bool</code>, not an error, and leave
+state completely untouched on failure.</strong> <code>PlaceBid</code> and
+<code>PlayCard</code> both start with a guard clause that returns
+<code>false</code> immediately — wrong phase, wrong turn, already bid,
+illegal card — before mutating anything. This mirrors Dart's
+<code>CallBreakGame</code> pattern from module 2 exactly: the caller (the
+room actor) turns a <code>false</code> into a protocol error frame with zero
+rollback logic of its own, because there's nothing to roll back.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (g *Game) PlayCard(seat int, card Card) bool {
+	if g.Phase != PhasePlaying || g.Turn == nil || *g.Turn != seat || g.AwaitingTrickClr {
+		return false
+	}
+	if !Contains(g.hands[seat], card) { return false }
+	if !IsLegalPlay(g.hands[seat], g.Trick, card) { return false }
+
+	g.hands[seat], _ = remove(g.hands[seat], card)
+	g.Trick = append(g.Trick, TrickPlay{Seat: seat, Card: card})
+	g.pending = append(g.pending, CardPlayed{Seat: seat, Card: card})
+
+	if len(g.Trick) == 4 {
+		winner := TrickWinner(g.Trick)
+		g.AwaitingTrickClr = true
+		g.Turn = nil
+		...
+	} else {
+		g.setTurn((seat + 1) % 4)
+	}
+	return true
+}</code></pre>
+<p>
+Four checks — phase, turn, card actually in hand, card legal under the
+rules — all have to pass before a single field changes. The fourth trick
+card triggers the exact same two-step clear you saw in Dart's
+<code>game.dart</code> (module 2): the trick freezes
+(<code>AwaitingTrickClr = true</code>, <code>Turn = nil</code>) so nobody
+can play into a trick that's already decided, and a separate
+<code>ClearTrick()</code> call — driven by the room actor's own timer, not
+by this method — banks it after the "linger" delay the client shows the
+finished trick for.
+</p>
+<pre><code>func (g *Game) ViewFor(seat int) *View {
+	v := &View{ Phase: g.Phase, HandIndex: g.HandIndex, ... }
+	...
+	if seat >= 0 && seat < 4 {
+		v.Hand = SortForDisplay(g.hands[seat])
+		for _, c := range g.LegalMovesFor(seat) {
+			v.LegalMoveIDs = append(v.LegalMoveIDs, c.ID())
+		}
+	}
+	...
+}</code></pre>
+<p>
+The redaction boundary — this is the only function in the entire backend
+that turns full table state into something safe to send a specific seat.
+Pass a real seat and you get that seat's actual cards plus its own legal
+moves; pass <code>-1</code> and you get a spectator view with no cards at
+all. Every other seat's hand is never even referenced here — <code>View</code>
+only ever carries <code>HandCounts</code> for the other three, never their
+actual cards. Exactly the same redaction-at-construction principle module 2
+established for <code>GameView</code> in Dart, independently re-implemented.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>NextHand</code> is a no-op unless the game is in <code>PhaseHandOver</code>. Given the room actor is the only caller, why guard against a call in the wrong phase at all?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>func (g *Game) NextHand() {
+	if g.Phase != PhaseHandOver {
+		return
+	}
+	...
+}</code></pre>
+<p>
+Because "the room actor is the only caller" describes today's callers, not a
+guarantee the type system enforces. A future bug — a duplicate timer firing
+twice, a race in how the room schedules the next-hand advance, a test
+calling it out of order — would otherwise silently corrupt game state (for
+example, dealing a second hand mid-trick) instead of harmlessly doing
+nothing. The guard costs one comparison and turns a whole category of
+programmer error into a no-op instead of corrupted state.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The concurrency-safety contract ("exactly one goroutine owns an instance")
+is documented but not enforced anywhere in this file — no build tag, no
+runtime owner-goroutine check (Go's race detector would catch a violation
+in tests, but only if a test actually exercises concurrent access, and none
+of <code>game_test.go</code>'s 425 lines appear to). This is the same shape
+of risk as module 10's three-implementations note: correct today because
+every real caller happens to follow the rule, with nothing short of the
+race detector (run manually, not as a gate) to catch a future caller that
+doesn't.
+</div>
+</div>
+
+<h2 id="eventgo"><code>engine/event.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/engine/event.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The Go counterpart to Dart's sealed <code>GameEvent</code> hierarchy from
+module 2 — a discrete record of something that happened (a hand started, a
+bid was placed, a trick was won) that the room actor forwards to clients as
+an <code>event</code> frame for them to animate.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>An interface with one method, not a sealed hierarchy — because Go
+has no sealed classes.</strong> Dart's version is a compiler-enforced closed
+set: a <code>switch</code> over a sealed <code>GameEvent</code> that misses a
+subtype fails to compile. Go's type system has no equivalent — the closest
+available tool is an interface (<code>Event</code>, with a single
+<code>Wire() map[string]any</code> method) that any of the six event structs
+can satisfy. The trade-off is real and asymmetric: any Go code that
+<code>switch</code>es on a concrete event type (a type switch) to handle
+each one specially gets <em>no</em> compiler warning if a new event variant
+is added later and that switch isn't updated to handle it — it simply falls
+through to whatever <code>default</code> case exists, silently, where Dart's
+sealed-class switch would refuse to compile until every case was handled.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>type Event interface {
+	Wire() map[string]any
+}
+
+type CardPlayed struct {
+	Seat int
+	Card Card
+}
+func (e CardPlayed) Wire() map[string]any {
+	return map[string]any{"event": "play", "seat": e.Seat, "card": e.Card.ID()}
+}</code></pre>
+<p>
+Each event is its own small struct, and its <code>Wire()</code> method
+returns the frame body as a bare map — deliberately without the outer
+<code>"type": "event"</code> envelope key, which <code>protocol.EncodeEvent</code>
+(module 11) injects afterward. Six events cover everything the client needs
+to animate: <code>HandStarted</code>, <code>BidPlaced</code>,
+<code>BiddingComplete</code>, <code>CardPlayed</code>, <code>TrickWon</code>,
+<code>HandOver</code>, <code>GameOver</code> — matching Dart's seven-variant
+<code>GameEvent</code> hierarchy from module 2 minus the two client-only
+variants (<code>PresenceChanged</code>, <code>AutoplayChanged</code>) that
+the server instead sends as raw maps directly from
+<code>protocol/server.go</code> (module 11's <code>AutoplayChanged</code>
+function), since those never originate from the engine itself.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The lack of compiler-enforced exhaustiveness (see Decision) is a real,
+if narrow, risk: <code>Game</code> only ever appends known event structs
+to <code>g.pending</code> and nothing in this package currently does a type
+switch over <code>Event</code> — the room actor (module 13) instead just
+calls <code>.Wire()</code> polymorphically through the interface, which
+sidesteps the risk entirely for the code that exists today. The risk is
+purely forward-looking: the day some future code needs to special-case one
+event type (metrics, logging, a feature that behaves differently per event)
+via a type switch, adding a new event variant later would not force that
+switch to be revisited the way Dart's sealed class would.
+</div>
+</div>
+
+<h2 id="jsongo"><code>engine/json.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/engine/json.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Go's <code>encoding/json</code> would happily marshal a <code>Card</code> as
+<code>{"Rank":14,"Suit":0}</code> and a <code>View</code> with its actual Go
+field layout — neither is what <code>GameView.fromJson</code> on the Dart
+side expects. This file hand-writes the marshaling so the bytes leaving the
+Go server are byte-compatible with what the Dart client already decodes.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Hand-written <code>MarshalJSON</code>/<code>UnmarshalJSON</code>,
+not struct tags alone, and not a code generator.</strong> The same
+convention module 2 established on the Dart side (hand-written
+<code>toJson</code>/<code>fromJson</code>, no codegen, as a zero-build-step
+house style) is mirrored here. Struct tags alone can't produce
+<code>"AS"</code> for a card — the wire format is a computed string, not a
+direct field — so <code>Card.MarshalJSON</code> is written by hand to call
+<code>c.ID()</code>. A code generator (like <code>protoc</code> or a
+Go-specific JSON codegen tool) could produce equivalent code, but would add
+a build step neither language's engine otherwise needs.
+</p>
+<p>
+<strong>Nil slices are explicitly normalized to empty arrays before
+marshaling.</strong> Nine separate <code>if out.X == nil { out.X = []Y{} }</code>-shaped checks
+in <code>View.MarshalJSON</code>. Go's zero
+value for a slice is <code>nil</code>, which <code>encoding/json</code>
+marshals as JSON <code>null</code> — but Dart's <code>fromJson</code> reads
+these as <code>List</code>s and calls methods on them directly; decoding
+<code>null</code> where a list is expected throws in Dart rather than
+producing an empty list. This normalization is the entire reason a freshly
+dealt hand with an empty legal-moves list doesn't crash the client.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (c Card) MarshalJSON() ([]byte, error) { return json.Marshal(c.ID()) }
+
+func (c *Card) UnmarshalJSON(data []byte) error {
+	var id string
+	if err := json.Unmarshal(data, &id); err != nil { return err }
+	parsed, err := ParseCard(id)
+	if err != nil { return err }
+	*c = parsed
+	return nil
+}</code></pre>
+<p>
+A <code>Card</code> marshals to and from a bare JSON string — not an object
+— which is exactly the shape module 1's Dart <code>PlayingCard.id</code>
+uses on the wire. Because <code>Card</code> implements the standard library's
+<code>json.Marshaler</code>/<code>Unmarshaler</code> interfaces, every place
+a <code>Card</code> appears inside a larger struct (a hand, a trick) encodes
+correctly automatically — <code>encoding/json</code> calls these methods for
+you at every nesting level, no manual wiring required at each call site.
+</p>
+<pre><code>type viewJSON struct {
+	Phase        Phase           `json:"phase"`
+	...
+	Bids         []*int          `json:"bids"`
+	...
+}
+
+func (v *View) MarshalJSON() ([]byte, error) {
+	out := viewJSON{ ... Bids: v.Bids[:], ... }
+	if out.Hand == nil { out.Hand = []Card{} }
+	...
+	return json.Marshal(out)
+}</code></pre>
+<p>
+<code>View</code> itself uses Go arrays (<code>[4]*int</code> for
+<code>Bids</code>) internally for the compile-time guarantee of exactly four
+seats, but a private mirror struct <code>viewJSON</code> with slice fields
+and explicit <code>json</code> tags is what's actually marshaled —
+<code>v.Bids[:]</code> converts the array to a slice at the boundary. This
+is the same "internal representation optimized for the language, wire
+representation matched to the contract" split you'd expect, kept in one
+small private type rather than leaking JSON tags onto the array-typed fields
+game logic actually works with.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found. The nil-to-empty-array normalization is exactly the kind
+of defensive measure this codebase's cross-language contract needs, and
+it's directly exercised by <code>golden_test.go</code> below rather than
+left to hope.
+</div>
+</div>
+
+<h2 id="goldentest">Testing strategy: <code>golden_test.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/engine/golden_test.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Two independent implementations of the same rules, in two different
+languages, are only as trustworthy as the mechanism that catches them
+drifting apart. This file is that mechanism: it captures real server output
+to a checked-in file, which a matching Dart test then has to be able to
+decode.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Golden JSON files checked into <code>testdata/</code>, decoded by a
+test in the <em>other</em> language, instead of maintaining two parallel
+unit test suites that assert the same things independently.</strong> The
+file's own comment states the risk this avoids plainly: "The Dart client
+decodes these frames with <code>GameView.fromJson</code>, which reads its
+keys unconditionally and throws on anything it does not recognise the shape
+of. A Go change that alters the encoding therefore breaks every connected
+client — and would do it at runtime, on a phone, not here." Two separate
+test suites, one per language, could both pass while each testing a
+slightly different (and both self-consistent) idea of the wire shape — they
+would never actually prove the two sides agree with each other. A golden
+file that one side writes and the other side is graded against makes
+disagreement a hard failure in CI rather than a silent runtime crash on a
+user's phone.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func goldenViews(t *testing.T) map[string]*View {
+	rng := rand.New(rand.NewPCG(20260809, 0x5eed))
+	g := NewGame(testTable(), HandsPerGame, rng)
+	out := map[string]*View{}
+	g.Start()
+	out["bidding"] = g.ViewFor(0)
+	for i := 0; i < 4; i++ { g.PlaceBid(*g.Turn, 3) }
+	out["playing"] = g.ViewFor(0)
+	...
+	out["spectator"] = g.ViewFor(-1)
+	timed := g.ViewFor(0)
+	timed.TurnDeadlineMs = 1786000015000
+	out["withTurnClock"] = timed
+	return out
+}</code></pre>
+<p>
+A seeded RNG makes the whole sequence deterministic, and the game is driven
+through every phase that produces a structurally different view — bidding
+(nullable bids populated differently than in play), mid-trick, hand-over
+(round scores populated), game-over (rankings populated), a spectator with
+no cards, and a view carrying the server-only turn clock fields. These are
+"exactly the ones a decoder trips over," per the file's own comment — the
+nullable and server-only fields are where a shape mismatch would actually
+bite.
+</p>
+<pre><code>encoded, err := json.MarshalIndent(frames, "", "  ")
+...
+if !bytes.Equal(existing, encoded) {
+	t.Fatalf("the view encoding changed.\n\n" +
+		"If that was deliberate, regenerate with:\n" +
+		"    UPDATE_GOLDEN=1 go test ./internal/engine\n" +
+		"then run the Flutter suite — frontend/test/wire_contract_test.dart " +
+		"decodes these exact bytes and will tell you whether the client can " +
+		"still read them.\n\ngolden file: %s", path)
+}</code></pre>
+<p>
+Run normally, the test fails loudly the instant the JSON bytes it produces
+differ from what's checked in — whether that's a deliberate protocol change
+or an accidental one. The failure message doesn't just say "it changed"; it
+tells the developer exactly what to do next: regenerate with
+<code>UPDATE_GOLDEN=1</code>, then go run the Dart-side decoder test
+(<code>frontend/test/wire_contract_test.dart</code>) against the new bytes
+before trusting the change.
+</p>
+
+<details class="try">
+<summary>Try it yourself — this file only captures <code>View</code> frames. What class of wire message from this module has no equivalent golden coverage?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<p>
+Events — everything <code>event.go</code>'s <code>Wire()</code> methods
+produce, wrapped by <code>protocol.EncodeEvent</code>. There is no
+<code>event_frames.json</code> or equivalent alongside
+<code>view_frames.json</code> in <code>backend/testdata/</code> (confirmed:
+the directory contains only <code>view_frames.json</code>), and no test in
+this package captures an <code>event</code> frame's bytes the way
+<code>goldenViews</code> captures a <code>view</code> frame's. A change to
+how, say, <code>HandOver</code>'s <code>deltas</code> field encodes would
+have no golden test to catch it before it reached a real client.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+As surfaced in the try-it-yourself above: the golden-file safety net covers
+<code>view</code> frames only, not <code>event</code> frames. Both are
+produced by this same engine package and consumed by the same
+"reads keys unconditionally and throws on the unexpected" Dart decoding
+style the comment warns about — an accidental change to an event's field
+names or types (in <code>event.go</code>) has exactly the same blast radius
+(a runtime crash on a connected client) as a view change, but only the view
+side has a regression test that would catch it before it shipped. Extending
+<code>goldenViews</code>'s pattern to capture one frame per event type would
+close this gap with the same mechanism already proven to work.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>The package comment on <code>card.go</code> says every exported symbol has a named Dart counterpart. What's actually true, and why does the gap exist?</summary>
+<div class="answer">
+Roughly a third of the file — the ShuffleKind/DealStyle/DealConfig deal-preset
+system — has no Dart equivalent at all; Dart's own dealHands is a three-line
+shuffle-and-cut. The gap exists because deal presets are a networked-table
+option chosen at join time, and only the server ever deals cards for a
+networked table — the offline mode never needed a choice.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>Game</code> get away with having no mutex, given it holds mutable shared state?</summary>
+<div class="answer">
+Because "shared" is the wrong word for how it's actually used: the codebase
+commits to an actor model where exactly one goroutine (the room actor, built
+next module) ever touches a given Game instance, so nothing is ever actually
+concurrent. The safety comes from that convention being followed everywhere,
+not from a lock — which is both the appeal (no lock contention, simpler code)
+and the risk (nothing stops a future caller from breaking the convention).
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>Round1</code> specifically use <code>math.Round</code> instead of a more common truncating int conversion?</summary>
+<div class="answer">
+Because Dart's own `.round()` ties away from zero, and math.Round matches
+that exact behavior — a truncating conversion would silently disagree with
+Dart on negative and half-way values, which is precisely where a losing
+bid's score (a plain negative number) would land.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does this codebase use a checked-in golden JSON file plus a cross-language decode test, instead of one unit test suite per language that separately asserts the wire shape?</summary>
+<div class="answer">
+Two independent suites could each pass while quietly encoding two different,
+self-consistent assumptions about the shape — neither would ever actually
+prove the two sides agree. A golden file one side writes and the other is
+graded against turns any real disagreement into a hard, visible CI failure
+instead of a runtime decode crash on a user's phone.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="11-go-foundations.html">← Module 11: Go Backend Foundations</a>
+<a href="13-room-match.html">Module 13: Room Actor & Matchmaking →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

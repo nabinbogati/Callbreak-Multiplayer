@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10. LAN Multiplayer — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m10">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 10 of 20</p>
+<h1>LAN Multiplayer</h1>
+<p class="lede">
+The last Flutter-only mode: four phones on the same Wi-Fi, no internet, no Go
+server at all. One phone becomes the table itself. This module builds
+<code>net/lan_discovery.dart</code> (finding a nearby table) and
+<code>net/lan_host_session.dart</code> (being one).
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="38" fill="#4fd68c">UI ✓ · State ✓ · Audio ✓ · RemoteSession ✓</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="88" fill="#4fd68c" font-weight="bold">GameSession ◀ you are here — LanHostSession, lan_discovery</text>
+  <text x="32" y="104" fill="#9db0a4">Part II complete after this module — every Flutter-only mode built</text>
+  <rect x="20" y="122" width="440" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="144" fill="#4fd68c">Engine ✓ · Bot ✓ · LocalSession ✓</text>
+  <text x="32" y="160" fill="#9db0a4">LanHostSession reuses this exactly like RemoteSession's server does</text>
+</svg>
+</div>
+
+<h2 id="landiscovery"><code>net/lan_discovery.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/lan_discovery.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Before two phones can play together over LAN, one has to find the other with
+no server, no internet, and no manual IP entry expected of an ordinary player.
+This file is that discovery mechanism — a host advertises itself, guests
+listen.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Plain UDP broadcast to a fixed port (<code>47777</code>), not
+multicast.</strong> Per the file's own comment: "Plain broadcast (not
+multicast), so no extra Android multicast permission is needed." A real,
+concrete platform constraint decided the mechanism — multicast is arguably the
+more "correct" tool for this (targeted delivery to interested listeners only),
+but broadcast avoids an extra permission prompt a player would have to grant
+for a card game, at the cost of every device on the network receiving every
+advert whether it's listening or not.
+</p>
+<p>
+<strong>Adverts expire by timeout (4 seconds with no fresh sighting), rather
+than the host sending an explicit "I'm closing" message.</strong> A host that
+crashes, loses power, or is simply killed by the OS can't be relied on to send
+a goodbye message — so guests instead just stop trusting a listing once its
+own periodic re-broadcasts (every second, from <code>LanBroadcaster</code>)
+stop arriving. The cost is a small window (up to 4 seconds) where a guest
+might still see a table that's actually already gone.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>class LanBroadcaster {
+  Future&lt;void&gt; start() async {
+    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    socket.broadcastEnabled = true;
+    _socket = socket;
+    _timer = Timer.periodic(interval, (_) =&gt; _sendOnce());
+    _sendOnce();
+  }
+
+  void _sendOnce() {
+    final payload = utf8.encode(jsonEncode({
+      'type': 'callbreak-lan', 'room': roomCode, 'host': hostName,
+      'port': wsPort, 'players': _playerCount,
+    }));
+    socket.send(payload, InternetAddress('255.255.255.255'), lanDiscoveryPort);
+  }
+}</code></pre>
+<p>
+The host side is almost the entire mechanism: bind a UDP socket, and every
+second, blast a small JSON packet to the network's broadcast address
+(<code>255.255.255.255</code>) with the room code, host name, and — crucially
+— the port its actual WebSocket server (built next) is listening on, since
+that's assigned dynamically at bind time.
+</p>
+<pre><code>class LanDiscovery extends ChangeNotifier {
+  final Map&lt;String, (LanGameAdvert, DateTime)&gt; _seen = {};
+
+  void _onEvent(RawSocketEvent event) {
+    ...
+    final key = '${datagram.address.address}:$room';
+    _seen[key] = (advert, DateTime.now());
+    notifyListeners();
+  }
+
+  void _prune() {
+    final cutoff = DateTime.now().subtract(_advertTtl);
+    _seen.removeWhere((_, entry) =&gt; entry.$2.isBefore(cutoff));
+    if (_seen.length != before) notifyListeners();
+  }
+}</code></pre>
+<p>
+The guest side is a live, self-cleaning map: every received advert refreshes
+its entry's timestamp, and a periodic prune drops anything not refreshed
+recently enough. The key
+(<code>'${datagram.address.address}:$room'</code>) combines sender address and
+room code, so the same room code broadcast by two different hosts (a
+collision, however unlikely) is still tracked as two separate, distinguishable
+tables rather than overwriting each other.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness — this is a small, self-contained, and appropriately defensive
+mechanism (a malformed or foreign UDP packet on the same port is simply
+ignored, lines 122–128).
+</div>
+</div>
+
+<h2 id="lanhostsession"><code>net/lan_host_session.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/lan_host_session.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A LAN game needs an authority — something has to hold the real deck and decide
+whose turn it is, the same job the Go server does for online play. Without a
+central server available, this file makes one phone <em>become</em> that
+authority: it runs an embedded WebSocket server, speaks the exact same wire
+protocol as the Go backend (Part III), and lets nearby guest devices connect
+to it precisely as if it were a real server.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The host runs a real, if minimal, <code>dart:io HttpServer</code> +
+<code>WebSocketTransformer</code> — the same primitives any server would use —
+rather than some lighter peer-to-peer scheme with no server role at all.</strong>
+Because it speaks the identical frame shapes the Go server does
+(<code>joined</code>, <code>lobby</code>, <code>view</code>, <code>event</code>),
+every guest simply connects with the exact same <code>RemoteSession</code>
+class built in module 9 — nothing about the client needs to know or care
+whether the far end is a phone or a data-center server. That reuse is the
+entire payoff of the wire protocol's own compatibility rules (module 9's
+Decision on total, defensive decoding). The cost is that this project now
+has <strong>three separate implementations of "run a Call Break table"</strong>
+— <code>LocalSession</code> (module 5), this file, and the Go room actor
+(module 13) — each hand-written, each needing to agree on pacing and rules.
+</p>
+<p>
+The file's own class doc comment says this almost exactly: "this mirrors
+[<code>LocalSession</code>]'s publish/schedule loop, just fanned out over
+every connected socket instead of one local field," and separately: "Unlike a
+local game it also runs the table's clocks, because a table with other people
+at it cannot wait indefinitely on any one of them" — which is precisely the
+same turn-timeout/autoplay responsibility the Go server owns for online
+tables. Architecturally, <code>LanHostSession</code> sits exactly between
+<code>LocalSession</code> (on-device, no clocks, no other players) and the Go
+backend (networked, with clocks, running on a real server) — same shape as
+the server, running on a phone instead.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>Future&lt;void&gt; startHosting() async {
+  _claimHostSeat();
+  final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+  _server = server;
+  server.listen((HttpRequest request) async {
+    if (WebSocketTransformer.isUpgradeRequest(request)) {
+      final socket = await WebSocketTransformer.upgrade(request);
+      _handleClient(socket);
+    } else {
+      request.response.statusCode = HttpStatus.forbidden;
+      await request.response.close();
+    }
+  });
+
+  final broadcaster = LanBroadcaster(
+    roomCode: roomCode, hostName: playerName, wsPort: server.port,
+  );
+  _broadcaster = broadcaster;
+  await broadcaster.start();
+  notifyListeners();
+}</code></pre>
+<p>
+Binding to port <code>0</code> asks the OS to pick any free port — that's why
+<code>LanBroadcaster</code> is constructed only <em>after</em> the bind
+succeeds, with <code>wsPort: server.port</code> reading back whatever port the
+OS actually assigned. A plain HTTP request that isn't a WebSocket upgrade is
+rejected outright (<code>403</code>) — this embedded server has exactly one
+job and nothing else to serve.
+</p>
+<p>
+<strong>Who's allowed to start the game (line 126):</strong></p>
+<pre><code>bool get canStart =&gt; !_started &amp;&amp; lobbyPlayers.where((p) =&gt; p.connected).length &gt;= 2;</code></pre>
+<p>
+Per its own comment: "A host playing three bots is what the offline mode is
+for — a LAN table needs somebody who actually joined it." This is the exact
+same "at least 2 humans" philosophy the Go backend's quickplay matchmaking
+enforces server-side (Part III) — genuinely independent code, same design
+principle, arrived at twice.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>_recorder</code> only exists on the host, never on a guest's own session. Why?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>/// Collects the upload payload as the game is played. The host is the only
+/// device that sees every seat, so it is the only one that can record a LAN
+/// game — the guests upload nothing.
+GameRecorder? _recorder;</code></pre>
+<p>
+Module 2's redaction principle again: a guest's own view of the table only
+ever contains its own cards, never the other three hands. A game history
+record needs every seat's bids, tricks and final scores — only the host, who
+runs the real, unredacted <code>CallBreakGame</code>, actually has that data
+to record.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+As named in the Decision above: this project maintains <strong>three</strong>
+separate hand-written implementations of table-running logic
+(<code>LocalSession</code>, <code>LanHostSession</code>, and the Go room
+actor in module 13), each of which must independently agree on pacing,
+turn-timeout behaviour, and rules enforcement. The engine itself is shared
+(module 2's <code>CallBreakGame</code> is reused directly here, unlike the Go
+side which is a full port), which narrows the risk considerably, but the
+*scheduling* logic — when a trick clears, when a bot acts, when a timeout
+fires — is written three separate times with no shared abstraction between
+them. A behavioural difference between <code>LanHostSession</code>'s timeout
+handling and the Go server's would be a real, easy-to-introduce bug with
+nothing to catch it beyond manual testing.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does LAN discovery use UDP broadcast instead of the more "correct" multicast?</summary>
+<div class="answer">
+Multicast requires an extra permission on Android that broadcast doesn't —
+the platform constraint decided the mechanism, at the cost of every device on
+the network (not just interested listeners) receiving every advert packet.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does a LAN table's discovery entry expire by timeout instead of the host sending an explicit "closing" message?</summary>
+<div class="answer">
+A host that crashes or is killed outright never gets the chance to send a
+goodbye message, so relying on one would leave guests seeing a phantom table
+forever in that case. Timing out an advert that's stopped being refreshed is
+self-healing regardless of how the host went away, at the cost of a brief
+window where a just-closed table can still appear live.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>LanHostSession</code> reuses <code>RemoteSession</code> unmodified on the guest side. What design decision from an earlier module made that possible?</summary>
+<div class="answer">
+Module 9's wire protocol decoding is total and defensive — it reads whatever
+frames arrive in the documented shape without caring which process produced
+them. Because <code>LanHostSession</code> emits the identical frame shapes
+the Go server does, <code>RemoteSession</code> connects to either one with
+zero code changes.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>What real maintainability risk does having three separate table-running implementations (LocalSession, LanHostSession, the Go room actor) create, and what limits its blast radius?</summary>
+<div class="answer">
+Each one hand-writes its own pacing and turn-timeout scheduling, so a
+behavioural difference between them (say, a timeout edge case handled
+differently) is a real bug with no shared code to catch it. What limits the
+risk: all three route actual game-rule decisions through the same engine
+(module 2's <code>CallBreakGame</code> in two of the three; a tested Go port
+in the third) — it's the scheduling logic around the engine, not the rules
+themselves, that's triplicated.
+</div>
+</details>
+
+</div>
+
+<h2>Part II complete</h2>
+<p>
+Every Flutter-only mode is now built: solo vs bots, private/quickplay online
+play, and LAN. Part III builds the Go server these networked modes actually
+talk to.
+</p>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="09-rest-upload.html">← Module 9: Going Online</a>
+<a href="11-go-foundations.html">Module 11: Go Backend Foundations →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

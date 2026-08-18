@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2. Game State Machine — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m02">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part I — Flutter engine (pure Dart) · Module 2 of 20</p>
+<h1>Game State Machine</h1>
+<p class="lede">
+<code>card.dart</code> defines what a card is; <code>rules.dart</code> defines
+what's legal. Neither knows what phase the game is in, whose turn it is, or
+what's been scored. That's <code>frontend/lib/engine/game.dart</code> — the
+594-line file that turns "rules" into an actual playable, turn-by-turn game.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="38" fill="#6d7f74">UI (not built yet)</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="94" fill="#6d7f74">GameSession (not built yet)</text>
+  <rect x="20" y="122" width="440" height="76" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="144" fill="#4fd68c" font-weight="bold">Engine — card.dart ✓, rules.dart ✓, game.dart ◀ you are here</text>
+  <text x="32" y="162" fill="#9db0a4">CallBreakGame drives phase/turn/bids/tricks on top of rules.dart</text>
+  <text x="32" y="178" fill="#9db0a4">and hands out a redacted GameView to whoever's watching.</text>
+</svg>
+</div>
+
+<h2>Prerequisite terms</h2>
+<p>
+<dfn class="term" title="A class whose subtypes are all known and declared in the same file; a switch over it must be exhaustive.">sealed class</dfn>,
+<dfn class="term" title="A push-based sequence of values delivered over time, one at a time, as they happen.">Stream</dfn> (used by the layer above this one, in module 5) —
+see the <a href="../glossary.html">Glossary</a>.
+</p>
+
+<h2 id="phase-playerinfo">Phase & player identity</h2>
+<div class="filecard">
+<div class="path">frontend/lib/engine/game.dart:11–73</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A game isn't always in the same mode — you can't accept a card play during
+bidding, or a bid once play has started. <code>GamePhase</code> makes "what kind
+of input is even valid right now" a single checkable value instead of an
+implicit tangle of booleans. <code>PlayerInfo</code> answers the parallel
+question of <em>who</em> is in each of the four seats — human or bot, and
+(critical for the networked modes built later) whether they're currently
+connected or being played by the server on their behalf.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>An explicit five-value enum (<code>lobby, bidding, playing, handOver,
+gameOver</code>) instead of inferring phase from other state</strong> (e.g. "if
+every seat has bid, we must be in the playing phase"). The enum is one source of
+truth that every guard clause in this file checks first
+(<code>if (phase != GamePhase.bidding...) return false;</code>), rather than
+each method re-deriving "are we in bidding" from bids/tricks state and risking
+disagreement. The cost is one more field to keep in sync with the state
+transitions below — miss updating <code>phase</code> in a new code path and
+every guard silently breaks.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>enum GamePhase { lobby, bidding, playing, handOver, gameOver }
+enum PlayerKind { human, bot }
+enum BotDifficulty { easy, normal, hard }
+
+class PlayerInfo {
+  const PlayerInfo({
+    required this.seat,
+    required this.name,
+    required this.kind,
+    this.difficulty = BotDifficulty.normal,
+    this.connected = true,
+    this.autoplay = false,
+  });
+  ...
+  /// True while the server is playing this seat because its human stopped
+  /// responding. The player is still here and still owns the seat — they take
+  /// it back the moment they touch the table.
+  final bool autoplay;
+  ...
+}</code></pre>
+<p>
+Five phases map to five stages of one hand's lifecycle: nobody's arrived yet
+(<code>lobby</code>) → everyone bids in turn (<code>bidding</code>) → cards are
+played (<code>playing</code>) → the hand is scored and the table waits before
+the next deal (<code>handOver</code>) → the whole game (all
+<code>totalHands</code> hands) is finished (<code>gameOver</code>). Note
+<code>connected</code> and <code>autoplay</code> on <code>PlayerInfo</code> are
+both meaningless in this module — a solo offline game never has a seat go
+offline — but the field exists here, in the shared model, because the
+networked session (module 5, 9) needs to represent it and this is the one
+<code>PlayerInfo</code> both use.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>GamePhase</code> is a plain enum, not a <code>sealed class</code> hierarchy
+carrying phase-specific data — so a field like <code>bids</code> exists on
+<code>CallBreakGame</code> at all times even during <code>lobby</code>, when it's
+meaningless (all null). Dart's type system can't stop code from reading it too
+early; only the runtime guard clauses in each method do. A phase-tagged sealed
+state (the way <code>GameEvent</code> below is modelled) would make an
+invalid read a compile error instead of a guarded no-op — worth it only if this
+class grows more phase-specific fields than it has today.
+</div>
+</div>
+
+<h2 id="gameview">GameView — the redacted read model</h2>
+<div class="filecard">
+<div class="path">frontend/lib/engine/game.dart:111–294</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Four seats are playing one game, but no seat should ever be able to see another
+seat's cards. If the UI simply held a reference to the whole <code>CallBreakGame</code>
+and was trusted to only render "your own" cards, that trust could be broken by
+any future line of UI code — a debug print, a copy-paste from another seat's
+widget. <code>GameView</code> makes that structurally impossible instead: it is
+built once per seat and simply <em>does not contain</em> the other three hands,
+only how many cards each holds.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A dedicated, JSON-serializable snapshot type built fresh per seat, versus
+handing the UI the live <code>CallBreakGame</code> plus a "which seat am I"
+parameter.</strong> The redacted-by-construction approach means "can this UI leak
+another player's hand" is answered by reading <em>one</em> place —
+<code>viewFor</code> at the bottom of this file — instead of auditing every widget
+that might render a hand. The cost is real: <code>GameView</code> duplicates most
+of <code>CallBreakGame</code>'s fields, so the two must be kept in sync by hand
+whenever a new piece of state is added to the game.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>int? get secondsLeft {
+  if (turnDeadlineMs &lt;= 0 || serverTimeMs &lt;= 0) return null;
+  final remaining = turnDeadlineMs - serverTimeMs;
+  return remaining &gt; 0 ? (remaining / 1000).ceil() : 0;
+}
+
+bool get isMyTurn =&gt; you != null &amp;&amp; turn == you;
+bool get iHaveBid =&gt; you != null &amp;&amp; bids[you!] != null;
+bool canPlay(PlayingCard card) =&gt;
+    phase == GamePhase.playing &amp;&amp; isMyTurn &amp;&amp; legalMoveIds.contains(card.id);</code></pre>
+<p>
+These getters are the entire contract the UI (module 6) codes against — it never
+inspects <code>phase</code>/<code>turn</code> raw, it asks <code>canPlay(card)</code>
+or reads <code>isMyTurn</code>. <code>legalMoveIds</code> is a
+<code>Set&lt;String&gt;</code> of wire ids rather than a
+<code>List&lt;PlayingCard&gt;</code> — cheap <code>O(1)</code> containment checks
+per card the hand-fan widget renders, and it's already computed server/host-side
+via <code>legalMoves</code> from module 1, so the UI never re-derives legality
+itself.
+</p>
+<p>The three clock fields explain themselves in their own doc comments in the file
+— worth reading verbatim, because the reasoning ("a bot's think delay... is not
+something to show a countdown for") is exactly the kind of decision that isn't
+obvious from the field names alone:</p>
+<pre><code>/// Wall-clock instant (unix millis, server clock) at which the seat on the
+/// clock is played for automatically. Zero on a locally hosted table, and on
+/// a networked one whenever a bot is thinking — a countdown only makes sense
+/// for a turn a person can actually take.
+final int turnDeadlineMs;</code></pre>
+<p>
+Notice the engine <strong>keeps no wall clock of its own</strong> —
+<code>withClock()</code> (lines 203–231) is how whoever is <em>hosting</em> the
+table (module 5's <code>LocalSession</code>, or the Go room actor in module 13)
+stamps deadlines onto an otherwise clock-free view on the way out. That's
+deliberate: a <code>Timer</code> or <code>DateTime.now()</code> call inside the
+engine would make it non-deterministic and unable to be driven by a test with a
+fake clock.
+</p>
+
+<details class="try">
+<summary>Try it yourself — why might <code>withClock</code> return a new <code>GameView</code> instead of mutating the existing one?</summary>
+<p>Think about what else in this file is declared <code>final</code>.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<p>
+Every field on <code>GameView</code> is <code>final</code> — it's an immutable
+value, like <code>PlayingCard</code> in module 1. Mutating it in place isn't an
+option; the only way to "add" clock info is to construct a new instance carrying
+the old fields plus the new ones, which is exactly what <code>withClock</code>
+does. Immutability here means a <code>GameView</code> handed to a widget can
+never change out from under it mid-<code>build()</code> — the widget rebuilds
+with a whole new one instead.
+</p>
+</details>
+</details>
+</div>
+
+<h2 id="gameevent">GameEvent — the event stream</h2>
+<div class="filecard">
+<div class="path">frontend/lib/engine/game.dart:297–381</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A <code>GameView</code> only tells you the current state — it can't tell you
+<em>what just happened</em>, which is what the UI needs to trigger a card-flip
+animation or a trick-won sound. <code>GameEvent</code> is a discrete log of
+happenings (a card was played, a trick was won, a hand ended) emitted alongside
+state changes, purely for the presentation layer to react to.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A <code>sealed class</code> hierarchy of concrete event types, instead of
+one <code>GameEvent</code> class with a <code>type</code> string and a generic
+payload map</strong> (the shape the wire protocol itself actually uses — see
+<code>backend/PROTOCOL.md</code>'s <code>event</code> frame). Inside pure Dart
+code, a sealed hierarchy lets every <code>switch</code> over a
+<code>GameEvent</code> (in the UI's event listener, module 6) be checked
+exhaustively by the compiler — add a tenth event type and every unhandled switch
+in the codebase becomes a compile error, not a silent no-op at runtime. The cost
+shows up at the network boundary: JSON has no native concept of a sealed type,
+so <code>remote_session.dart</code> (module 9) still has to decode a wire
+<code>type</code> string back into one of these concrete classes by hand.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>sealed class GameEvent {
+  const GameEvent();
+}
+
+class CardPlayed extends GameEvent {
+  const CardPlayed(this.seat, this.card);
+  final int seat;
+  final PlayingCard card;
+}
+
+class TrickWon extends GameEvent {
+  const TrickWon(this.seat);
+  final int seat;
+}</code></pre>
+<p>
+Each subtype carries only the data relevant to that event —
+<code>CardPlayed</code> needs a seat and a card, <code>TrickWon</code> needs just
+the winning seat, <code>GameOver</code> needs the final
+<code>List&lt;SeatRanking&gt;</code>. There are seven concrete subtypes in total;
+<code>PresenceChanged</code> and <code>AutoplayChanged</code> stand out because,
+per their own doc comments, they're not really about game rules at all — they
+exist purely so a networked table can announce "a seat dropped" or "the server
+took over this seat" as a one-time notification, not something a player has to
+notice on their own.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness tied to this hierarchy itself — it's a textbook use of sealed
+classes. The cost noted above (dual representation: sealed classes in Dart,
+stringly-typed frames on the wire) is inherent to crossing a JSON boundary at
+all, not a defect in this file.
+</div>
+</div>
+
+<h2 id="callbreakgame">CallBreakGame — the state machine</h2>
+<div class="filecard">
+<div class="path">frontend/lib/engine/game.dart:383–594</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Everything above this point is data. <code>CallBreakGame</code> is the one class
+that actually <em>owns</em> a game in progress and mutates it in response to
+player actions — <code>placeBid</code>, <code>playCard</code>,
+<code>clearTrick</code>, <code>nextHand</code> — while enforcing that those
+actions only succeed when the current phase and turn allow them.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Every mutating method returns a plain <code>bool</code> (accepted /
+rejected) rather than throwing an exception on an illegal action.</strong> A
+rejected move is an entirely expected, routine outcome here — a client trying to
+play out of turn, or a stale UI tap after the turn already advanced — not an
+exceptional one. Modelling it as a return value keeps the call sites (the
+session layer, and later the Go room actor handling untrusted network input) as
+plain <code>if</code> checks instead of <code>try</code>/<code>catch</code>
+around every player action. The cost: it's easy to forget to check the boolean
+and assume the action always succeeded.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Starting a hand (lines 436–455):</strong></p>
+<pre><code>void _startHand(int index) {
+  handIndex = index;
+  dealer = (dealer + 1) % 4;
+  _hands = dealHands(_random);
+  bids = List.filled(4, null);
+  ...
+  phase = GamePhase.bidding;
+  turn = (dealer + 1) % 4;
+  _pendingEvents.add(HandStarted(index));
+}</code></pre>
+<p>
+<code>dealer</code> starts at <code>3</code> in the field declaration (line 404)
+specifically so this first <code>(dealer + 1) % 4</code> lands on seat 0 —
+"dealer starts at 3 so the first hand is dealt by seat 0 and led by seat 1," per
+the doc comment. Every subsequent hand rotates the dealer by one seat, which is
+standard trick-taking-game etiquette encoded directly in arithmetic rather than
+a separate rotation table.
+</p>
+
+<details class="try">
+<summary>Try it yourself — write <code>placeBid</code> before looking</summary>
+<p>
+Write a method <code>bool placeBid(int seat, int bid)</code>: reject (return
+<code>false</code>, change nothing) unless the phase is <code>bidding</code>,
+it's that seat's turn, and that seat hasn't already bid. On success, clamp the
+bid with <code>clampBid</code> from module 1, store it, emit a
+<code>BidPlaced</code> event, and then either advance <code>turn</code> to the
+next seat, or — if all four seats have now bid — switch <code>phase</code> to
+<code>playing</code>, set <code>turn</code> to the seat after the dealer, and
+emit a <code>BiddingComplete</code> event.
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>bool placeBid(int seat, int bid) {
+  if (phase != GamePhase.bidding || turn != seat || bids[seat] != null) {
+    return false;
+  }
+  final value = clampBid(bid);
+  bids[seat] = value;
+  _pendingEvents.add(BidPlaced(seat, value));
+
+  if (bids.every((b) =&gt; b != null)) {
+    phase = GamePhase.playing;
+    turn = (dealer + 1) % 4;
+    _pendingEvents.add(const BiddingComplete());
+  } else {
+    turn = (seat + 1) % 4;
+  }
+  return true;
+}</code></pre>
+</details>
+</details>
+
+<p><strong>Playing a card, and the two-step trick clear (lines 507–546):</strong></p>
+<pre><code>bool playCard(int seat, PlayingCard card) {
+  if (phase != GamePhase.playing || turn != seat || awaitingTrickClear) {
+    return false;
+  }
+  if (!_hands[seat].contains(card)) return false;
+  if (!isLegalPlay(_hands[seat], trick, card)) return false;
+
+  _hands[seat].remove(card);
+  ...
+  if (trick.length == 4) {
+    final winner = trickWinner(trick);
+    awaitingTrickClear = true;
+    turn = null;
+    lastTrick = CompletedTrick([...trick], winner);
+    _pendingEvents.add(TrickWon(winner));
+  } else {
+    turn = (seat + 1) % 4;
+  }
+  return true;
+}
+
+/// Called by the host once the finished trick has been on screen long enough.
+void clearTrick() {
+  if (!awaitingTrickClear) return;
+  ...
+}</code></pre>
+<p>
+Notice a finished trick doesn't clear itself — <code>playCard</code> sets
+<code>awaitingTrickClear = true</code> and <code>turn = null</code>, and stops.
+Nobody can act (no seat is "on turn," and the guard clause blocks a fifth play).
+A separate <code>clearTrick()</code> call, made by whoever's hosting after a
+pause (so players can actually see the four cards on the table before they're
+swept away), is what advances to the next trick or ends the hand. This two-step
+split is what makes the "finished trick lingers on screen" pacing possible at
+all — module 5's <code>LocalSession</code> is what actually calls
+<code>clearTrick()</code> on a timer, not this file.
+</p>
+
+<p><strong>Handing out a view — the redaction boundary (lines 570–593):</strong></p>
+<pre><code>GameView viewFor(int? seat, {int? hostSeat}) =&gt; GameView(
+  phase: phase,
+  ...
+  hand: seat == null ? const [] : sortForDisplay(_hands[seat]),
+  legalMoveIds: seat == null ? const {} : legalMovesFor(seat).map((c) =&gt; c.id).toSet(),
+  handCounts: [for (final h in _hands) h.length],
+  ...
+);</code></pre>
+<p>
+This is the one line in the whole engine that decides what a seat is allowed to
+see: <code>hand:</code> is that seat's own cards in full, but every seat's card
+<em>count</em> — never their cards — goes into <code>handCounts</code> for
+everyone. Pass <code>seat: null</code> and you get a spectator view with no hand
+and no legal moves at all. There is exactly one method that builds a
+<code>GameView</code>; nothing else in the codebase is allowed to construct one,
+which is what makes this the enforcement point rather than a convention someone
+could forget to follow.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>CallBreakGame</code> has no persistence or serialization of its own
+<em>internal</em> state (only the redacted <code>GameView</code> is
+serializable) — an in-progress game exists only in this object's memory. That's
+fine for the offline mode this module targets, but it's the root cause of a
+gap flagged later, at the server: a networked table is "in memory only" (see
+Module 18 / the Roadmap) — a process restart loses every hand in progress,
+because there was never a serialized form of <code>CallBreakGame</code> to
+snapshot in the first place.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>GameView</code> duplicate most of <code>CallBreakGame</code>'s fields instead of the UI just reading the game object directly with a "my seat" parameter?</summary>
+<div class="answer">
+So that "can another player's hand ever leak to this seat" is guaranteed by what
+data <code>GameView</code> physically contains, not by trusting every future
+widget to filter correctly. The cost is duplication that must be kept in sync
+by hand as the game gains new state.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does the engine keep no wall clock of its own — no <code>Timer</code>, no <code>DateTime.now()</code> anywhere in <code>game.dart</code>?</summary>
+<div class="answer">
+So the state machine stays deterministic and can be driven entirely by explicit
+method calls in a test, with no real time dependency. Clock info
+(<code>turnDeadlineMs</code> etc.) is stamped on afterward by whoever is
+hosting, via <code>withClock()</code> — the engine itself never decides when a
+turn times out.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why is a finished trick a two-step process (<code>playCard</code> sets <code>awaitingTrickClear</code>, a separate <code>clearTrick()</code> advances) instead of one method that plays the fourth card and immediately starts the next trick?</summary>
+<div class="answer">
+Because the finished trick needs to actually be visible on screen for a beat
+before it's swept away — if the fourth card immediately triggered the next
+trick, there'd be no state in which "four cards sit on the table, nobody's
+turn yet" exists for the UI to render and pace against.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>placeBid</code>/<code>playCard</code> return <code>bool</code> instead of throwing on an illegal move. What kind of caller does this design assume, and where might it be the wrong choice?</summary>
+<div class="answer">
+It assumes callers expect rejection as a routine outcome, not an exceptional
+one — true for a UI reacting to a stale tap, and true for a server handling
+untrusted network input from a client that might be malicious or buggy. It
+would arguably be the wrong choice inside test code, where a silently-ignored
+<code>false</code> can mask a test bug that meant to assert the move succeeded.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="01-cards-and-rules.html">← Module 1: Cards & Rules</a>
+<a href="03-bot.html">Module 3: Bot Opponent →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

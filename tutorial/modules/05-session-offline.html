@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5. Sessions & Offline Play — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m05">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 5 of 20</p>
+<h1>Sessions & Offline Play</h1>
+<p class="lede">
+This is the module where the game becomes playable end-to-end for the first
+time — entirely offline, against bots, with no server. It builds
+<code>net/session.dart</code> (the contract every playing mode will implement)
+and <code>net/local_session.dart</code> (the first, and simplest,
+implementation of it).
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="38" fill="#4fd68c">UI ✓ (wiring only so far — screens land in module 6)</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="88" fill="#4fd68c" font-weight="bold">GameSession ◀ you are here — session.dart, local_session.dart</text>
+  <text x="32" y="104" fill="#9db0a4">LocalSession: engine + bots + a self-driving clock, no network</text>
+  <rect x="20" y="122" width="440" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="144" fill="#4fd68c">Engine ✓ · Bot ✓</text>
+  <text x="32" y="160" fill="#9db0a4">card.dart, rules.dart, game.dart, bot.dart</text>
+</svg>
+</div>
+
+<h2 id="gamesession"><code>net/session.dart</code> — the contract</h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/session.dart:30–79</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The table screen (module 6) needs to render a hand of cards, show whose turn
+it is, and send a bid or a play — and it needs to do that identically whether
+the game is offline, on the internet, or over LAN. Without one shared
+contract, the table screen would need a different code path per mode, and any
+UI bug fix would need to be made three times. <code>GameSession</code> is that
+one contract.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>An <code>abstract class</code> extending Flutter's
+<code>ChangeNotifier</code>, plus a separate <code>Stream&lt;GameEvent&gt;</code>
+— two different push mechanisms on the same object, deliberately, not one.</strong>
+<code>ChangeNotifier</code> holds "the current snapshot" (<code>view</code>) —
+a widget wrapped in <code>ListenableBuilder</code> just re-reads
+<code>session.view</code> whenever <code>notifyListeners()</code> fires, no
+manual subscription bookkeeping. A <code>Stream</code>, by contrast, is a
+history of one-shot happenings — "a card was played" needs to trigger an
+animation exactly once, which a rebuild-on-latest-value model like
+<code>ChangeNotifier</code> can't express (if two cards get played between two
+rebuilds, a snapshot model has already lost the first one). Two mechanisms for
+two genuinely different needs, at the cost of the class carrying two separate
+subscription models a consumer has to know about, instead of one.
+</p>
+<p>
+This is also the file's second real decision: <strong>the contract lives in
+<code>package:flutter/foundation.dart</code>'s <code>ChangeNotifier</code>,
+not in a Flutter-independent form</strong>, unlike every file in Part I. That's
+intentional here — this layer's whole job is bridging domain state to the UI,
+so coupling it to Flutter's own listener mechanism is the right trade, at the
+cost of this file (unlike the engine) not being reusable outside a Flutter app.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>abstract class GameSession extends ChangeNotifier {
+  GameView? get view;
+  SessionStatus get status;
+  String? get errorMessage;
+  GameMode get mode;
+  Stream&lt;GameEvent&gt; get events;
+
+  bool get isReady =&gt; status == SessionStatus.ready &amp;&amp; view != null;
+
+  void placeBid(int bid);
+  void play(PlayingCard card);
+  void continueToNextHand();
+  void restart();
+}</code></pre>
+<p>
+Four getters describe "what's true right now" (<code>view</code>,
+<code>status</code>, <code>errorMessage</code>, <code>mode</code>), one stream
+describes "what just happened," and four methods are the entire vocabulary of
+things a player can <em>do</em>. Every screen in module 6 is built against
+exactly this surface — nothing in the table screen ever imports
+<code>LocalSession</code> or a network class by name.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>turnDeadline</code> converts a server-clock timestamp into something usable. What problem is it solving?</summary>
+<p>
+Read the doc comment on <code>GameView.turnDeadlineMs</code> from module 2
+again: it's a <em>unix millis</em> value on the <em>server's</em> clock. What
+goes wrong if a widget just compared it directly to
+<code>DateTime.now()</code> on the phone?
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>/// The view carries the deadline on the server's clock, which is useless to
+/// compare against `DateTime.now()` on a phone whose clock is minutes off. A
+/// session therefore converts it once, when the view lands, by treating the
+/// view's own `serverTimeMs` as "now". What survives is a duration, which
+/// both clocks agree on.
+DateTime? get turnDeadline =&gt; null;</code></pre>
+<p>
+A phone's clock can be minutes off from the server's (wrong timezone, no NTP
+sync, whatever) — comparing a raw server timestamp to the device's
+<code>DateTime.now()</code> would make the turn clock lie. The fix is to only
+ever trust the <em>relative</em> gap: "the deadline is X ms after the moment
+this view was sent" (<code>turnDeadlineMs - serverTimeMs</code>), then add
+that duration to the device's own <code>DateTime.now()</code> once, on arrival.
+Both clocks then agree on the duration even though they disagree on absolute
+time. Note the default implementation here just returns <code>null</code> —
+it's overridden per session type that actually has a clock to convert.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness in this contract itself. It's worth noting as a maintainability
+observation for later: because <code>GameSession</code> has three real
+implementations (this module's <code>LocalSession</code>, plus
+<code>RemoteSession</code> and <code>LanHostSession</code> in modules 9–10),
+any new capability added to the interface (a new getter, a new method) must be
+implemented — or explicitly no-op'd, as several methods here already do with
+default bodies — in all three. The default no-op bodies on methods like
+<code>wakeUp()</code> are exactly that safety valve already in use.
+</div>
+</div>
+
+<h2 id="networksession"><code>net/session.dart</code> — <code>NetworkSession</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/session.dart:175–227</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A networked table has states an offline game never does: waiting in a lobby
+for friends, a hostless quickplay table counting down, reconnecting after a
+dropped connection. Without somewhere to put that, either
+<code>GameSession</code> itself would carry lobby/reconnect fields that mean
+nothing for a solo game, or the table screen would need type-specific
+knowledge of which network class it's holding.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A second abstract class, <code>NetworkSession extends GameSession</code>,
+carrying only the networked-only surface, instead of adding nullable lobby
+fields to <code>GameSession</code> itself.</strong> <code>LocalSession</code>
+never has to implement <code>lobby</code>, <code>countdown</code>,
+<code>canResume</code> or any reconnect logic — its surface stays exactly the
+four getters and four methods above. The cost lands on the table screen: to
+reach lobby-only state it has to check <code>session is NetworkSession</code>
+and narrow the type, an extra branch that a flatter, single-class design
+wouldn't need.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>abstract class NetworkSession extends GameSession {
+  LobbyState? get lobby;
+  int? get countdown;
+  void leaveLobby();
+
+  bool get isResuming;
+  bool get canResume;
+  Duration? get seatHeldFor;
+  void retryNow();
+
+  void startGame();
+  void setHandsPerGame(int hands) {}
+}</code></pre>
+<p>
+<code>lobby</code> being nullable is itself meaningful: null once play has
+begun, non-null only while the table is still filling. <code>isResuming</code>
+vs. a first-time <code>connecting</code> status matters to the player — "your
+seat is being held, hang on" reads very differently from "connecting" on a
+fresh join, per the doc comment on <code>isResuming</code>.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness tied to this file. It's a clean example of an interface segregated
+by capability rather than by implementation.
+</div>
+</div>
+
+<h2 id="tablepacing"><code>net/local_session.dart</code> — <code>TablePacing</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/local_session.dart:14–43</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A bot that plays instantly feels like a machine, not an opponent; a bot that
+takes ten seconds feels broken. <code>TablePacing</code> is the one place
+every timing constant for a locally-hosted table lives — how long a bot
+"thinks," how long a finished trick lingers before clearing, how long a human
+gets to bid or play before autoplay takes over.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>These constants are duplicated in Go, not shared</strong> — the
+backend's own README states outright: "The pacing defaults deliberately match
+<code>TablePacing</code> in <code>frontend/lib/net/local_session.dart</code>,
+so a networked table feels the same as the offline one." That's a real,
+accepted trade-off: there's no single source of truth for these numbers across
+the two languages, only a documented intention to keep them equal by hand.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>class TablePacing {
+  static const botThinkMin = Duration(milliseconds: 550);
+  static const botThinkExtra = Duration(milliseconds: 450);
+  static const trickLinger = Duration(milliseconds: 1100);
+  static const bidTimeout = Duration(seconds: 5);
+  static const playTimeouts = [
+    Duration(seconds: 10), Duration(seconds: 8),
+    Duration(seconds: 6),  Duration(seconds: 5),
+  ];
+  static const handAdvanceWait = Duration(seconds: 5);
+}</code></pre>
+<p>
+<code>playTimeouts</code> is indexed by trick position — the leader of a trick
+gets the longest clock (10s), the fourth player to act gets the shortest (5s),
+because per its doc comment "each seat after has less to decide with more of
+the trick already on the table." <code>bidTimeout</code> and the play timeouts
+are explicitly documented as mattering only when someone else is at the table
+— "a solo game against bots is never hurried" — which is a decision enforced
+in <code>LocalSession</code> itself, not in this constants file.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+Because these constants are hand-duplicated rather than shared (see Decision,
+above), changing one side without the other silently desyncs the offline and
+networked feel — e.g. edit <code>PLAY_TIMEOUTS</code> in the backend's env
+config without touching this file, and a networked table's turn clock stops
+matching what a solo game trains a player to expect. A generated or
+config-driven single source (e.g. the server sending its actual pacing values
+to the client once, at connect time) would close this gap; today it depends on
+a developer remembering to touch two files in two languages.
+</div>
+</div>
+
+<h2 id="localsession"><code>net/local_session.dart</code> — <code>LocalSession</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/local_session.dart:47–263</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+This is the class that makes "vs Bots" playable: it owns a
+<code>CallBreakGame</code> (module 2), a <code>BotBrain</code> per bot seat
+(module 3), and a self-driving clock that plays bot turns and clears finished
+tricks on a timer — entirely on-device, no server involved at all.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The session drives its own pacing with an internal <code>Timer</code>,
+rather than requiring the UI to call some <code>tick()</code> method on a
+frame callback.</strong> A self-scheduling session means the table screen has
+zero responsibility for pacing the game — it just renders whatever
+<code>view</code> currently is. The cost is lifecycle discipline: a
+<code>Timer</code> running inside a non-widget object must be explicitly
+cancelled when the session is done, or it fires a callback into a
+now-meaningless, disposed object. <code>dispose()</code> (line 257) exists
+specifically to prevent that.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>The publish/schedule loop — the engine of the whole class
+(lines 154–219):</strong></p>
+<pre><code>void _publish() {
+  if (_disposed) return;
+  _view = _game.viewFor(humanSeat);
+  for (final event in _game.takeEvents()) {
+    _record(event);
+    if (!_events.isClosed) _events.add(event);
+  }
+  notifyListeners();
+  _scheduleNextAutoAction();
+}
+
+void _scheduleNextAutoAction() {
+  _timer?.cancel();
+  if (_disposed) return;
+
+  if (_game.awaitingTrickClear) {
+    _timer = Timer(_scaled(TablePacing.trickLinger), () {
+      _game.clearTrick();
+      _publish();
+    });
+    return;
+  }
+
+  final seat = _game.turn;
+  if (seat == null || seat == humanSeat) return;
+  final brain = _brains[seat];
+  if (brain == null) return;
+  _timer = Timer(_thinkTime(), () =&gt; _takeBotTurn(seat, brain));
+}</code></pre>
+<p>
+Every mutation to the game funnels through <code>_publish()</code>: pull a
+fresh redacted view for the human seat, drain and forward the engine's pending
+events (module 2's <code>takeEvents()</code>), tell listeners to rebuild, then
+decide what the table should do <em>next</em> on its own. That last step is
+either "a trick just finished — clear it after a pause" or "it's a bot's turn
+— think, then act" — and each of those branches calls <code>_publish()</code>
+again when it fires, which is what keeps the whole game moving forward without
+the UI ever driving it.
+</p>
+
+<details class="try">
+<summary>Try it yourself — write <code>placeBid</code> and <code>play</code> before looking</summary>
+<p>
+Both are one-liners: call the matching <code>CallBreakGame</code> method
+(module 2) for the human's fixed seat, and if it returns <code>true</code>
+(accepted), call <code>_publish()</code>.
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>@override
+void placeBid(int bid) {
+  if (_game.placeBid(humanSeat, bid)) _publish();
+}
+
+@override
+void play(PlayingCard card) {
+  if (_game.playCard(humanSeat, card)) _publish();
+}</code></pre>
+<p>
+Notice what happens on rejection: nothing. No error surfaced, no exception —
+the engine's <code>bool</code> return (module 2's Decision) is exactly what
+makes this safe to call from a UI tap handler with no try/catch, at the cost
+that a caller who forgets to check what happened has no way to tell an
+accepted move from a silently rejected one.
+</p>
+</details>
+</details>
+
+<p><strong>Cleanup (lines 256–262):</strong></p>
+<pre><code>@override
+void dispose() {
+  _disposed = true;
+  _timer?.cancel();
+  _events.close();
+  super.dispose();
+}</code></pre>
+<p>
+Three things happen, in order that matters: the <code>_disposed</code> flag is
+set first so any <em>already-scheduled</em> timer callback that fires between
+now and cancellation still no-ops via its own <code>if (_disposed) return</code>
+guard; the timer is cancelled so it doesn't fire at all in the common case; the
+event stream is closed so nothing can subscribe to a dead session. This is a
+model of a leak-free Dart object — contrast it with the gap flagged in module
+4, where <code>main()</code> has no equivalent guard around its own async
+setup.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>_record</code> (lines 171–198) hands a finished game to
+<code>GameUploader.enqueue</code> and the file's own comment says the quiet
+part out loud: "Entirely fire-and-forget... a phone with no signal finishes
+the game exactly as fast as one with a connection and the player is never told
+anything went wrong." That's the right call for not blocking the win screen on
+a network call, but it means a permanently-failing upload (not just an offline
+one — a genuinely broken account link, say) looks identical to a healthy one
+from the player's point of view, forever. See module 9's own note on
+<code>GameUploader</code> for where that queue's retry behaviour actually
+lives.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>GameSession</code> expose both a <code>ChangeNotifier</code>-style <code>view</code> getter <em>and</em> a separate <code>Stream&lt;GameEvent&gt;</code>, instead of putting everything through one mechanism?</summary>
+<div class="answer">
+They serve different needs: <code>view</code> is "the current snapshot," fine
+to just re-read on rebuild and safe to miss intermediate states. Events are
+one-shot happenings (a card played) that must each be reacted to individually
+— if two cards are played between two rebuilds, a snapshot-only model has
+already lost the first one, but a stream delivers both.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>NetworkSession</code> adds lobby/reconnect capability as a subclass rather than nullable fields on <code>GameSession</code> itself. What's the concrete cost of that choice, paid where?</summary>
+<div class="answer">
+<code>LocalSession</code> stays minimal — it never implements lobby or
+reconnect logic it doesn't need. The cost is paid in the table screen (module
+6), which has to type-check <code>session is NetworkSession</code> and narrow
+before it can read lobby-only state, an extra branch a flatter design
+wouldn't require.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>LocalSession</code> drive itself with an internal <code>Timer</code> instead of the UI calling a <code>tick()</code> method?</summary>
+<div class="answer">
+So the table screen has zero responsibility for pacing — it only ever renders
+whatever <code>view</code> is. The cost is that a <code>Timer</code> living
+inside a plain object (not a widget with a framework-managed lifecycle) needs
+explicit, careful cancellation on dispose, or it can fire into an object that
+no longer means anything.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>TablePacing</code>'s constants are deliberately duplicated in the Go backend rather than shared. What real failure mode does that open, concretely?</summary>
+<div class="answer">
+The two sets of numbers can drift: change a timeout on one side (say, the
+backend's <code>PLAY_TIMEOUTS</code> env var) without updating this file, and
+a networked table's turn clock stops matching the pacing an offline game
+trained the player to expect — a UX inconsistency with no compiler or test to
+catch it, since nothing enforces the two files agree.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="04-app-wiring.html">← Module 4: App Wiring & Design Tokens</a>
+<a href="06-core-ui.html">Module 6: Core Table UI →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+/bin/
+/.gocache/
+*.out
+*.test
+.env

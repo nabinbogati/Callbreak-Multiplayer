@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3. Bot Opponent — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m03">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part I — Flutter engine (pure Dart) · Module 3 of 20</p>
+<h1>Bot Opponent</h1>
+<p class="lede">
+The engine can now run a full game, but only if all four seats hand it valid
+bids and card plays. <code>frontend/lib/bots/bot.dart</code> is what stands in
+for the three seats a solo player doesn't fill — and, later, for any seat a
+networked table needs to cover.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="38" fill="#6d7f74">UI (not built yet)</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="94" fill="#6d7f74">GameSession (not built yet) — will pace bot moves via a Timer</text>
+  <rect x="20" y="122" width="440" height="76" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="144" fill="#4fd68c" font-weight="bold">bots/bot.dart ◀ you are here · engine/* ✓</text>
+  <text x="32" y="162" fill="#9db0a4">BotBrain calls estimateTricks/legalMoves/wouldWin from rules.dart —</text>
+  <text x="32" y="178" fill="#9db0a4">it never touches CallBreakGame directly, only plain card data.</text>
+</svg>
+</div>
+
+<h2 id="botbrain"><code>bots/bot.dart</code> — <code>BotBrain</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/bots/bot.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Without an opponent, "vs bots" isn't a mode — it's an empty table. This class
+is the entire opponent: it decides what to bid given a hand, and which legal
+card to play given the current trick. Nothing about it depends on Flutter, the
+UI, or the network; it's handed plain data (a hand, a trick, unseen cards) and
+returns a decision, which is what lets the exact same class run inside a purely
+offline solo game.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A hand-tuned heuristic (count controlled tricks, then play to hit that
+number) instead of a search algorithm</strong> like minimax or Monte Carlo tree
+search over the hidden information. A trick-taking game with hidden hands is a
+genuinely hard search problem — modelling what three unseen hands might contain
+gets expensive fast. The heuristic runs in microseconds with no real
+computational cost, at the price of playing suboptimally in situations a deeper
+search would handle correctly (e.g. inferring a specific opponent's void suit
+from their earlier discards, which this bot doesn't track at all — it only
+tracks <em>which cards have been played</em>, in <code>_unseenCards</code>,
+not who played them).
+</p>
+<p>
+<strong>One class with a <code>difficulty</code> knob (noise + blunder rate)
+instead of three separate bot implementations.</strong> All three difficulties
+share the exact same decision logic; only <code>_noise</code> (how much random
+jitter is added to the bid estimate) and <code>_blunderRate</code> (chance of
+playing a uniformly random legal card instead of the computed one) differ. One
+code path is far less to maintain than three, but it puts a hard ceiling on
+"hard" mode — turning noise and blunders to zero just plays the heuristic
+perfectly, it can never play <em>better</em> than the heuristic's ceiling the
+way a genuinely different, stronger algorithm could.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Bidding (lines 21–39):</strong></p>
+<pre><code>double get _noise =&gt; switch (difficulty) {
+  BotDifficulty.easy =&gt; 1.4,
+  BotDifficulty.normal =&gt; 0.5,
+  BotDifficulty.hard =&gt; 0.0,
+};
+
+int chooseBid(List&lt;PlayingCard&gt; hand) {
+  final estimate = estimateTricks(hand);
+  final jitter = _noise == 0 ? 0.0 : (_random.nextDouble() * 2 - 1) * _noise;
+  return clampBid((estimate + jitter).round());
+}</code></pre>
+<p>
+This reuses <code>estimateTricks</code> from module 1's <code>rules.dart</code>
+— the exact same function that powers the human's on-screen bid suggestion —
+then adds up to <code>±_noise</code> tricks of random jitter before rounding
+and clamping. An easy bot's bids look human-ishly imperfect; a hard bot's bids
+are the heuristic's best estimate, unmodified.
+</p>
+
+<details class="try">
+<summary>Try it yourself — before reading <code>chooseCard</code>, guess the two special cases it must handle before doing any "thinking"</summary>
+<p>Hint: one is about having no real choice at all, and one is about difficulty.</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>PlayingCard chooseCard({...}) {
+  final legal = legalMoves(hand, trick);
+  if (legal.length == 1) return legal.first;
+  if (_blunderRate &gt; 0 &amp;&amp; _random.nextDouble() &lt; _blunderRate) {
+    return legal[_random.nextInt(legal.length)];
+  }
+  ...
+}</code></pre>
+<p>
+If there's only one legal card, there's nothing to decide — return it and skip
+all the analysis below. Otherwise, roll the dice against <code>_blunderRate</code>
+first (0 on hard, 0.06 normal, 0.25 easy): a "blunder" means picking uniformly
+at random among the legal cards, deliberately bypassing the strategy entirely —
+this is what makes easy bots visibly make bad plays sometimes, not just weaker
+bids.
+</p>
+</details>
+</details>
+
+<p><strong>Leading a trick — the actual strategy (lines 67–93):</strong></p>
+<pre><code>PlayingCard _chooseLead(...) {
+  final sideMasters = legal.where((c) =&gt; !c.isTrump &amp;&amp; _isMaster(c, unseen)).toList();
+  if (sideMasters.isNotEmpty) return _bestMasterToLead(sideMasters, hand);
+
+  final trumps = legal.where((c) =&gt; c.isTrump).toList();
+  if (need &gt; 0) {
+    if (need &gt;= tricksLeft &amp;&amp; trumps.isNotEmpty) return trumps.highest;
+    final trumpMasters = trumps.where((c) =&gt; _isMaster(c, unseen)).toList();
+    if (trumpMasters.isNotEmpty) return trumpMasters.lowest;
+    if (trumps.length &gt;= 5) return trumps.highest;
+  }
+  return _safeDiscard(legal, hand);
+}</code></pre>
+<p>
+Read this as priority order, top to bottom: (1) if you hold a side-suit
+<strong>master</strong> — a card no unseen card can beat, see
+<code>_isMaster</code> below — cash it, it's a free trick that costs nothing to
+take now. (2) Otherwise, if you still need tricks to hit your bid
+(<code>need &gt; 0</code>) and you're so far behind that you need every
+remaining trick, throw your best trump. (3) If you have a trump master, play
+your <em>lowest</em> one — no need to spend the good one when the cheap one
+already wins. (4) With five or more trumps, lead one anyway, to drain
+opponents' trumps out so your remaining small ones become winners later. Fail
+every case and there's nothing useful to do — discard safely instead.
+</p>
+
+<p><strong>The card-counting primitive everything above depends on
+(lines 123–135):</strong></p>
+<pre><code>List&lt;PlayingCard&gt; _unseenCards({
+  required List&lt;PlayingCard&gt; hand,
+  required List&lt;PlayingCard&gt; played,
+}) {
+  final known = {...hand, ...played};
+  return fullDeck().where((c) =&gt; !known.contains(c)).toList();
+}
+
+bool _isMaster(PlayingCard card, List&lt;PlayingCard&gt; unseen) =&gt;
+    !unseen.any((c) =&gt; c.suit == card.suit &amp;&amp; c.rank &gt; card.rank);
+</code></pre>
+<p>
+"Unseen" means neither in your own hand nor already face-up this hand — i.e.
+every card that could plausibly still be in one of the other three hands. A
+card is a "master" exactly when no unseen card of the same suit outranks it —
+this is the bot's entire model of "what might the opponents have," and it's
+intentionally simple: it tracks <em>which cards remain</em>, never <em>who is
+likely holding which</em>.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>BotBrain</code>'s constructor (<code>bot.dart:15–16</code>) defaults
+<code>Random? random</code> to <code>Random()</code> — the system's
+non-deterministic source — if nobody passes one in. Module 5's
+<code>LocalSession</code> is careful to pass its own seeded generator instead
+(<code>BotBrain(difficulty: p.difficulty, random: _random)</code>, where
+<code>_random</code> is seeded from the same value the deal itself uses), so in
+practice a solo game <em>is</em> fully reproducible from its seed. The gap is
+narrower than it looks from this file alone: it's an implicit contract
+("always pass a seeded <code>Random</code>") that this file's own type
+signature doesn't enforce — a future call site that constructs
+<code>BotBrain()</code> with no argument would silently break replay
+determinism with no compiler warning.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>BotBrain</code> use one heuristic with a difficulty knob instead of three separate strategies for easy/normal/hard?</summary>
+<div class="answer">
+One code path is far less to build and maintain, and it's enough to produce
+visibly different-feeling opponents by tuning noise and blunder rate. The cost
+is a hard ceiling: "hard" can only ever play as well as the underlying
+heuristic — it can't become a fundamentally stronger algorithm just by turning
+noise to zero.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>What does <code>_isMaster</code> actually know about the other three players' hands, and what does it deliberately not know?</summary>
+<div class="answer">
+It knows exactly which cards have <em>not yet</em> appeared anywhere (not in
+its own hand, not played face-up) — that's the entire "unseen" set. It has no
+model of which of the other three seats is more likely to hold any particular
+unseen card; every unseen card is treated as equally possible to be in any
+opponent's hand.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>chooseCard</code> check <code>legal.length == 1</code> before running any strategy at all?</summary>
+<div class="answer">
+Because with exactly one legal card there is no decision to make — running the
+lead/follow strategy would just be wasted computation that returns the same
+answer skipping it does immediately.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="02-game-engine.html">← Module 2: Game State Machine</a>
+<a href="04-app-wiring.html">Module 4: App Wiring & Design Tokens →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

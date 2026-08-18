@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1. Cards & Rules — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m01">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part I — Flutter engine (pure Dart) · Module 1 of 20</p>
+<h1>Cards & Rules</h1>
+<p class="lede">
+Before a game can be played, it needs an unambiguous definition of what a card
+<em>is</em> and what moves are <em>legal</em>. This module builds
+<code>frontend/lib/engine/card.dart</code> and <code>frontend/lib/engine/rules.dart</code>
+— the two files everything else in the project is built on top of.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="38" fill="#6d7f74">UI (not built yet)</text>
+
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="94" fill="#6d7f74">GameSession (not built yet)</text>
+
+  <rect x="20" y="122" width="440" height="76" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="144" fill="#4fd68c" font-weight="bold">Engine — engine/card.dart, engine/rules.dart ◀ you are here</text>
+  <text x="32" y="162" fill="#9db0a4">Pure Dart. No Flutter import. No I/O. No randomness in rules.dart.</text>
+  <text x="32" y="178" fill="#9db0a4">Every other layer in this project sits on top of this one.</text>
+</svg>
+</div>
+
+<h2>Prerequisite terms</h2>
+<p>
+<dfn class="term" title="A fixed, named set of values. Dart enums can carry methods via extension.">enum</dfn>,
+<dfn class="term" title="Dart syntax for adding methods/getters to a type you don't own, without editing its definition.">extension</dfn>,
+<dfn class="term" title="A switch used as an expression that returns a value — no break, no fallthrough.">switch expression</dfn>,
+<dfn class="term" title="A constructor whose result is compile-time-constant and immutable.">const constructor</dfn>.
+See the <a href="../glossary.html">Glossary</a> for the full list.
+</p>
+
+<h2>Set up the project (do this once)</h2>
+<pre><code>flutter create --org com.example --project-name callbreak frontend
+cd frontend
+mkdir -p lib/engine
+</code></pre>
+<p>The real project's package name is <code>callbreak</code> — check <code>frontend/pubspec.yaml</code>'s
+<code>name:</code> field if you want to match it exactly.</p>
+
+<h2 id="card-dart"><code>engine/card.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/engine/card.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every other file in the project needs to talk about "the ace of spades" or "a card
+this seat may legally play" — but there has to be one canonical, comparable,
+serializable representation of a card first, or the engine, the bot, the UI, and
+the network protocol would each invent their own and drift apart. This file is
+that single representation. Without it, there is no shared vocabulary between
+"what the rules allow" (<code>rules.dart</code>), "what the state machine tracks"
+(<code>game.dart</code>), and "what crosses the wire" (the <code>id</code> string
+documented in <code>backend/PROTOCOL.md</code>: <code>"AS"</code>, <code>"10H"</code>).
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A plain immutable class with hand-rolled <code>==</code>/<code>hashCode</code>,
+instead of a code-generation package like <code>freezed</code> or <code>equatable</code>.</strong>
+The project-wide convention (see <code>docs/CONCEPT_MAP.md</code>) is "hand-written
+JSON, deliberately no codegen" — no <code>build_runner</code> step means anyone
+can clone the repo and run it immediately, with nothing to regenerate after a
+model changes. The cost: every model class carries a few lines of boilerplate
+(<code>operator ==</code>, <code>hashCode</code>, <code>toJson</code>) that a
+codegen tool would otherwise write for you, and it's on the author to keep them
+in sync if a field is added.
+</p>
+<p>
+<strong>A human-readable wire id (<code>"AS"</code>, <code>"10H"</code>) instead of
+a compact numeric encoding</strong> (e.g. <code>rank * 4 + suit.index</code>). The
+string is self-describing in a network capture or a server log — you can read
+<code>backend/PROTOCOL.md</code>'s example JSON and know exactly which card is
+meant. The cost is a few extra bytes per card and a string-parse instead of an
+array index on every decode; at 52 cards a hand this is not a real performance
+concern.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Suit and its metadata (lines 4–33):</strong></p>
+<pre><code>enum Suit { spades, hearts, diamonds, clubs }
+
+extension SuitInfo on Suit {
+  String get code =&gt; switch (this) {
+    Suit.spades =&gt; 'S',
+    Suit.hearts =&gt; 'H',
+    Suit.diamonds =&gt; 'D',
+    Suit.clubs =&gt; 'C',
+  };
+  ...
+  bool get isTrump =&gt; this == trumpSuit;
+}
+
+const Suit trumpSuit = Suit.spades;</code></pre>
+<p>
+<code>Suit</code> itself is just four bare names. All of its behaviour — the
+one-letter wire <code>code</code>, the display <code>symbol</code> (♠♥♦♣), whether
+it's red, whether it's the permanent trump suit — is attached afterward via
+<code>extension SuitInfo on Suit</code>. This keeps the enum itself trivial to
+pattern-match on everywhere, while still giving it rich, discoverable
+<code>.code</code>/<code>.symbol</code>/<code>.isTrump</code> getters at every call
+site, as if they were built in. <code>trumpSuit</code> is a single
+<code>const</code> — Call Break always plays spades as trump, so this is the one
+place that fact lives.
+</p>
+
+<p><strong>Ranks are plain integers, not another enum (lines 38–56):</strong></p>
+<pre><code>const int minRank = 2;
+const int maxRank = 14;
+
+String rankLabel(int value) =&gt; switch (value) {
+  14 =&gt; 'A',
+  13 =&gt; 'K',
+  12 =&gt; 'Q',
+  11 =&gt; 'J',
+  _ =&gt; '$value',
+};</code></pre>
+<p>
+Rank runs 2–14 with the ace <em>high</em> (14, not 1) — that single choice is what
+makes every comparison in <code>rules.dart</code> a plain integer
+<code>&gt;</code>/<code>&lt;</code>, with no special-casing "unless it's an ace."
+<code>rankLabel</code>/<code>rankFromLabel</code> are the only two places that
+translate between that integer and the human label (<code>"A"</code>, <code>"K"</code>,
+<code>"10"</code>) — including on the wire, since <code>rankLabel</code> feeds
+<code>PlayingCard.id</code> below.
+</p>
+
+<details class="try">
+<summary>Try it yourself — write <code>PlayingCard</code> before looking</summary>
+<p>
+Write an immutable <code>PlayingCard</code> class with a final <code>rank</code>
+(int) and <code>suit</code> (Suit), a <code>const</code> constructor, value
+equality (two cards with the same rank+suit are <code>==</code>), a
+<code>label</code> getter using <code>rankLabel</code>, and an <code>id</code>
+getter that concatenates <code>label</code> and <code>suit.code</code> (e.g.
+<code>"AS"</code>). Add a factory <code>PlayingCard.fromId(String id)</code> that
+reverses it — careful, the rank label can be one character (<code>"A"</code>) or
+two (<code>"10"</code>), but the suit code is always the last character.
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>class PlayingCard {
+  const PlayingCard(this.rank, this.suit);
+
+  final int rank;
+  final Suit suit;
+
+  bool get isTrump =&gt; suit == trumpSuit;
+
+  String get label =&gt; rankLabel(rank);
+
+  /// Stable wire id, e.g. `AS`, `10H`. Used by the network protocol.
+  String get id =&gt; '$label${suit.code}';
+
+  factory PlayingCard.fromId(String id) {
+    final suit = suitFromCode(id.substring(id.length - 1));
+    return PlayingCard(rankFromLabel(id.substring(0, id.length - 1)), suit);
+  }
+
+  @override
+  bool operator ==(Object other) =&gt;
+      other is PlayingCard &amp;&amp; other.rank == rank &amp;&amp; other.suit == suit;
+
+  @override
+  int get hashCode =&gt; Object.hash(rank, suit);
+
+  @override
+  String toString() =&gt; id;
+}</code></pre>
+<p>
+The trick in <code>fromId</code>: slice off the <em>last</em> character as the
+suit code first (<code>id.substring(id.length - 1)</code>), then whatever's left
+is the rank label, one or two characters either way. Slicing from the front would
+break on <code>"10H"</code>.
+</p>
+</details>
+</details>
+
+<p>
+Notice what <code>==</code> and <code>hashCode</code> are doing: two
+<code>PlayingCard</code> instances built separately (one in a hand, one decoded
+from JSON) are equal exactly when their rank and suit match — not when they're
+the same object in memory. This is what lets <code>hand.contains(card)</code> and
+<code>Set&lt;PlayingCard&gt;</code> work the way you'd expect from a value type.
+Forget to override <code>hashCode</code> to match <code>==</code> and a
+<code>PlayingCard</code> silently stops working correctly inside any
+<code>Set</code> or as a <code>Map</code> key — Dart's default is identity-based.
+</p>
+
+<p><strong>Dealing and display order (lines 87–110):</strong></p>
+<pre><code>List&lt;PlayingCard&gt; fullDeck() =&gt; [
+  for (final suit in Suit.values)
+    for (var rank = minRank; rank &lt;= maxRank; rank++) PlayingCard(rank, suit),
+];
+
+List&lt;List&lt;PlayingCard&gt;&gt; dealHands(Random random) {
+  final deck = fullDeck()..shuffle(random);
+  return [
+    for (var seat = 0; seat &lt; 4; seat++)
+      sortForDisplay(deck.sublist(seat * 13, seat * 13 + 13)),
+  ];
+}</code></pre>
+<p>
+<code>dealHands</code> takes a <code>Random</code> instead of creating its own.
+That's a small but important seam: whoever calls it (the engine, in module 2)
+controls the seed, which is what makes a whole game <em>replayable</em> — deal the
+same seed twice and you get the same four hands. <code>sortForDisplay</code>
+(trumps first, then each suit high-to-low) is purely cosmetic — it's what a human
+sees in their hand fan, and has no bearing on legality.
+</p>
+
+<div class="section-tag">Improvement note</div>
+<div class="improve-box">
+No known weakness in this file — it's small, has no I/O, and every branch is a
+one-line pure function that's trivially unit-testable
+(<code>frontend/test/engine_test.dart</code> exercises it). Nothing to flag.
+</div>
+</div>
+
+<h2 id="rules-dart"><code>engine/rules.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/engine/rules.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+This file answers three questions the rest of the app can't function without:
+which cards may I legally play right now, who wins a finished trick, and what is
+a hand worth once bidding and tricks-won are known. If this logic lived scattered
+inside the UI or the state machine, "what's a legal move" could end up defined
+differently in two places — exactly the class of bug the project's own README
+calls out as the one thing the Go port <a href="../glossary.html">cannot afford</a>
+to get wrong later.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Free top-level functions taking plain data
+(<code>List&lt;PlayingCard&gt;</code>, <code>List&lt;TrickPlay&gt;</code>) instead
+of methods on a <code>Rules</code> class or directly on the game object.</strong>
+A free function with no hidden state is the easiest possible thing to unit test
+(call it, assert the output) and — critically for this project — the easiest
+thing to <em>port line-for-line to Go</em>, which is exactly what
+<code>backend/internal/engine/rules.go</code> does in module 12. The cost: every
+call site has to pass the hand and trick in explicitly rather than the function
+reaching into <code>self</code>/<code>this</code> for them, which reads slightly
+more verbose at each call site.
+</p>
+<p>
+<strong><code>estimateTricks</code> is a hand-tuned weighted heuristic, not a
+simulation-based estimator</strong> (e.g. Monte-Carlo dealing out thousands of
+plausible opponent hands and averaging trick counts). The heuristic is
+deterministic and runs in microseconds, which matters because it's called on
+every bot bid <em>and</em> live, on every keystroke, to show the human a bid
+suggestion. The cost: it's an approximation tuned by feel, not provably optimal
+— a hand shape the weights don't anticipate could get a noticeably wrong
+suggestion, and there's no way to know without playing thousands of hands past it.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Legal moves — the actual rules of Call Break (lines 66–100):</strong></p>
+<pre><code>List&lt;PlayingCard&gt; legalMoves(List&lt;PlayingCard&gt; hand, List&lt;TrickPlay&gt; trick) {
+  if (trick.isEmpty) return [...hand];
+
+  final led = trick.first.card.suit;
+  final inSuit = hand.ofSuit(led);
+
+  if (inSuit.isNotEmpty) {
+    final bestLed = trick
+        .where((p) =&gt; p.card.suit == led)
+        .map((p) =&gt; p.card.rank)
+        .reduce((a, b) =&gt; a &gt; b ? a : b);
+    final higher = inSuit.where((c) =&gt; c.rank &gt; bestLed).toList();
+    return higher.isNotEmpty ? higher : inSuit;
+  }
+  ...</code></pre>
+<p>
+Read this as three cases, in order: (1) you're leading — anything goes.
+(2) You hold the led suit — you <em>must</em> follow it, and specifically with a
+card that beats the best one already played, if you have one ("heading" — the
+comment above the function calls this out explicitly). Only if you can't beat it
+are you allowed to underplay in that suit. (3) You're void in the led suit — you
+must trump if you hold any, and must <em>overtrump</em> an already-trumped trick
+if you can beat the best trump played so far. Only genuinely stuck (no trumps, or
+can't beat the trump on the table) can you discard anything.
+</p>
+
+<details class="try">
+<summary>Try it yourself — write <code>trickWinner</code> before looking</summary>
+<p>
+Given a completed 4-play trick (<code>List&lt;TrickPlay&gt;</code>), write a
+function that returns the winning seat. Rule: the highest trump wins if any
+trump was played; otherwise the highest card of the <em>led</em> suit wins
+(a card of a different, non-trump suit can never win).
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>int trickWinner(List&lt;TrickPlay&gt; trick) {
+  final led = trick.first.card.suit;
+  final trumps = trick.where((p) =&gt; p.card.isTrump).toList();
+  final contenders = trumps.isNotEmpty
+      ? trumps
+      : trick.where((p) =&gt; p.card.suit == led).toList();
+  return contenders.reduce((a, b) =&gt; b.card.rank &gt; a.card.rank ? b : a).seat;
+}</code></pre>
+<p>
+The whole function is "narrow the field to whoever could possibly win (trumps if
+any were played, else the led suit), then reduce to the highest rank in that
+field." <code>wouldWin</code> just below it reuses this exact function by
+hypothetically appending the candidate card with a sentinel seat
+(<code>-1</code>) and checking whether <code>-1</code> comes back as the winner
+— rather than duplicating the winner logic.
+</p>
+</details>
+</details>
+
+<p><strong>Scoring (lines 121–126):</strong></p>
+<pre><code>double scoreHand(int bid, int tricksWon) {
+  final raw = tricksWon &gt;= bid ? bid + (tricksWon - bid) * 0.1 : -bid.toDouble();
+  return (raw * 10).round() / 10;
+}</code></pre>
+<p>
+Make your bid exactly and you score the bid; every trick beyond it is worth
+0.1 more (an "overtrick"); fall short by even one trick and you lose the
+<em>whole bid</em> as a negative score, regardless of how close you got. The
+<code>(raw * 10).round() / 10</code> dance is rounding to one decimal place
+without floating-point drift accumulating over a multi-hand game — a real, if
+small, correctness concern given <code>totals</code> in <code>game.dart</code>
+keeps adding these up hand after hand.
+</p>
+
+<div class="section-tag">Improvement note</div>
+<div class="improve-box">
+No known weakness tied to this exact file — it's pure, deterministic, and has a
+dedicated test file (<code>frontend/test/engine_test.dart</code>) plus a
+byte-for-byte Go port (module 12) that's tested case-for-case against it, which
+is about as much safety net as a rules engine can reasonably have.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>PlayingCard</code> hand-roll <code>==</code>/<code>hashCode</code> instead of using a codegen package, and what does that decision cost the project long-term?</summary>
+<div class="answer">
+The project's convention is zero build steps — no <code>build_runner</code>
+means the repo runs immediately after <code>git clone</code> with nothing to
+regenerate. The cost is manual boilerplate that must be kept in sync by hand:
+add a field to <code>PlayingCard</code> and forget to touch
+<code>operator ==</code>/<code>hashCode</code>, and equality silently goes
+stale with no compiler error to catch it.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why are <code>legalMoves</code> and <code>trickWinner</code> free functions that take a hand/trick as arguments, rather than methods on the game object?</summary>
+<div class="answer">
+Two reasons that both matter here: they're trivially unit-testable in isolation
+(no game object to construct first), and — the bigger one for this specific
+project — they need to be ported to Go nearly line-for-line in module 12. A pure
+function with explicit inputs and no hidden state is the easiest possible shape
+to translate faithfully between two languages.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does rank run 2–14 (ace high) instead of the more common 1–13?</summary>
+<div class="answer">
+So every rank comparison in the rules is a plain integer <code>&gt;</code>, with
+the ace naturally outranking everything with no special-case branch for "unless
+it's an ace." <code>rankLabel</code>/<code>rankFromLabel</code> are the only two
+places that ever need to know 14 displays as "A".
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>estimateTricks</code> is a heuristic, not a simulation. What real failure mode does that trade-off open up, and where would you feel it?</summary>
+<div class="answer">
+It's a set of hand-tuned weights, not a provably optimal estimate — a hand shape
+the weights don't model well (e.g. an unusual void distribution) can get a bid
+suggestion that's off, and because it's deterministic, that same hand shape will
+be wrong the <em>same way</em> every time rather than averaging out. You'd feel
+it as the on-screen bid suggestion (and bot bidding) occasionally looking
+overconfident or underconfident on specific hands, with no way to detect it short
+of manual review.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="../index.html">← Overview</a>
+<a href="02-game-engine.html">Module 2: Game State Machine →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

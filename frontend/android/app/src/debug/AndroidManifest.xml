@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Android 9+ blocks cleartext traffic by default, which includes the
+         plain `ws://` a locally run game server speaks. Allowing it in debug
+         builds only is what lets the app reach `ws://<lan-ip>:8080/ws` during
+         development; release builds still require `wss://`. -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>

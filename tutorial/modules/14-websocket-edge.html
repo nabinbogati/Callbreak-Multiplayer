@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14. WebSocket Edge — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m14">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part III — Go backend · Module 14 of 20</p>
+<h1>WebSocket Edge</h1>
+<p class="lede">
+Module 13's room actors never touch a raw socket — they only know
+<code>room.Client</code>, the small interface from module 13's
+<code>room.go</code>. This module builds the thing that actually implements
+it: <code>ws/server.go</code> (upgrading HTTP to a socket, routing a join to
+a table), <code>ws/conn.go</code> (one connection's two goroutines),
+<code>ws/identity.go</code> (resolving an account without ever blocking a
+join on the database), and <code>ws/limit.go</code> (the two rate limits
+that protect the server from a hostile or just-broken client).
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="40" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="34" fill="#9db0a4">RemoteSession (Flutter, module 9) — a real WebSocket client</text>
+  <rect x="20" y="60" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="82" fill="#4fd68c" font-weight="bold">ws ◀ you are here — server.go, conn.go, identity.go, limit.go</text>
+  <text x="32" y="98" fill="#9db0a4">Upgrades HTTP, authenticates, rate-limits, then hands off — never plays a card</text>
+  <rect x="20" y="116" width="440" height="80" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="138" fill="#9db0a4">room.Hub / match.Broker (module 13) — where a join actually lands</text>
+  <text x="32" y="154" fill="#9db0a4">auth (module 15) — issues/verifies the tokens this module trusts</text>
+  <text x="32" y="172" fill="#9db0a4">db (module 16) — the account lookup this module never waits on</text>
+</svg>
+</div>
+
+<h2 id="serverchunk"><code>ws/server.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/ws/server.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Something has to turn an HTTP request into a live socket, decide whether the
+first frame it sends is a private-table join or a quickplay request, and
+route it accordingly. The package comment states its scope precisely:
+"Nothing here knows the rules of Call Break. Its job is to make sure that by
+the time a message reaches a room actor it is well-formed, rate-limited, and
+attributable to a seat."
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A <code>Locator</code> interface, satisfiable by nothing at all.</strong>
+</p>
+<pre><code>type Locator interface {
+	Owner(room string) (endpoint string, elsewhere bool)
+}</code></pre>
+<p>
+Multi-node deployments need to know which node actually owns a given room
+code, so a client joining the wrong node can be redirected rather than
+failing to find their table. Rather than baking that lookup directly into
+<code>Server</code>, it's an interface — and <code>Server.Locator</code> is
+allowed to stay <code>nil</code>. A single-node deployment (the default
+covered in this course) simply never sets it, and every code path that
+checks it (<code>if s.Locator != nil { ... }</code>) skips straight past.
+The alternative — a concrete field always pointing at a real registry — would
+force even a single developer running <code>go run ./cmd/server</code>
+locally to stand up Redis (module 16) just to accept a connection.
+</p>
+<p>
+<strong>The account lookup for a device id is started before the join
+finishes, and nothing downstream waits on it.</strong>
+</p>
+<pre><code>lookup := s.resolveAccount(frame.DeviceID, protocol.SanitizeName(frame.Name), c.log)
+...
+req := room.JoinRequest{ ..., UserID: lookup.peek() }
+...
+res := table.Join(req)
+...
+lookup.attach(c, table, res.Seat)</code></pre>
+<p>
+This is the same principle module 11's config comment named for the
+database broadly — persistence is an enrichment, never a precondition — made
+concrete at the exact point a player joins. <code>resolveAccount</code>
+kicks off a goroutine immediately; the actual work of validating the room
+code, finding or creating the table, and round-tripping through the room
+actor's message inbox all happens in parallel with it. Whatever the lookup
+has produced by the time the <code>JoinRequest</code> is actually built
+(<code>lookup.peek()</code>) rides along; anything still pending is
+delivered later via <code>lookup.attach</code>, covered in
+<code>identity.go</code> below. A player never waits on Postgres to sit
+down at a table.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" { return true }
+	for _, allowed := range s.cfg.AllowedOrigins {
+		if allowed == "*" || strings.EqualFold(allowed, origin) {
+			return true
+		}
+	}
+	return false
+}</code></pre>
+<p>
+The comment says it plainly: "The Flutter app sends no Origin header, so
+native clients always pass; a browser is only allowed when its origin has
+been configured explicitly." This is the concrete mechanism behind module
+11's <code>validate()</code> requiring <code>ALLOWED_ORIGINS</code> in
+production — without it, any web page could open a socket to the server on a
+visitor's behalf, since a plain native client (this game's actual target)
+never triggers this check at all.
+</p>
+<pre><code>func (s *Server) joinPrivate(c *Conn, frame protocol.ClientFrame, ...) {
+	code := frame.Room
+	if !room.ValidRoomCode(code) { c.Fail(protocol.ErrBadFrame, ...); return }
+	if s.Locator != nil {
+		if endpoint, elsewhere := s.Locator.Owner(code); elsewhere {
+			c.sendThenClose(protocol.Encode(protocol.NewRedirect(endpoint)))
+			return
+		}
+	}
+	var table *room.Room
+	var created bool
+	if frame.Create {
+		table, created, _ = s.hub.GetOrCreate(code, protocol.ModePrivate, ...)
+	} else {
+		table, ok := s.hub.Get(code)
+		if !ok { c.Fail(protocol.ErrRoomNotFound, ...); return }
+	}
+	...
+}</code></pre>
+<p>
+Only a join carrying <code>Create: true</code> (the room's actual creator,
+per module 11's protocol field) may bring a fresh table into existence — an
+ordinary join to an unknown code fails outright rather than silently
+minting an empty room. The comment explains why: "a mistyped or stale code
+[would otherwise become] a request to build a new empty room ... guests
+would silently create tables they can never seem to find again."
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>joinQuickplay</code> checks a resume claim before falling back to the matchmaker. Given a quickplay table's code is never shown to the client, how can a resume token possibly know which table to reclaim?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>// A quickplay table is addressed by a generated code the client never
+// learns — the join frame only asks for QUICKPLAY — so a resume token is
+// the one thing that can still name the table a player dropped from.
+if claim, ok := s.quickplayResumeClaim(frame, c.PlayerID()); ok {
+	if table, ok := s.hub.Get(claim.Room); ok && table.Mode() == protocol.ModeOnline {
+		...
+	}
+}
+</code></pre>
+<p>
+The room code the client never sees is embedded, signed, inside the resume
+token itself (<code>auth.Seat</code>, built next module) — the token the
+player was handed in the original <code>joined</code> frame
+(<code>protocol.Joined.ResumeToken</code>, module 11). A dropped quickplay
+player's client still holds that token from before it disconnected, so
+presenting it on reconnect names the exact table without the player ever
+having had to know or type a room code — matching module 11's own
+<code>QuickplayRoom</code> sentinel design, where the join frame's
+<code>Room</code> field is never a real address for this mode.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<strong><code>clientIP</code> trusts client-supplied headers with no
+trusted-proxy allowlist.</strong>
+<pre><code>func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Real-IP"); v != "" { return v }
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if first, _, ok := strings.Cut(v, ","); ok { return strings.TrimSpace(first) }
+		return strings.TrimSpace(v)
+	}
+	...
+}</code></pre>
+<p style="margin-top:0.5rem">
+This is what <code>MaxConnsPerIP</code> (module 11) and the ip limiter
+(<code>limit.go</code> below) key their entire per-address connection cap
+on — but the function trusts <code>X-Real-IP</code> and
+<code>X-Forwarded-For</code> unconditionally, with no check that the
+request actually arrived through a known, trusted load balancer that would
+be the one setting them honestly. A client connecting directly to the
+server's port (bypassing any load balancer entirely, which nothing here
+prevents) can set <code>X-Forwarded-For</code> to a different fake address
+on every single connection attempt, and <code>ipLimiter.acquire</code> would
+treat each one as a brand-new address with its own fresh allowance — the
+exact connection-exhaustion attack <code>MaxConnsPerIP</code> exists to
+stop, defeated by the header meant to make the limit more accurate behind a
+proxy. The identical pattern, with the identical gap, is repeated
+independently in <code>httpapi/api.go</code> (module 17) — this is a
+systemic issue affecting both the WebSocket and REST edges, not a one-off.
+The fix is standard: only trust these headers when the immediate peer
+address is itself a configured, trusted proxy/load-balancer IP; otherwise
+fall back to the raw socket address every time.
+</div>
+</div>
+
+<h2 id="connchunk"><code>ws/conn.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/ws/conn.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+One player, one <code>Conn</code>, implementing the exact
+<code>room.Client</code> interface a room actor was built against in module
+13 — <code>Send</code>, <code>Fail</code>, <code>Close</code>,
+<code>PlayerID</code>. Everything about turning bytes on a socket into
+frames a room understands, and back, lives here.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Two goroutines per connection, with one strict rule: only the write
+pump ever calls <code>ws.WriteMessage</code>.</strong> The type's own
+comment: "a read pump that turns frames into room messages, and a write pump
+that is the only writer to the socket." A single <code>gorilla/websocket</code>
+connection is not safe for concurrent writes from multiple goroutines — so
+rather than a mutex around every write call site (several: incoming frames,
+pings, the close handshake), the design sidesteps the question entirely by
+having exactly one goroutine ever touch the write side. Everything that
+wants to send something posts to the buffered <code>send</code> channel
+instead; the write pump is the only consumer.
+</p>
+<p>
+<strong><code>Send</code> never blocks — a slow client is dropped, not
+waited on.</strong>
+</p>
+<pre><code>func (c *Conn) Send(frame []byte) {
+	select {
+	case <-c.closed: return
+	default:
+	}
+	select {
+	case c.send <- frame:
+	default:
+		obs.SendDrops.Inc()
+		c.Close("policy", "send queue overflow")
+	}
+}</code></pre>
+<p>
+This is the same "never stall the table" rule module 13's <code>Client</code>
+interface documents at the definition site, implemented here concretely: a
+full 64-frame queue means this specific socket has fallen far enough behind
+that catching it up isn't worth blocking a room actor's goroutine (module
+13's actor never does anything except post to channels — a blocking
+<code>Send</code> here would stall the whole table, not just one player).
+The comment on the interface itself makes the trade-off explicit: the
+client "reconnects and gets a fresh authoritative view, so nothing is lost
+but the connection" — the alternative, buffering without limit, risks
+unbounded memory growth per stuck socket for a value (queued frames for
+someone who isn't reading them) that's worthless anyway.
+</p>
+<p>
+<strong><code>finish()</code> queues a <code>nil</code> sentinel through the
+same channel real frames travel, rather than closing the socket directly.</strong>
+</p>
+<pre><code>func (c *Conn) finish() {
+	select {
+	case <-c.closed:
+	case c.send <- nil:
+	default:
+		c.Close("policy", "closing")
+	}
+}
+
+// in writePump:
+case frame := <-c.send:
+	if frame == nil {
+		c.Close("normal", "closing after final frame")
+		return
+	}
+	...</code></pre>
+<p>
+Because the write pump is a single consumer draining the channel in order,
+a <code>nil</code> sentinel behind a real error frame guarantees the error
+is actually written to the wire before the socket closes — closing directly
+from <code>Fail</code> would race the close against the write pump still
+having that frame queued, and the client could see a bare disconnect with no
+explanation at all. This is exactly the mechanism the <code>Fail</code>
+doc comment on <code>Client</code> (module 13) demands: "Implementations
+must never close before the frame is written."
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (c *Conn) readPump() {
+	defer c.teardown()
+	c.ws.SetReadLimit(protocol.MaxFrameBytes)
+	_ = c.ws.SetReadDeadline(time.Now().Add(pongWait))
+	c.ws.SetPongHandler(func(string) error {
+		return c.ws.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	limiter := newBucket(c.srv.cfg.MsgRatePerSecond, c.srv.cfg.MsgBurst)
+	for {
+		_, data, err := c.ws.ReadMessage()
+		if err != nil { return }
+		_ = c.ws.SetReadDeadline(time.Now().Add(pongWait))
+		if c.fatal.Load() { continue }
+		if !limiter.allow() {
+			c.Fail(protocol.ErrRateLimited, ...)
+			continue
+		}
+		frame, err := protocol.DecodeClient(data)
+		if err != nil {
+			c.reject(protocol.ErrBadFrame, ...)
+			continue
+		}
+		c.dispatch(frame)
+	}
+}</code></pre>
+<p>
+Notice the read deadline is refreshed by <em>any</em> traffic, not only pong
+control frames — the comment: "a client that is playing should never be
+timed out" — a player actively sending bid and play frames proves liveness
+just as well as a pong would, so there's no reason to require a separate
+heartbeat from someone who's obviously still there. <code>DecodeClient</code>
+(module 11) does the actual validation — this loop's only job is size
+(<code>SetReadLimit</code>), pace (the token bucket), and shape (decode),
+before <code>dispatch</code> routes a clean frame to either the join
+handler or the bound room's <code>Action</code>.
+</p>
+
+<details class="try">
+<summary>Try it yourself — after <code>Fail</code> sets <code>c.fatal</code>, the read pump keeps looping and reading frames (just discarding them) instead of returning immediately. Why not just exit the loop the moment a fatal error is queued?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>// Once a fatal error is on its way out, nothing else this client says
+// should reach a table.
+if c.fatal.Load() {
+	continue
+}</code></pre>
+<p>
+<code>Fail</code> only <em>queues</em> the close (through <code>finish</code>'s
+sentinel) — it doesn't synchronously close the socket, because that's the
+write pump's job, and it has to happen only after the error frame is
+actually written. Until the write pump gets to that sentinel and calls
+<code>Close</code>, the socket is still technically open and
+<code>ReadMessage</code> will keep returning data. Exiting the read loop
+immediately would either mean duplicating the close logic here or leaving
+the socket in a half-torn-down state; discarding further reads until the
+real close happens (which stops <code>ReadMessage</code> with an error,
+ending the loop naturally) keeps there being exactly one place that
+actually closes the connection.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found beyond the shared <code>clientIP</code> gap noted under
+<code>server.go</code>. The two-pump, single-writer design and the
+close-sentinel ordering are both textbook solutions to real, named
+concurrency hazards, and — notably for this package specifically, unlike
+most of module 13's <code>room</code> package — this behavior actually has
+test coverage: <code>backend/internal/ws/</code> contains five test files
+totaling roughly 2,900 lines (<code>autoplay_test.go</code>,
+<code>online_test.go</code>, <code>persistence_test.go</code>,
+<code>private_test.go</code>, <code>resilience_test.go</code>) against 826
+lines of source in this module's four files — more than three lines of test
+for every line of implementation, including scenarios named for exactly the
+kind of thing this module handles: reconnects, autoplay handoff, private
+and online table flows. This is worth noting because it demonstrates the
+gap flagged repeatedly in module 13 is not a project-wide habit — this
+package proves the team tests exactly this class of networking/concurrency
+code well elsewhere; the room package's near-total absence of tests is an
+inconsistency, not an inherent limitation of how this codebase is written.
+</div>
+</div>
+
+<h2 id="identitychunk"><code>ws/identity.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/ws/identity.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Turns a client-supplied device id into a stored account id, in the
+background, without a slow or unreachable database ever adding latency to
+the moment a player sits down at a table — the concrete mechanism behind the
+"identity is an enrichment, never a precondition" rule this module's
+<code>server.go</code> section already named.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A channel-close happens-before edge, not a mutex, guards the shared
+result.</strong>
+</p>
+<pre><code>type accountLookup struct {
+	id   string
+	done chan struct{}
+	delivered bool
+}</code></pre>
+<p>
+The comment states the safety argument directly: "<code>id</code> is written
+before <code>done</code> is closed and read only after <code>done</code> is
+observed closed, which is the happens-before edge that makes it safe without
+a lock." This leans on a specific, named Go memory-model guarantee (a
+channel close happens-before any receive that observes it) rather than a
+<code>sync.Mutex</code> — a smaller, allocation-cheaper primitive doing
+exactly the one job needed here: one writer, potentially several readers,
+one irreversible transition from "pending" to "done."
+</p>
+<p>
+<strong>Two separate access methods — <code>peek</code> (never blocks) and
+<code>attach</code> (waits, but off on its own goroutine) — instead of one
+function that always blocks with a timeout.</strong> A single blocking
+"get the result, waiting up to N seconds" function would be simpler to
+write, but would reintroduce exactly the coupling this design exists to
+avoid: whoever calls it would have to decide how long they're willing to
+wait, and any nonzero wait re-couples the join to the database's latency.
+Splitting the two calls lets the fast path (database answered already) cost
+nothing, and the slow path (still pending) cost one extra goroutine that
+attaches the answer whenever it eventually arrives — with the seat already
+allocated and the player already playing either way.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (l *accountLookup) peek() string {
+	if l == nil { return "" }
+	select {
+	case <-l.done:
+		l.delivered = true
+		return l.id
+	default:
+		return ""
+	}
+}
+
+func (l *accountLookup) attach(c *Conn, table *room.Room, seat int) {
+	if l == nil || table == nil || l.delivered { return }
+	go func() {
+		<-l.done
+		table.AttachUser(c, seat, l.id)
+	}()
+}</code></pre>
+<p>
+<code>peek</code>'s <code>select</code> with a <code>default</code> case is
+the non-blocking read: if <code>done</code> is already closed, take the
+answer; otherwise return empty immediately, no waiting. It also records
+<code>l.delivered = true</code> the moment it succeeds — which is exactly
+what lets <code>attach</code> skip spawning a goroutine at all in the common
+case where the database answered quickly: "the test is peek's own record
+rather than the channel: the lookup may well have finished in between, and
+that answer still has to reach a seat that was allocated without it" — so
+even a lookup that finishes a few milliseconds too late to make
+<code>peek</code>'s window is guaranteed to eventually reach the seat via
+<code>room.AttachUser</code> (module 13), just later.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness found. This is a small, carefully reasoned piece of
+concurrent code whose safety argument is documented inline rather than
+left implicit, and the pending-database-answer scenario is exactly the kind
+of edge case a rushed implementation would get wrong (either by blocking the
+join, or by dropping a late answer on the floor) — neither happens here.
+</div>
+</div>
+
+<h2 id="limitchunk"><code>ws/limit.go</code></h2>
+<div class="filecard">
+<div class="path">backend/internal/ws/limit.go</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Two independent defenses against abuse, at two different scopes: a
+per-connection message-rate limiter (a single misbehaving or buggy client
+flooding frames), and a per-IP-address connection-count cap (many sockets
+from one source trying to exhaust the server).
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The token bucket is deliberately lock-free, because it's
+structurally impossible for it to need one.</strong> The comment: "it is
+deliberately tiny and allocation-free: there is one per connection, and it
+is consulted on every frame. Not safe for concurrent use — each bucket is
+touched only by its own read pump." Because exactly one goroutine (that
+connection's own read pump, per <code>conn.go</code>'s two-pump design) ever
+calls <code>allow()</code> on a given bucket, adding a mutex here would be
+pure overhead paid on every single incoming frame for a race that can never
+occur — the same "no lock needed because only one goroutine ever touches
+this" reasoning module 13's room actors use for game state, applied at
+connection scope instead of table scope.
+</p>
+<p>
+<strong>The IP limiter, by contrast, needs its lock — because it's shared
+across every connection on the server.</strong> Unlike the bucket, many
+connections' goroutines call <code>acquire</code>/<code>release</code>
+concurrently on the same <code>ipLimiter</code> instance (there's exactly
+one, owned by <code>Server</code>), so its map genuinely is shared mutable
+state — and it gets the <code>sync.Mutex</code> the bucket correctly omits.
+Two structurally similar-looking rate limiters, two different concurrency
+answers, each correct for its actual scope.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>func (b *bucket) allow() bool {
+	now := time.Now()
+	b.tokens += now.Sub(b.last).Seconds() * b.rate
+	if b.tokens > b.burst { b.tokens = b.burst }
+	b.last = now
+	if b.tokens < 1 { return false }
+	b.tokens--
+	return true
+}</code></pre>
+<p>
+Classic token bucket: tokens accumulate continuously at <code>rate</code>
+per second, capped at <code>burst</code> so a client that's been idle for a
+while can't bank unlimited tokens and then unleash a huge burst — it can
+only ever have up to <code>burst</code> saved up. Every allowed frame costs
+exactly one token. Module 11's <code>MsgRatePerSecond</code> (default 20)
+and <code>MsgBurst</code> (default 40) are what parameterize this per
+connection.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The IP limiter's fairness is only as good as <code>clientIP</code>'s
+accuracy, which this module's <code>server.go</code> section already flagged
+as trusting unauthenticated headers. That gap surfaces here concretely: an
+attacker who can vary their apparent address defeats <code>MaxConnsPerIP</code>
+entirely, since <code>ipLimiter</code> itself has no way to know the address
+it was given is fabricated — it does exactly what it's supposed to with the
+input it's handed. No further independent weakness in this file itself.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why can <code>Server.Locator</code> safely be <code>nil</code>, and what does that buy a single-node deployment?</summary>
+<div class="answer">
+Every call site checks <code>if s.Locator != nil</code> before using it, so
+a nil Locator simply means every table this server knows about is
+considered its own — no redirect logic ever runs. A single developer running
+the server locally never has to stand up Redis or any cross-node registry
+just to accept a connection.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>Conn</code> use two goroutines with a strict "only the write pump writes" rule, instead of a mutex around every <code>WriteMessage</code> call?</summary>
+<div class="answer">
+gorilla/websocket connections are not safe for concurrent writes from
+multiple goroutines. Rather than guard every one of several write call
+sites with a lock, the design sidesteps the question by making exactly one
+goroutine the only writer — everything else posts to a channel instead.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>accountLookup</code> use a closed channel as its synchronization primitive instead of a mutex protecting the result field?</summary>
+<div class="answer">
+A channel close is a one-way, irreversible "done" signal with a documented
+happens-before guarantee in Go's memory model — exactly what's needed for a
+single writer and potentially multiple readers of a value that's written
+once and never changes again. It's a smaller, cheaper primitive than a
+mutex for a job that never needs to be reversed or re-locked.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does the per-connection token bucket need no lock, while the per-IP connection limiter does?</summary>
+<div class="answer">
+Exactly one goroutine — that connection's own read pump — ever touches its
+bucket, so there is structurally nothing to race. The IP limiter is a single
+shared instance that many different connections' goroutines call into
+concurrently, so its map is genuinely shared mutable state that does need
+a lock.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="13-room-match.html">← Module 13: Room Actor & Matchmaking</a>
+<a href="15-auth.html">Module 15: Auth & Guest Identity →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4. App Wiring & Design Tokens — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m04">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 4 of 20</p>
+<h1>App Wiring & Design Tokens</h1>
+<p class="lede">
+The engine (Part I) can run a full game in memory, but nothing shows it on
+screen yet. This module wires up the actual Flutter application —
+<code>lib/main.dart</code> — and the two files that keep every widget built
+after this point from hard-coding a colour or a pixel size:
+<code>design/tokens.dart</code> and <code>design/metrics.dart</code>.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="32" fill="#4fd68c" font-weight="bold">UI ◀ you are here — main.dart, design/</text>
+  <text x="32" y="48" fill="#9db0a4">Wires MaterialApp, theme, and the settings scope.</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="94" fill="#6d7f74">GameSession (module 5)</text>
+  <rect x="20" y="122" width="440" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="144" fill="#4fd68c">Engine ✓ · Bot ✓</text>
+  <text x="32" y="160" fill="#9db0a4">card.dart, rules.dart, game.dart, bot.dart</text>
+</svg>
+</div>
+
+<h2 id="main-dart"><code>lib/main.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/main.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every Flutter app needs exactly one entry point that starts the widget tree.
+This file is also where the small set of things that must exist
+<em>before</em> a single pixel is drawn get built once: on-disk settings, the
+device identity, and the queue of any offline games that still need uploading
+from a previous run.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Build <code>AppSettings</code> once in <code>main()</code> and hand it
+down through a hand-rolled <code>InheritedWidget</code>
+(<code>SettingsScope</code>, module 7), instead of a state-management package</strong>
+like Provider or Riverpod. The whole app has one real piece of app-wide mutable
+state (settings), so a stdlib <code>InheritedWidget</code> is enough — no extra
+package for the team to learn, no code generation. The cost: if this app grew
+several independent pieces of app-wide state, each would need its own
+hand-rolled scope, where a package gives you that pattern for free and
+composes multiple stores more easily.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>Future&lt;void&gt; main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  SystemChrome.setPreferredOrientations([...]);
+
+  // Storage is read once, here, so every widget below can treat the device id
+  // and the session token as plain synchronous values.
+  final settings = AppSettings(identity: await IdentityStore.open());
+
+  // Offline games queued by the last run go out now. Deliberately not awaited:
+  // the home screen must not wait on a network call to appear.
+  GameUploader.install(await GameUploader.open(client: ApiClient.forSettings(settings)));
+
+  runApp(CallBreakApp(settings: settings));
+}</code></pre>
+<p>
+<code>WidgetsFlutterBinding.ensureInitialized()</code> exists because the two
+calls right after it (<code>SystemChrome...</code>) talk to native platform
+code before <code>runApp</code> has set that channel up itself — a required
+one-liner any time you touch a platform API before the app is running.
+</p>
+<p>
+The two comments in the code above are doing real explanatory work, verbatim
+from the file — read them closely: <code>identity: await IdentityStore.open()</code>
+is <em>awaited</em> deliberately, so every widget built afterward can assume
+the device id is already loaded and read it synchronously, with no "is it
+ready yet" check anywhere else in the app. <code>GameUploader.install(...)</code>,
+by contrast, is <em>not</em> awaited — its own network upload must not delay
+the first frame the player sees. Same file, two adjacent lines, opposite
+async strategy, each for a stated reason.
+</p>
+
+<details class="try">
+<summary>Try it yourself — before reading it, guess what <code>CallBreakApp</code>'s <code>build()</code> needs to return</summary>
+<p>
+It needs a <code>MaterialApp</code> with a dark theme seeded from the design's
+gold accent, and its <code>home</code> should be whatever screen the app opens
+to first. What wraps the <code>MaterialApp</code> so settings reach every
+screen below it?
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>@override
+Widget build(BuildContext context) {
+  return SettingsScope(
+    settings: _settings,
+    child: MaterialApp(
+      title: 'Call Break',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF04140F),
+        fontFamily: 'PlusJakartaSans',
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: AppColors.gold,
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: const HomeScreen(),
+    ),
+  );
+}</code></pre>
+<p>
+<code>SettingsScope</code> wraps <em>outside</em> <code>MaterialApp</code>, so
+settings are reachable from absolutely anywhere in the tree, including code
+that runs before any screen (route transitions, error builders). It's built in
+module 7, alongside <code>AppSettings</code> itself.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>main()</code> (lines 12–29) has no top-level error handling around the two
+awaited calls — if <code>IdentityStore.open()</code> or building the
+<code>ApiClient</code>/<code>GameUploader</code> throws (a corrupt on-disk
+settings file, for instance), <code>runApp</code> is never reached and the user
+sees a blank screen with no crash report and no fallback UI. A
+<code>runZonedGuarded</code> wrapper with a minimal error screen, or a
+try/catch that falls back to fresh in-memory settings, would turn a silent
+blank-screen failure into a recoverable one.
+</div>
+</div>
+
+<h2 id="tokens-dart"><code>design/tokens.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/design/tokens.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A card table app has dozens of widgets that all need to agree on the same gold,
+the same felt green, the same type ramp. Without one shared source, colours
+drift widget-by-widget over time as different people (or different sessions
+with an AI) touch different screens. The file's own doc comment states the
+rule directly: "Nothing in the UI should hard-code a colour or a type ramp —
+it all comes from here."
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Table appearance and card-face appearance are two independent enums
+(<code>TableTheme</code> and <code>CardStyle</code>), each resolved through its
+own static lookup class, rather than one combined "theme" enum</strong> (e.g.
+<code>Theme.emeraldClassic</code>). Two independent axes let a player pick
+"Sapphire table, Midnight cards" — 4 × 6 = 24 combinations from 10 declared
+values instead of needing 24 declared combinations. The cost is exactly what
+you'd guess: nothing enforces that a given <code>CardStyle</code> looks good
+against every <code>TableTheme</code> — that's left to whoever picks the
+literal colour values to get right by eye, which the code above (lines 170–174,
+199–202) shows real thought went into, but the type system can't verify it.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>enum TableTheme { emerald, sapphire, amethyst, crimson }
+
+class ThemePalette {
+  const ThemePalette({required this.label, required this.background, ...});
+  ...
+  static const _palettes = &lt;TableTheme, ThemePalette&gt;{
+    TableTheme.emerald: ThemePalette(
+      label: 'Emerald',
+      background: [Color(0xFF061A14), Color(0xFF0D3D2C), Color(0xFF145C42)],
+      ...
+    ),
+    ...
+  };
+
+  static ThemePalette of(TableTheme theme) =&gt; _palettes[theme]!;
+}</code></pre>
+<p>
+Every theme's actual colour values live in one <code>const</code> map, keyed
+by the enum. Any widget that needs "the felt colour for the current theme"
+calls <code>ThemePalette.of(theme).felt</code> — never a raw
+<code>Color(0x...)</code> literal. This is the mechanism, repeated for
+<code>CardFacePalette</code>, that makes the file's "nothing hard-codes a
+colour" rule actually enforceable in practice rather than just a comment nobody
+follows.
+</p>
+<p>
+Read the two comments above the <code>CardStyle.crimson</code> and the four
+saturated-suit entries (lines 170–174, 199–202) verbatim — they explain a real
+design constraint, not decoration: a saturated red card <em>face</em> would
+make the normal red-suit ink (also red) disappear into it, so Crimson's ink
+colours are inverted specifically to stay legible. That's the kind of
+non-obvious reasoning a plain colour value can't carry on its own — which is
+the actual argument for keeping it in one commented file instead of scattered
+literals.
+</p>
+
+<h3>design/metrics.dart</h3>
+<p>
+Sitting next to <code>tokens.dart</code>: <strong>colour</strong> comes from
+tokens, <strong>size</strong> comes from <code>Metrics</code>. Same principle,
+different axis.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>One scalar <code>scale</code> factor, derived from the device's
+shortest side and applied everywhere via <code>Metrics.s(designPx)</code>,
+instead of per-breakpoint layouts</strong> (distinct phone/tablet layout code,
+or a package like <code>flutter_screenutil</code>). One number keeps every
+widget's proportions consistent relative to each other automatically — design
+at 390pt, multiply by <code>scale</code>, done. The cost, from the file's own
+comment: it's "a ceiling so a tablet does not end up with comically large
+cards," meaning the same scalar can't independently decide that, say, the bid
+panel should grow slower than the card fan — every design-pixel value scales
+by the exact same factor.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>static double _scaleFor(Size size) {
+  final shortSide = size.shortestSide;
+  return (shortSide / designShortSide).clamp(_minScale, _maxScale);
+}</code></pre>
+<p>
+<code>designShortSide</code> is <code>390.0</code> — the design's own reference
+device width. Any real device's shortest side (portrait width, or landscape
+height) divided by that gives a ratio, clamped between 0.78 and 1.4 so an
+extreme phone or tablet doesn't blow layout proportions out. Every widget then
+calls <code>Metrics.s(24)</code> instead of a hard-coded <code>24</code>, and
+gets a device-appropriate pixel value back.
+</p>
+<p>
+The more subtle piece is <em>where</em> that size comes from — read the doc
+comment on <code>MetricsScope</code> verbatim, because the reasoning is a real,
+specific Flutter gotcha:
+</p>
+<pre><code>/// Sized from the media query rather than from the incoming layout
+/// constraints on purpose: a `Scaffold` shrinks its body on every frame of the
+/// on-screen keyboard's open/close animation (`Scaffold.resizeToAvoidBottomInset`),
+/// but `MediaQuery.sizeOf` ignores that inset and keeps reporting the settled
+/// screen. Keying the scale and the portrait/landscape split off the stable
+/// value means `Metrics.updateShouldNotify` returns false while the keyboard
+/// animates, so the whole subtree does not rebuild — and re-lay out — at 60fps
+/// just to adjust to a shrinking viewport.
+class MetricsScope extends StatelessWidget { ... }</code></pre>
+<p>
+Without this, opening a text field's keyboard would trigger a full-tree relayout
+every animation frame while the keyboard slides up — a real, previously-hit
+performance bug this comment is documenting the fix for, not a hypothetical one.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No known weakness — both files are pure, static data plus one small pure
+function (<code>_scaleFor</code>), with the reasoning behind every non-obvious
+choice already captured in the file's own comments.
+</div>
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why is <code>GameUploader.install(...)</code> not awaited in <code>main()</code>, while <code>IdentityStore.open()</code> is?</summary>
+<div class="answer">
+The device identity must be ready before any widget builds, so every screen
+can read it synchronously — hence it's awaited. The upload queue's network
+call has no such requirement, and awaiting it would delay the very first
+frame the player sees for no benefit; the file's own comment says exactly
+this.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>TableTheme</code> and <code>CardStyle</code> are separate enums instead of one combined theme. What does that buy, and what does it not guarantee?</summary>
+<div class="answer">
+It buys every table-colour × card-colour combination (24 from 10 declared
+values) without declaring each combination by hand. It does not guarantee
+every combination looks good together — that's down to whoever picks the
+literal colours, verified by eye, not by the type system.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>Metrics</code> compute its scale from <code>MediaQuery.sizeOf</code> instead of the widget's own incoming layout constraints?</summary>
+<div class="answer">
+Layout constraints shrink every frame while the on-screen keyboard animates
+open or closed (via <code>resizeToAvoidBottomInset</code>), which would
+trigger a full relayout of the metrics-dependent subtree at 60fps for no
+reason. <code>MediaQuery.sizeOf</code> reports the settled screen size and
+ignores that transient inset, so the scale — and anything depending on it —
+stays stable through the animation.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="03-bot.html">← Module 3: Bot Opponent</a>
+<a href="05-session-offline.html">Module 5: Sessions & Offline Play →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

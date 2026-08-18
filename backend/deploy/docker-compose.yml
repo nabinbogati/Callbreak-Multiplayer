@@ -1,0 +1,102 @@
+# Local production-shaped stack: the game server, the shared room registry and
+# the match history database.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Then point the Flutter app's debug server URL at ws://<your-lan-ip>:8080/ws.
+# Use the LAN address rather than localhost, or a phone or emulator will be
+# looking for the server on itself.
+
+volumes:
+  # Redis is soft state and deliberately gets no volume. Postgres is the
+  # opposite: accounts and match history are the only things in this stack that
+  # cannot be regenerated, so they are the only things that survive a
+  # `docker compose down`. Use `down -v` when you actually want a clean slate.
+  postgres-data:
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ADDR: ":8080"
+      ENV: development
+      LOG_LEVEL: debug
+      # A fixed secret keeps guest and resume tokens valid across restarts,
+      # which is what you want while testing reconnects. Generate a real one for
+      # any deployment that is not on your own machine.
+      JWT_SECRET: local-development-secret-change-me
+      REDIS_URL: redis://redis:6379/0
+      # Persistence. Remove this line and the server still runs and still plays
+      # games — it just records nothing and the REST endpoints answer
+      # 503 persistence_disabled, which is the documented no-database mode.
+      DATABASE_URL: postgres://callbreak:local-development-password@postgres:5432/callbreak?sslmode=disable
+      # Card-level replay is off by default: ~260 rows a game against the four a
+      # scoreboard needs. Turn it on here if you want to inspect the tables.
+      RECORD_TRICKS: "false"
+      # How other nodes tell clients to reach this one. With a single replica it
+      # is only used to recognise this node's own claims.
+      PUBLIC_URL: ws://localhost:8080/ws
+      MATCH_BOT_FILL_AFTER: 20s
+      # Uncomment to enable the operations dashboard at /admin and the
+      # /v1/admin/* API. Pick a long random value; it is the only credential
+      # guarding live tables, hands and the runtime settings.
+      ADMIN_TOKEN: change-me
+    depends_on:
+      redis:
+        condition: service_healthy
+      # Not just "started": the server applies migrations at boot, so it has to
+      # wait for Postgres to be accepting queries rather than merely for the
+      # container to exist. Without the healthcheck condition the first `up`
+      # after a fresh volume races the database's own initialisation and the
+      # server crashes on a connection refused.
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # No persistence: the registry is soft state that rebuilds itself from the
+    # nodes' heartbeats within a minute.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    # 16 rather than latest, so the version here is the version you get in six
+    # months. The schema needs 13 or newer for gen_random_uuid().
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: callbreak
+      POSTGRES_PASSWORD: local-development-password
+      POSTGRES_DB: callbreak
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # No published port. Nothing outside this network needs to reach the
+    # database, and a Postgres on 5432 of a laptop that joins café wifi is a
+    # worse idea than it looks. Add `ports: ["5432:5432"]` locally if you want
+    # to poke at it with psql.
+    healthcheck:
+      # -U and -d matter: the default `pg_isready` asks about the root role and
+      # would report healthy before the entrypoint has finished creating the
+      # application database, which is precisely the window the server would
+      # otherwise start in.
+      test: ["CMD-SHELL", "pg_isready -U callbreak -d callbreak"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # The first boot has to initdb before it can answer anything, and a
+      # start_period keeps those failures from counting against the retries.
+      start_period: 10s
+    restart: unless-stopped

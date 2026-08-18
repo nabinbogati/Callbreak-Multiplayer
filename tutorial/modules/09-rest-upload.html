@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9. Going Online — Build Call Break</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body data-page="m09">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Part II — Flutter app · Module 9 of 20</p>
+<h1>Going Online: RemoteSession, REST & Uploads</h1>
+<p class="lede">
+This is the module that makes the app actually multiplayer. It builds
+<code>net/remote_session.dart</code> — the third <code>GameSession</code>
+implementation, this time talking to a real Go server over a WebSocket — plus
+the REST support around it: <code>net/api_client.dart</code>,
+<code>net/api_models.dart</code>, and the offline-game upload queue in
+<code>net/game_uploader.dart</code>.
+</p>
+<p style="font-size:0.85rem;color:var(--text-dim)">
+<strong>Scope note:</strong> <code>api_models.dart</code> (560 lines) is
+mostly repeated instances of one JSON-decoding pattern — it's shown once in
+full here, not per model class. <code>remote_session.dart</code> (710 lines)
+gets the deepest coverage in this module, since it's where the interesting
+networked-client decisions live.
+</p>
+
+<h2>Where this fits</h2>
+<div class="diagram-wrap">
+<svg viewBox="0 0 480 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <rect x="20" y="10" width="440" height="46" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="38" fill="#4fd68c">UI ✓ · State ✓ · Audio ✓</text>
+  <rect x="20" y="66" width="440" height="46" rx="6" fill="#132018" stroke="#4fd68c" stroke-width="2"/>
+  <text x="32" y="88" fill="#4fd68c" font-weight="bold">GameSession ◀ you are here — RemoteSession, api_client, game_uploader</text>
+  <text x="32" y="104" fill="#9db0a4">First real network code: WebSocket to a Go server (Part III), plus REST</text>
+  <rect x="20" y="122" width="440" height="56" rx="6" fill="#132018" stroke="#2a3a32"/>
+  <text x="32" y="144" fill="#4fd68c">Engine ✓ · Bot ✓ · LocalSession ✓</text>
+  <text x="32" y="160" fill="#9db0a4">Everything RemoteSession renders through is already built</text>
+</svg>
+</div>
+
+<h2 id="remotesession-connect"><code>net/remote_session.dart</code> — connecting & reconnecting</h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/remote_session.dart:189–434</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+A real network drops. Wi-Fi flickers, a phone walks out of range, a server
+restarts. Without deliberate reconnect logic, any of those would end the game
+for a player who did nothing wrong. This is the piece of the app that decides
+"is this seat still worth trying to get back," and does the retrying so the
+player mostly never has to.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Client-driven exponential backoff (1s, 2s, 4s, then every 8s), bounded
+by a server-issued grace window — not a fixed retry interval, and not a
+server-pushed "retry at this time."</strong> A fixed short interval would hammer
+a server that's genuinely down; a long fixed interval would feel sluggish for
+a one-second Wi-Fi blip. Backing off is a proven middle path, at the cost of
+extra bookkeeping (<code>_attempts</code>, the switch table) for what a fixed
+delay would do in one line.
+</p>
+<p>
+<strong>A dedicated <code>_connecting</code> guard flag prevents two
+overlapping connection attempts</strong> from ever running at once — a real
+race is possible here: a "Try again" tap landing while a scheduled backoff
+timer is also mid-connect. Without the guard, both attempts could each open a
+socket and leave the session holding two live connections fighting over its
+state. The cost is one more boolean to remember to check, and to reset in a
+<code>finally</code> block (line 272) so it's never left <code>true</code>
+after an attempt ends, however it ends.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Detecting a silent drop the OS didn't report
+(lines 237–245):</strong></p>
+<pre><code>// A network switch (Wi-Fi ↔ cellular, a changed IP) does not always
+// close the underlying TCP connection — it can just go silent, with no
+// FIN or RST ever arriving. Without this, neither onError nor onDone
+// fires and the session sits in SessionStatus.ready forever, showing a
+// frozen table. Enabling protocol-level pings makes the socket itself
+// notice: if a pong does not come back in time, it closes the
+// connection and onDone runs, which is what actually drives the
+// reconnect logic below.
+socket.pingInterval = const Duration(seconds: 10);</code></pre>
+<p>
+This single line is the difference between a real network failure being
+detected at all, or the app just... sitting there, showing a table that will
+never move again, with no error and no signal that anything is wrong. It's a
+genuinely non-obvious platform behavior (a switched network interface doesn't
+always tell TCP it's gone) that the comment is careful to spell out rather than
+leave as an unexplained magic number.
+</p>
+
+<p><strong>Distinguishing a deliberate leave from a real drop
+(lines 324–351):</strong></p>
+<pre><code>void _onDisconnected() {
+  if (_status == SessionStatus.error) return;
+  _subscription = null;
+  _socket = null;
+
+  if (_left) {
+    _status = SessionStatus.closed;
+    notifyListeners();
+    return;
+  }
+
+  if (_resumeToken != null &amp;&amp; _view != null &amp;&amp; _view!.phase != GamePhase.gameOver) {
+    _seatHeldUntil ??= DateTime.now().add(_reconnectGrace);
+    _scheduleReconnect();
+    return;
+  }
+
+  _status = SessionStatus.closed;
+  notifyListeners();
+}</code></pre>
+<p>
+Every path to a closed socket runs through this one method, and its first job
+is figuring out <em>why</em> the socket closed: <code>_left</code> (the player
+tapped leave, <code>leaveLobby()</code> already sent the frame) means "closed
+on purpose, nothing to recover." Otherwise, if there's a resume token and a
+live, non-final game view, this was an involuntary drop worth fighting for —
+start the grace clock and try to reconnect. Anything else (dropped from a
+lobby, say — module 5's doc comment on <code>NetworkSession</code> notes
+rejoining a lobby you already left would take a seat off whoever's waiting) is
+just... closed.
+</p>
+
+<details class="try">
+<summary>Try it yourself — <code>canResume</code> gates whether a reconnect attempt is even worth scheduling. Write it before looking.</summary>
+<p>
+It should be true only when: there's a resume token, the player hasn't
+deliberately left, the seat-held-until deadline hasn't passed, there's a view
+in hand, and that view isn't already <code>gameOver</code>.
+</p>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>@override
+bool get canResume {
+  final until = _seatHeldUntil;
+  return _resumeToken != null &amp;&amp;
+      !_left &amp;&amp;
+      until != null &amp;&amp;
+      DateTime.now().isBefore(until) &amp;&amp;
+      _view != null &amp;&amp;
+      _view!.phase != GamePhase.gameOver;
+}</code></pre>
+</details>
+</details>
+
+<p><strong>The backoff schedule itself (lines 375–407):</strong></p>
+<pre><code>void _scheduleReconnect() {
+  _retryTimer?.cancel();
+  if (!canResume) {
+    _resuming = false;
+    _fail("We couldn't get you back in time, so your seat was given to "
+        'another player. Start a new table to play again.');
+    return;
+  }
+  _resuming = true;
+  _status = SessionStatus.connecting;
+  notifyListeners();
+
+  final backoff = Duration(seconds: switch (_attempts) {
+    0 =&gt; 1, 1 =&gt; 2, 2 =&gt; 4, _ =&gt; 8,
+  });
+  _attempts++;
+  _retryTimer = Timer(backoff, () {
+    if (_status == SessionStatus.closed || _left) return;
+    _connect();
+  });
+}</code></pre>
+<p>
+Notice this checks <code>canResume</code> <em>before</em> scheduling anything
+— if the grace window has already run out, it doesn't even try; it tells the
+player plainly that the seat is gone, per the file's own comment: "Say so
+plainly instead of spinning forever." Only when there's genuinely still time
+left does it queue the next attempt, doubling the wait each time up to the 8s
+ceiling.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+The backoff schedule (lines 394–401) is a fixed sequence with no random
+<dfn class="term" title="A small random offset added to a retry delay so many clients retrying at once don't all fire at the exact same instant.">jitter</dfn>
+added. If a server restart (or a brief network partition) drops many clients
+at once, every one of them schedules its first retry at exactly 1 second, the
+second at exactly 2 seconds, and so on — all in lockstep. At real scale that's
+a synchronized retry storm hitting the server the moment it comes back,
+rather than a smoothed-out trickle. Adding a small random jitter to each
+backoff step (e.g. <code>±20%</code>) is the standard fix and would cost only
+a few lines here.
+</div>
+</div>
+
+<h2 id="remotesession-frames"><code>net/remote_session.dart</code> — decoding the wire</h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/remote_session.dart:470–642</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+The server (Part III) speaks the JSON frames documented in
+<code>backend/PROTOCOL.md</code>. Something on this side has to turn those raw
+bytes into the typed <code>GameView</code>/<code>GameEvent</code>/
+<code>LobbyState</code> objects the rest of the app already knows how to
+render — this is that translation layer.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>A <code>switch</code> on the frame's <code>type</code> string, not a
+sealed-class decode</strong> — because JSON crosses a language boundary (this
+is decoding what a <em>Go</em> process sent), there's no shared type to pattern
+match on the way module 2's <code>GameEvent</code> sealed hierarchy allows
+inside pure Dart. This is exactly the cost flagged back in module 2's Decision
+section: crossing a wire means falling back to a stringly-typed protocol no
+matter how strongly typed either side is internally.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>void _onMessage(dynamic raw) {
+  late final Map&lt;String, dynamic&gt; message;
+  try {
+    message = Map&lt;String, dynamic&gt;.from(jsonDecode(raw as String) as Map);
+  } catch (_) {
+    return; // Ignore anything that is not a protocol frame.
+  }
+
+  switch (message['type']) {
+    case 'joined': ...
+    case 'lobby': _lobby = LobbyState.fromJson(message); ...
+    case 'view':
+      _view = GameView.fromJson(message);
+      _syncDeadlines(_view!);
+      ...
+    case 'event': _handleEvent(message);
+    case 'error': _handleError(message);
+    case 'pong': break;
+  }
+}</code></pre>
+<p>
+Notice <code>GameView.fromJson(message)</code> — the exact same factory
+constructor built in module 2, now decoding a frame that came from a
+<em>different process, written in a different language</em>, and it works
+unmodified. That's the entire payoff of module 2's redaction-at-construction
+decision: the server built this <code>GameView</code>'s JSON with the same
+shape the offline engine already produces, so the client-side rendering code
+never needs to know or care whether the view came from a local
+<code>CallBreakGame</code> or a real server.
+</p>
+<p><strong>Fatal vs. non-fatal server errors (lines 594–614):</strong></p>
+<pre><code>void _handleError(Map&lt;String, dynamic&gt; message) {
+  final code = message['code'] as String?;
+  final text = message['message'] as String? ?? 'The server rejected the request.';
+
+  if (code == 'redirect') {
+    _error = '$text Please reconnect.';
+    _status = SessionStatus.error;
+    notifyListeners();
+    return;
+  }
+
+  // Non-fatal errors are corrections, not failures: an out-of-turn tap or an
+  // illegal card. The server sends a fresh view straight after, so the table
+  // resyncs on its own and there is nothing to show the player.
+  if (message['fatal'] != true) return;
+
+  _fail(text);
+}</code></pre>
+<p>
+This is a real design choice worth sitting with: not every rejection from the
+server is worth interrupting the player over. Tap a card a beat after the
+server already moved the turn on, and you get an <code>error</code> frame —
+but the very next <code>view</code> frame already reflects reality, so the UI
+silently resyncs rather than flashing an error dialog for something the player
+will never even perceive as wrong.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness beyond the sealed-vs-stringly-typed cost already noted as
+inherent to any wire boundary — this decode layer is otherwise defensive
+throughout (every field read defaults rather than throws, matching
+<code>api_models.dart</code>'s own stated "deliberately total" decoding
+philosophy, covered below).
+</div>
+</div>
+
+<h2 id="apiclient"><code>net/api_client.dart</code> — <code>ApiException</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/api_client.dart:1–89</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+REST calls (auth, profile, match history — module 17 covers the server side)
+can fail in a lot of different ways: no network, a timeout, a 4xx, a 5xx, a
+server with no database configured. Every caller needs one consistent way to
+react to <em>any</em> of them without a different <code>catch</code> clause
+per failure kind.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>One <code>ApiException</code> type for every kind of REST failure —
+network-level, timeout, and every HTTP status — instead of a separate
+exception class per failure kind</strong> (a more idiomatic Dart pattern would
+often be <code>NetworkException</code>, <code>TimeoutException</code>,
+<code>HttpException</code> as distinct types). The file's own comment states
+the payoff directly: "every caller has exactly one thing to catch." The cost:
+callers lose Dart's type-based <code>catch</code> dispatch and instead branch
+on a stringly-typed <code>code</code> field and boolean getters
+(<code>isTransient</code>, <code>isUnauthorized</code>...) — a runtime check
+instead of a compile-time-exhaustive one.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>bool get isTransient =&gt; statusCode == 0 || statusCode == 429 || statusCode &gt;= 500;
+
+String get _fallbackMessage =&gt; switch (code) {
+  network =&gt; 'No connection to the game server.',
+  timeout =&gt; 'The server took too long to answer.',
+  _ when statusCode &gt;= 500 =&gt; 'The server hit a snag. Please try again in a moment.',
+  _ when statusCode == 429 =&gt; 'A little too fast. Give it a moment, then try again.',
+  _ when statusCode == 404 =&gt; 'This server does not recognise that request — '
+      'it may be an older version. Please try again.',
+  _ when statusCode &gt;= 400 =&gt; 'That request did not go through. Check your '
+      'input and try again.',
+  _ =&gt; 'Something unexpected happened. Please try again.',
+};</code></pre>
+<p>
+<code>isTransient</code> is the single most important getter here — it's what
+lets a caller (like <code>GameUploader.drain()</code>, next) decide "worth
+retrying" versus "this exact request will never succeed" with one boolean,
+instead of re-deriving that logic at every call site. Status <code>0</code>
+means the request never reached the server at all (a real network failure) —
+grouped with <code>429</code> (rate limited) and <code>5xx</code> (server-side
+trouble) because all three describe the world, not the request: try again
+later and it might just work.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness — this is a well-reasoned trade-off, explicitly justified in its
+own doc comment rather than left implicit.
+</div>
+</div>
+
+<h2 id="apimodels"><code>net/api_models.dart</code> — the decoding pattern</h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/api_models.dart:1–41</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Every REST response needs to become a typed Dart object, the same problem
+<code>GameView.fromJson</code> solved for the WebSocket in module 2. This file
+is that layer for the whole REST surface — profiles, match history, stats.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>Every decoder is total — a missing key falls back to a zero value, an
+unknown key is silently ignored — rather than throwing on an unexpected
+shape.</strong> The file's own comment explains why this matters more here
+than it might elsewhere: "the document is explicit that <em>adding</em> a
+field is a safe, unversioned change on the server — so a client that throws on
+an unexpected shape would turn a routine backend deploy into a crash on every
+phone that had not updated yet." The cost is that a genuinely malformed
+response (a bug, not a new field) fails silently into default values instead
+of surfacing loudly as a decode error.
+</p>
+
+<div class="section-tag">Explanation</div>
+<pre><code>int _int(Object? value, [int fallback = 0]) =&gt;
+    value is num ? value.toInt() : fallback;
+
+Map&lt;String, dynamic&gt; _object(Object? value) =&gt;
+    value is Map ? Map&lt;String, dynamic&gt;.from(value) : const {};
+
+List&lt;Map&lt;String, dynamic&gt;&gt; _objects(Object? value) =&gt; value is List
+    ? [for (final entry in value) if (entry is Map) Map&lt;String, dynamic&gt;.from(entry)]
+    : const [];</code></pre>
+<p>
+Five tiny helpers (<code>_int</code>, <code>_double</code>, <code>_string</code>,
+<code>_bool</code>, <code>_time</code>, plus the two collection ones shown
+above) are the entire toolkit every model's <code>fromJson</code> in this
+560-line file is built from — a field that isn't the type expected, or isn't
+present at all, degrades to a safe fallback rather than throwing. This is the
+identical philosophy modules 7 and 8 already applied to disk storage and
+audio, now applied a third time to network responses: a whole file built
+around "degrade gracefully, never crash," repeated consistently enough across
+the codebase to call it a house style rather than a one-off.
+</p>
+<p>
+Its doc comment also makes a second, sharper point worth remembering: "Nothing
+derived is decoded... because two sources for one number always end up
+disagreeing" — win rate, average score, and similar are computed client-side
+from raw counters, never trusted as a value the server might also compute
+slightly differently.
+</p>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+No weakness — the same trade-off already named above (a genuine bug decodes
+identically to "a field the client doesn't know about yet") is the accepted
+cost of the compatibility guarantee this design buys.
+</div>
+</div>
+
+<h2 id="gameuploader"><code>net/game_uploader.dart</code></h2>
+<div class="filecard">
+<div class="path">frontend/lib/net/game_uploader.dart</div>
+
+<div class="section-tag">Purpose</div>
+<p>
+Games played in <code>bots</code> or <code>lan</code> mode never touch the
+server while they're being played — the device is the only witness. Without
+this file, those games would simply vanish the moment the app closes: no
+history, no stats, nothing to show on the profile screen.
+</p>
+
+<div class="section-tag decision">Decision</div>
+<p>
+<strong>The upload's idempotency key (<code>clientGameId</code>) is minted at
+game <em>start</em>, inside <code>GameRecorder</code>'s constructor — not at
+upload time, and not at game end.</strong> Per the doc comment: "the id is part
+of the payload before the first upload attempt, so every retry of a failed
+upload carries the id the server may already have seen and gets the original
+game back instead of creating a second one." Minting it any later (say, when
+the upload is actually attempted) would leave a window where a request that
+reached the server but whose response was lost could be retried as a
+<em>second</em>, duplicate game. The cost is essentially none here — it's
+almost free correctness, which is presumably why it was worth doing this way
+from the start.
+</p>
+<p>
+<strong>The queue is capped at 50 entries, dropping the oldest first.</strong>
+An unbounded queue that never syncs (a player who plays offline for months) is
+a slow, unbounded memory/storage leak. Capping it trades that away for
+silently losing the oldest unsynced games once the cap is hit — accepted
+because "the newest games are the ones a player expects to see in their
+history," per the comment.
+</p>
+
+<div class="section-tag">Explanation</div>
+<p><strong>Draining the queue — retry only what's worth retrying
+(lines 222–260):</strong></p>
+<pre><code>Future&lt;void&gt; drain() async {
+  if (_draining || _queue.isEmpty) return;
+  _draining = true;
+  try {
+    while (_queue.isNotEmpty) {
+      final entry = _queue.first;
+      final payload = _decode(entry);
+      if (payload == null) {
+        _queue.removeAt(0);
+        await _persist();
+        continue;
+      }
+      try {
+        await client.uploadGame(payload);
+      } on ApiException catch (error) {
+        if (error.isTransient) return;
+        // A 4xx says the payload itself is wrong — drop it rather than retry forever.
+      } catch (_) {
+        return;
+      }
+      _queue.removeAt(0);
+      await _persist();
+    }
+  } finally {
+    _draining = false;
+  }
+}</code></pre>
+<p>
+This is <code>ApiException.isTransient</code> (from
+<code>api_client.dart</code>, above) doing exactly the job it was designed
+for: a transient failure (no network, a 5xx, a rate limit) stops the whole
+drain loop right there — the entry stays queued, nothing after it in the queue
+even gets attempted, preserving upload order for next time. A non-transient
+failure (a genuine 4xx — the payload itself is malformed) falls through
+instead, and the entry is dropped: retrying an identical bad payload
+indefinitely would never succeed, so there's no point keeping it.
+</p>
+
+<details class="try">
+<summary>Try it yourself — why does <code>GameUploader</code>'s constructor wire <code>client.onServerReachable = () => unawaited(drain())</code>?</summary>
+<details class="solution">
+<summary>Show solution</summary>
+<pre><code>GameUploader({required this.client, ...}) : ... {
+  // A successful call of any kind is the cheapest possible proof that the
+  // network is back, and costs nothing to listen for.
+  client.onServerReachable = () =&gt; unawaited(drain());
+}</code></pre>
+<p>
+Rather than polling "is the network back yet?" on a timer, the uploader
+piggybacks on whatever REST call the rest of the app happens to make
+successfully for its own reasons (checking the profile, say) — any successful
+round trip is proof the server is reachable right now, which is the cheapest
+possible signal to trigger a retry drain on.
+</p>
+</details>
+</details>
+
+<div class="section-tag improve">Improvement note</div>
+<div class="improve-box">
+<code>enqueue()</code> (lines 203–214) silently drops the oldest queued game
+the moment the queue exceeds 50 entries (lines 206–208), with no signal to the
+player that a game fell out of their history. For most players this never
+matters — 50 unsynced offline games is a lot — but a player who genuinely
+plays offline for an extended stretch loses history with zero warning, which
+contradicts the comment's own framing of the queue as "the worst outcome of a
+failed upload is that the game shows up in their history later" — past 50
+entries, that promise quietly stops being true. A small on-screen notice when
+the cap is hit (rather than a hard silent drop) would close that gap.
+</div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="checkpoints">
+
+<details class="checkpoint">
+<summary>Why does <code>RemoteSession</code> use exponential backoff instead of retrying at a fixed interval?</summary>
+<div class="answer">
+A short fixed interval risks hammering a server that's genuinely down; a long
+fixed interval feels sluggish for a brief Wi-Fi blip. Backing off starts fast
+(catches quick blips promptly) and slows down the longer the outage persists
+(doesn't spam a server that's truly gone) — at the cost of more bookkeeping
+than a single fixed delay would need.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why does <code>_handleError</code> only surface an error to the player when the server marks it <code>fatal: true</code>?</summary>
+<div class="answer">
+Because most rejections (an out-of-turn tap, a stale illegal-card attempt) are
+corrected automatically by the very next <code>view</code> frame — the table
+resyncs on its own, and the player never perceives anything was wrong. Only
+failures the client genuinely can't recover from on its own (a redirect to the
+wrong node, a fatal protocol violation) are worth interrupting the player for.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary>Why is <code>GameRecorder</code>'s <code>clientGameId</code> minted when the game <em>starts</em>, rather than when the finished game is first handed to the uploader?</summary>
+<div class="answer">
+So the id already exists inside the very first upload attempt — which means
+every retry of that same upload (after a lost response, a timeout, whatever)
+carries the identical id, and the server's idempotency check on that id
+returns the original game instead of recording a second copy. Minting it any
+later would leave a window where a lost response could cause a genuine
+duplicate.
+</div>
+</details>
+
+<details class="checkpoint">
+<summary><code>ApiException</code> unifies every REST failure mode into one exception type with a <code>code</code> field, instead of distinct exception classes per failure. What's the real cost of that choice?</summary>
+<div class="answer">
+Every caller only needs one <code>catch</code> clause, which is a genuine
+simplification — but it trades away Dart's compile-time-exhaustive type
+dispatch for runtime string/boolean checks (<code>code == 'redirect'</code>,
+<code>isTransient</code>). Forget to check a particular <code>code</code>
+value somewhere and nothing catches the omission at compile time, unlike a
+missing <code>case</code> in an exhaustive sealed-class switch.
+</div>
+</details>
+
+</div>
+
+<div class="mark-complete">
+<button id="mark-complete-btn"></button>
+</div>
+
+<div class="pager">
+<a href="08-audio.html">← Module 8: Audio</a>
+<a href="10-lan.html">Module 10: LAN Multiplayer →</a>
+</div>
+
+</main>
+</div>
+<script>var TUT_BASE = "../";</script>
+<script src="../js/app.js"></script>
+</body>
+</html>

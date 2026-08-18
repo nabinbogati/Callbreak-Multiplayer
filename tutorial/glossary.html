@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Build Call Break</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body data-page="glossary">
+<div class="layout">
+<nav id="sidebar"></nav>
+<main id="content">
+
+<p class="eyebrow">Reference</p>
+<h1>Glossary</h1>
+<p class="lede">
+Every term below is also defined inline (hover the dotted underline) the first
+time it appears in a module. This page is the lookup table for when you land on
+module 14 having skipped module 6.
+</p>
+
+<h2>Dart & Flutter</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><strong>Widget</strong></td><td>A declarative description of a piece of UI in Flutter. Widgets form a tree; Flutter rebuilds the parts of the tree whose inputs changed. Roughly: a React component, but for layout too — there is no separate HTML/CSS.</td></tr>
+<tr><td><strong>StatefulWidget</strong></td><td>A widget that owns mutable state and can call <code>setState()</code> to trigger a rebuild of itself.</td></tr>
+<tr><td><strong>ChangeNotifier</strong></td><td>A stdlib class with a <code>notifyListeners()</code> method. Widgets that listen to it rebuild when it fires. This project's whole "publish state changed" mechanism, with no external state-management package.</td></tr>
+<tr><td><strong>InheritedWidget</strong></td><td>A widget that makes a value available to every widget below it in the tree without passing it through every constructor — Flutter's built-in dependency injection.</td></tr>
+<tr><td><strong>Stream</strong></td><td>A push-based sequence of values delivered over time, one at a time, as they happen (<code>dart:async</code>). Compare to a message queue with one consumer.</td></tr>
+<tr><td><strong>Future</strong></td><td>Dart's name for a promise — a value that will be available later, awaited with <code>await</code>.</td></tr>
+<tr><td><strong>const constructor</strong></td><td>A constructor whose result is compile-time-constant and immutable — Dart/Flutter can reuse the same instance everywhere it's constructed identically, which is both a correctness signal (this object never changes) and a small performance win.</td></tr>
+<tr><td><strong>enum</strong></td><td>A fixed, named set of values (e.g. <code>Suit.spades</code>). Dart enums can carry methods via <code>extension</code>.</td></tr>
+<tr><td><strong>extension</strong></td><td>Dart syntax for adding methods/getters to a type you don't own (or don't want to put instance logic inside), e.g. <code>extension SuitInfo on Suit</code>.</td></tr>
+<tr><td><strong>sealed class</strong></td><td>A class whose subtypes are all known and declared in the same file. A <code>switch</code> over a sealed type must be exhaustive — the compiler rejects a missing case, catching bugs that a dynamic language would only find at runtime.</td></tr>
+<tr><td><strong>switch expression</strong></td><td>A <code>switch</code> used as an expression that returns a value, e.g. <code>String get code => switch (this) { ... }</code> — no <code>break</code>, no fallthrough.</td></tr>
+<tr><td><strong>null safety</strong></td><td>Dart's type system distinguishes <code>String</code> (never null) from <code>String?</code> (may be null) at compile time, so a null-dereference bug is usually caught before the code ever runs.</td></tr>
+<tr><td><strong>hot reload</strong></td><td>Flutter injects changed code into a running app in under a second, preserving state — the fast edit/see loop that replaces "rebuild and redeploy."</td></tr>
+</table>
+
+<h2>Go & backend</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><strong>goroutine</strong></td><td>A function that runs concurrently, scheduled by the Go runtime rather than the OS. Far cheaper than an OS thread — a Go program can run thousands of them, which is what makes "one goroutine per game table" affordable.</td></tr>
+<tr><td><strong>channel</strong></td><td>A typed pipe goroutines use to send values to each other safely, without a lock. Go's proverb: "don't communicate by sharing memory; share memory by communicating."</td></tr>
+<tr><td><strong>actor model</strong></td><td>A concurrency pattern where one unit of state is owned exclusively by one worker, and everyone else talks to it only by sending messages to an inbox, never by touching its memory directly. This project's <code>internal/room</code> package is one actor per game table.</td></tr>
+<tr><td><strong>mutex</strong></td><td>A lock that lets only one goroutine touch a piece of shared state at a time. The actor model above is a way of avoiding needing one on the hot path.</td></tr>
+<tr><td><strong>panic / recover</strong></td><td>Go's exception mechanism. A <code>panic</code> unwinds the stack; a deferred <code>recover()</code> can catch it and keep the process alive instead of crashing entirely.</td></tr>
+<tr><td><strong>token bucket</strong></td><td>A rate-limiting algorithm: a bucket refills with "tokens" at a fixed rate and each unit of work spends one; if the bucket's empty, the work is refused. Bursts up to the bucket size are allowed; sustained rate is capped.</td></tr>
+<tr><td><strong>graceful shutdown / drain</strong></td><td>Stopping a server by first refusing new work, then waiting for in-flight work to finish (up to a timeout), instead of killing everything mid-request.</td></tr>
+<tr><td><strong>connection pool</strong></td><td>A small, reused set of already-open database connections, handed out to callers and returned rather than opened fresh per request — opening a new DB connection is expensive.</td></tr>
+<tr><td><strong>migration</strong></td><td>A versioned, ordered SQL script that changes a database's schema (e.g. <code>0001_init.sql</code>), applied in sequence so every environment's schema history is reproducible.</td></tr>
+</table>
+
+<h2>Networking & general</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><strong>WebSocket</strong></td><td>A single long-lived TCP connection that lets client and server send messages to each other at any time, in either direction, without the request/response back-and-forth of plain HTTP.</td></tr>
+<tr><td><strong>REST</strong></td><td>An HTTP API style where each request is a self-contained call to a resource URL (<code>GET /v1/games</code>) — used here for things that aren't a continuous session (auth, profile, match history), while the WebSocket carries the live game.</td></tr>
+<tr><td><strong>JWT</strong></td><td>JSON Web Token — a signed, tamper-evident blob of claims (e.g. "this is guest player p_9f3c") a client can hold and present, without the server needing to look it up in a session store.</td></tr>
+<tr><td><strong>idempotent</strong></td><td>An operation that has the same effect no matter how many times it's repeated — important for anything a flaky network might cause a client to retry.</td></tr>
+<tr><td><strong>redaction (server-authoritative view)</strong></td><td>The server holds the full game state but sends each player only what they're allowed to see (their own cards in full, everyone else's as a count) — the client never receives data it isn't entitled to.</td></tr>
+<tr><td><strong>horizontal scaling</strong></td><td>Handling more load by running more copies of a stateless(ish) server behind a load balancer, instead of making one machine bigger.</td></tr>
+<tr><td><strong>UDP broadcast</strong></td><td>Sending one network packet to every device on the local network segment at once, with no guarantee of delivery — used here so a phone can announce "I'm hosting a table" without knowing anyone's address in advance.</td></tr>
+<tr><td><strong>CI/CD</strong></td><td>Continuous Integration/Continuous Deployment — automatically running tests (and often deploying) on every code change, usually via a hosted pipeline like GitHub Actions.</td></tr>
+</table>
+
+</main>
+</div>
+<script>var TUT_BASE = "./";</script>
+<script src="js/app.js"></script>
+</body>
+</html>
