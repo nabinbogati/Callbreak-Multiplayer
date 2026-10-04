@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart' show Icons;
 import 'package:flutter/widgets.dart';
 
 import '../../design/metrics.dart';
+import '../../design/motion.dart';
 import '../../design/tokens.dart';
 import '../../engine/game.dart';
 import 'playing_card_view.dart';
@@ -17,8 +19,12 @@ enum SeatSlot { bottom, left, top, right }
 SeatSlot slotFor({required int seat, required int? viewer}) =>
     SeatSlot.values[(seat - (viewer ?? 0) + 4) % 4];
 
-/// Avatar plus name/bid plate for one player around the table.
-class SeatView extends StatelessWidget {
+/// Avatar plus name and bid plates for one player around the table.
+///
+/// Also the place the table talks about a player: a ring that pings when
+/// their turn comes, a speech bubble when they bid, and a "+1" that floats
+/// off their score when they take a trick.
+class SeatView extends StatefulWidget {
   const SeatView({
     super.key,
     required this.player,
@@ -31,6 +37,7 @@ class SeatView extends StatelessWidget {
     this.isHost = false,
     this.deadline,
     this.handCount,
+    this.axis,
   });
 
   final PlayerInfo player;
@@ -46,45 +53,113 @@ class SeatView extends StatelessWidget {
   final bool isHost;
 
   /// When this seat's turn runs out, on the device's clock. Null unless the
-  /// seat is on the clock and a real person is being waited for — a bot's turn,
-  /// or a seat already playing itself, has nothing worth counting down.
+  /// seat is on the clock and a real person is being waited for.
   final DateTime? deadline;
 
-  /// How many cards this seat holds, for the face-down fan shown in front of an
-  /// opponent's avatar. Null (or the bottom/self seat, whose hand is on screen
-  /// as the real face-up fan) renders no fan.
+  /// How many cards this seat holds, for the face-down fan in front of an
+  /// opponent's avatar. Null (and always for the bottom seat) renders none.
   final int? handCount;
 
-  bool get _isYou => slot == SeatSlot.bottom;
+  /// Lays the plates out beside the avatar (horizontal) or above and below it
+  /// (vertical). Defaults by side: across for top/bottom, stacked for the
+  /// side seats, whose fans open sideways.
+  final Axis? axis;
+
+  @override
+  State<SeatView> createState() => _SeatViewState();
+}
+
+class _SeatViewState extends State<SeatView> {
+  /// The bid just announced, shown in a bubble for a moment.
+  int? _announcedBid;
+  Timer? _bubbleTimer;
+
+  bool get _isYou => widget.slot == SeatSlot.bottom;
+
+  @override
+  void didUpdateWidget(SeatView old) {
+    super.didUpdateWidget(old);
+    final bid = widget.bid;
+    if (old.bid == null && bid != null && !_isYou) {
+      _announcedBid = bid;
+      _bubbleTimer?.cancel();
+      _bubbleTimer = Timer(const Duration(milliseconds: 1500), () {
+        if (mounted) setState(() => _announcedBid = null);
+      });
+    } else if (bid == null && _announcedBid != null) {
+      _bubbleTimer?.cancel();
+      _announcedBid = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _bubbleTimer?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
-    final avatar = _Avatar(
-      player: player,
-      palette: palette,
-      isYou: _isYou,
-      isTurn: isTurn,
-      deadline: deadline,
-      size: _isYou ? m.sc(46, 45) : m.sc(38, 39),
-      slot: slot,
-      handCount: _isYou ? null : handCount,
+    final slot = widget.slot;
+    final avatarSize = _isYou ? m.sc(44, 42) : m.sc(44, 40);
+    final avatar = RepaintBoundary(
+      child: _Avatar(
+        player: widget.player,
+        palette: widget.palette,
+        isYou: _isYou,
+        isTurn: widget.isTurn,
+        deadline: widget.deadline,
+        size: avatarSize,
+        slot: slot,
+        handCount: _isYou ? null : widget.handCount,
+      ),
     );
-    final nameChip = _NameChip(player: player, isDealer: isDealer, isHost: isHost);
-    final bidChip = _BidChip(bid: bid, tricksWon: tricksWon);
+    final nameChip = _NameChip(
+      player: widget.player,
+      isDealer: widget.isDealer,
+      isHost: widget.isHost,
+      highlighted: widget.isTurn,
+    );
+    final bidChip = _BidChip(bid: widget.bid, tricksWon: widget.tricksWon);
+    final gap = SizedBox(width: m.sc(6, 4), height: m.sc(5, 3));
 
-    final gap = SizedBox(width: m.sc(6, 4), height: m.sc(6, 4));
+    final axis =
+        widget.axis ??
+        (slot == SeatSlot.left || slot == SeatSlot.right
+            ? Axis.vertical
+            : Axis.horizontal);
+    final body = Flex(
+      direction: axis,
+      mainAxisSize: MainAxisSize.min,
+      children: [nameChip, gap, avatar, gap, bidChip],
+    );
 
-    return switch (slot) {
-      SeatSlot.top || SeatSlot.bottom => Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [nameChip, gap, avatar, gap, bidChip],
-      ),
-      SeatSlot.left || SeatSlot.right => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [nameChip, gap, avatar, gap, bidChip],
-      ),
-    };
+    final bubble = _BidBubble(bid: _announcedBid, slot: slot);
+    return Stack(
+      clipBehavior: Clip.none,
+      alignment: Alignment.center,
+      children: [
+        body,
+        // Speech bubbles open toward the middle of the table, where there is
+        // room and where the eye already is.
+        switch (slot) {
+          SeatSlot.top => Positioned(top: avatarSize + m.s(40), child: bubble),
+          SeatSlot.left => Positioned(
+            left: avatarSize + m.s(34),
+            child: bubble,
+          ),
+          SeatSlot.right => Positioned(
+            right: avatarSize + m.s(34),
+            child: bubble,
+          ),
+          SeatSlot.bottom => Positioned(
+            bottom: avatarSize + m.s(8),
+            child: bubble,
+          ),
+        },
+      ],
+    );
   }
 }
 
@@ -106,49 +181,24 @@ class _Avatar extends StatelessWidget {
   final bool isTurn;
   final DateTime? deadline;
   final double size;
-
-  /// Which side of the table this seat is on, so the face-down hand fan can
-  /// open toward the table centre.
   final SeatSlot slot;
-
-  /// Cards held by this seat; null/0 hides the fan (the self seat never gets
-  /// one — its real hand is already on screen).
   final int? handCount;
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
-    final ring = size + m.s(8);
+    final ring = size + m.s(10);
 
     return SizedBox(
       width: ring,
       height: ring,
       child: Stack(
         alignment: Alignment.center,
-        // The face-down hand fan opens out past the ring toward the table, so
-        // the cards must not be clipped at the avatar's edge.
+        // The face-down hand fan opens out past the ring toward the table.
         clipBehavior: Clip.none,
         children: [
           ..._handFanCards(m),
-          // Turn ring — animates in so the eye catches whose turn it is.
-          AnimatedOpacity(
-            opacity: isTurn ? 1 : 0,
-            duration: const Duration(milliseconds: 220),
-            child: Container(
-              width: ring,
-              height: ring,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(
-                  color: AppColors.gold.withValues(alpha: 0.9),
-                  width: 2,
-                ),
-                boxShadow: [
-                  BoxShadow(color: AppColors.gold.withValues(alpha: 0.5), blurRadius: 14),
-                ],
-              ),
-            ),
-          ),
+          _TurnRing(active: isTurn, diameter: ring),
           Container(
             width: size,
             height: size,
@@ -156,32 +206,44 @@ class _Avatar extends StatelessWidget {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
                 colors: isYou
-                    ? const [AppColors.gold, AppColors.goldDeep]
-                    : palette.avatar,
+                    ? const [
+                        AppColors.goldLight,
+                        AppColors.goldMid,
+                        AppColors.goldDeep,
+                      ]
+                    : [
+                        Color.lerp(
+                          palette.avatar.first,
+                          const Color(0xFFFFFFFF),
+                          0.12,
+                        )!,
+                        palette.avatar.first,
+                        palette.avatar.last,
+                      ],
               ),
               border: Border.all(
                 color: isYou
-                    ? AppColors.goldLight.withValues(alpha: 0.9)
-                    : AppColors.textMuted.withValues(alpha: 0.3),
-                width: isYou ? 2 : 1.5,
+                    ? AppColors.goldLight.withValues(alpha: 0.95)
+                    : AppColors.goldBorder.withValues(
+                        alpha: isTurn ? 0.9 : 0.35,
+                      ),
+                width: isYou ? 2 : 1.6,
               ),
-              boxShadow: const [
-                BoxShadow(color: Color(0x73000000), blurRadius: 10, offset: Offset(0, 3)),
-              ],
+              boxShadow: AppShadows.low,
             ),
             child: Text(
               player.initial,
               style: AppText.bold(
-                size * (isYou ? 0.37 : 0.37),
+                size * 0.42,
                 isYou ? AppColors.onGold : AppColors.textOnDark,
               ),
             ),
           ),
           // Offline: veil the avatar so an absent player is obvious even in
-          // peripheral vision, rather than only on close inspection.
+          // peripheral vision.
           if (!player.connected)
             Container(
               width: size,
@@ -198,37 +260,31 @@ class _Avatar extends StatelessWidget {
               ),
             ),
 
-          // A bot is driving this seat — the occupant is a bot outright, or their
-          // connection dropped and the table has stopped waiting for them. This
-          // is the pair to the wifi-off veil above: "they are gone" and, at the
-          // same time, "their hand is not stalled because of it".
+          // A bot is driving this seat — the occupant is a bot outright, or
+          // their connection dropped and the table stopped waiting for them.
           if (player.isBot || !player.connected)
             Align(
               alignment: Alignment.topLeft,
-              child: _BotBadge(size: size * 0.34),
+              child: _BotBadge(size: size * 0.36),
             ),
 
-          // Autoplay: the player is still here, still connected, but the table
-          // stopped waiting for them. That is a different thing from being
-          // offline and gets its own mark rather than reusing the scrim — the
-          // seat is one tap away from being theirs again.
+          // Autoplay: still here and connected, but the table stopped waiting.
+          // One tap away from being theirs again, so a different corner.
           if (player.autoplay && player.connected)
             Align(
               alignment: Alignment.topRight,
-              child: _BotBadge(size: size * 0.34),
+              child: _BotBadge(size: size * 0.36),
             ),
 
-          // Presence lamp, for human seats only — a bot is never "online" in
-          // any sense a player cares about, and a dot on every seat would say
-          // nothing. Its presence therefore also reads as "this is a person".
+          // Presence lamp, for human seats only.
           if (!player.isBot)
             Align(
               alignment: Alignment.bottomRight,
               child: _PresenceDot(online: player.connected, size: size * 0.28),
             ),
 
-          // Last, so the clock draws over the avatar and both badges — when it
-          // is on screen at all it is the most urgent thing on the table.
+          // Last, so the clock draws over everything — when it shows at all it
+          // is the most urgent thing on the table.
           if (deadline case final due?)
             TurnClock(deadline: due, diameter: ring, audible: isYou),
         ],
@@ -237,25 +293,18 @@ class _Avatar extends StatelessWidget {
   }
 
   /// The opponent's face-down hand, fanned in an arc in front of their avatar
-  /// (toward the table centre). The avatar's centre is the fan's pivot: every
-  /// card's held edge sits there and the card reaches one card-height toward
-  /// the table, rotated around the pivot — so the far ends trace a clean arc,
-  /// just like cards spread in a hand. Each seat gets the same arrangement,
-  /// turned to face its own direction of the table.
+  /// (toward the table centre), pivoting on the avatar's centre.
   List<Widget> _handFanCards(Metrics m) {
     final count = handCount ?? 0;
     if (count <= 0 || isYou) return const [];
 
-    final cardWidth = m.sc(26, 22);
+    final cardWidth = m.sc(24, 20);
     final cardHeight = cardWidth * CardBackView.aspect;
-    final ring = size + m.s(8);
+    final ring = size + m.s(10);
     final cx = ring / 2;
     final cy = ring / 2;
-    // Total fan angle in radians; a full hand opens to ~100°.
-    final sweep = (count - 1) * 0.15;
+    final sweep = (count - 1) * 0.13;
 
-    // The forward direction (toward the table centre) and the base rotation
-    // that points a card's long axis along it.
     final (double fx, double fy, double base) = switch (slot) {
       SeatSlot.top => (0.0, 1.0, 0.0),
       SeatSlot.left => (1.0, 0.0, -math.pi / 2),
@@ -269,12 +318,10 @@ class _Avatar extends StatelessWidget {
           builder: (context) {
             final t = count == 1 ? 0.0 : (i / (count - 1)) - 0.5;
             final theta = t * sweep;
-            // The card's held edge sits on the pivot; the body reaches toward
-            // the table, rotated by theta around the pivot.
             final dirX = fx * math.cos(theta) - fy * math.sin(theta);
             final dirY = fx * math.sin(theta) + fy * math.cos(theta);
-            final centerX = cx + dirX * (cardHeight / 2);
-            final centerY = cy + dirY * (cardHeight / 2);
+            final centerX = cx + dirX * (cardHeight * 0.55);
+            final centerY = cy + dirY * (cardHeight * 0.55);
             return Positioned(
               left: centerX - cardWidth / 2,
               top: centerY - cardHeight / 2,
@@ -283,8 +330,7 @@ class _Avatar extends StatelessWidget {
                 child: CardBackView(
                   width: cardWidth,
                   palette: palette,
-                  // Only the frontmost card casts a shadow, so the overlap of
-                  // the fan reads as held cards, not a smear of shadows.
+                  // Only the frontmost card casts a shadow.
                   shadow: i == count - 1,
                 ),
               ),
@@ -295,9 +341,151 @@ class _Avatar extends StatelessWidget {
   }
 }
 
-/// Marks a seat the table is playing on its occupant's behalf — a permanent
-/// bot, a player whose connection dropped, or one who stopped responding. The
-/// robot reads as "somebody is being played for", whatever the reason.
+/// The ring round the seat whose turn it is. It pings once — a ripple
+/// spreading off the avatar — the moment the turn arrives, then holds as a
+/// steady glow: loud enough to catch the eye at the change, calm while the
+/// player thinks. (A forever-looping pulse would also never let a widget test
+/// settle.)
+class _TurnRing extends StatefulWidget {
+  const _TurnRing({required this.active, required this.diameter});
+
+  final bool active;
+  final double diameter;
+
+  @override
+  State<_TurnRing> createState() => _TurnRingState();
+}
+
+class _TurnRingState extends State<_TurnRing>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ping = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 750),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.active) _ping.forward();
+  }
+
+  @override
+  void didUpdateWidget(_TurnRing old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) _ping.forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    _ping.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = widget.diameter;
+    return AnimatedOpacity(
+      opacity: widget.active ? 1 : 0,
+      duration: const Duration(milliseconds: 220),
+      child: AnimatedBuilder(
+        animation: _ping,
+        builder: (context, _) {
+          final t = Motion.enter.transform(_ping.value);
+          final pinging = _ping.isAnimating;
+          return Stack(
+            alignment: Alignment.center,
+            clipBehavior: Clip.none,
+            children: [
+              if (pinging)
+                Container(
+                  width: d * (1 + 0.55 * t),
+                  height: d * (1 + 0.55 * t),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: AppColors.turnGlow.withValues(
+                        alpha: 0.8 * (1 - t),
+                      ),
+                      width: 2,
+                    ),
+                  ),
+                ),
+              Container(
+                width: d,
+                height: d,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: AppColors.turnGlow, width: 2.2),
+                  boxShadow: AppShadows.glow(
+                    AppColors.turnGlow,
+                    strength: 1.1,
+                    blur: 16,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// "Bid 4" in a speech bubble, popping out of a seat for a moment when that
+/// player commits to their bid.
+class _BidBubble extends StatelessWidget {
+  const _BidBubble({required this.bid, required this.slot});
+
+  final int? bid;
+  final SeatSlot slot;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Metrics.of(context);
+    final value = bid;
+    return IgnorePointer(
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 260),
+        switchInCurve: Curves.easeOutBack,
+        switchOutCurve: Curves.easeIn,
+        transitionBuilder: (child, animation) => FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(scale: animation, child: child),
+        ),
+        child: value == null
+            ? const SizedBox.shrink()
+            : Container(
+                key: ValueKey(value),
+                padding: EdgeInsets.symmetric(
+                  horizontal: m.s(11),
+                  vertical: m.s(6),
+                ),
+                decoration: BoxDecoration(
+                  gradient: goldButtonGradient,
+                  borderRadius: BorderRadius.circular(m.s(12)),
+                  boxShadow: AppShadows.glow(AppColors.goldDeep, strength: 0.8),
+                ),
+                child: Text.rich(
+                  TextSpan(
+                    children: [
+                      TextSpan(
+                        text: 'Bid ',
+                        style: AppText.semiBold(m.s(11), AppColors.onGold),
+                      ),
+                      TextSpan(
+                        text: '$value',
+                        style: AppText.bold(m.s(15), AppColors.onGold),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+}
+
+/// Marks a seat the table is playing on its occupant's behalf.
 class _BotBadge extends StatelessWidget {
   const _BotBadge({required this.size});
 
@@ -311,19 +499,19 @@ class _BotBadge extends StatelessWidget {
       alignment: Alignment.center,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: const Color(0xE60A1207),
+        color: const Color(0xF00A1207),
         border: Border.all(color: AppColors.goldMid, width: size * 0.09),
       ),
-      child: Icon(Icons.smart_toy_outlined, size: size * 0.58, color: AppColors.goldMid),
+      child: Icon(
+        Icons.smart_toy_outlined,
+        size: size * 0.58,
+        color: AppColors.goldMid,
+      ),
     );
   }
 }
 
 /// A small lamp showing whether a seated player is reachable.
-///
-/// The ring is what makes it legible: the felt, the avatar gradients and the
-/// themes all vary, so the dot needs its own dark border to keep its shape
-/// against any of them.
 class _PresenceDot extends StatelessWidget {
   const _PresenceDot({required this.online, required this.size});
 
@@ -353,27 +541,26 @@ class _PresenceDot extends StatelessWidget {
   }
 }
 
-/// Small dark panel shared by [_NameChip] and [_BidChip] so the pair reads
-/// as a matched set flanking the avatar.
+/// Dark glass plate shared by the name and bid chips.
 class _Chip extends StatelessWidget {
-  const _Chip({required this.padding, required this.child});
+  const _Chip({required this.padding, required this.child, this.border});
 
   final EdgeInsets padding;
   final Widget child;
+  final Color? border;
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
 
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
       padding: padding,
       decoration: BoxDecoration(
-        color: const Color(0xD104120D),
-        border: Border.all(color: AppColors.hairline),
-        borderRadius: BorderRadius.circular(m.sc(11, 8)),
-        boxShadow: const [
-          BoxShadow(color: Color(0x73000000), blurRadius: 12, offset: Offset(0, 4)),
-        ],
+        color: const Color(0xE0061410),
+        border: Border.all(color: border ?? AppColors.hairlineStrong),
+        borderRadius: BorderRadius.circular(m.sc(10, 8)),
+        boxShadow: AppShadows.low,
       ),
       child: child,
     );
@@ -381,56 +568,77 @@ class _Chip extends StatelessWidget {
 }
 
 class _NameChip extends StatelessWidget {
-  const _NameChip({required this.player, required this.isDealer, required this.isHost});
+  const _NameChip({
+    required this.player,
+    required this.isDealer,
+    required this.isHost,
+    required this.highlighted,
+  });
 
   final PlayerInfo player;
   final bool isDealer;
   final bool isHost;
 
+  /// Their turn — the plate's border warms to match the ring.
+  final bool highlighted;
+
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
+    final badge = m.sc(14, 11);
 
     return _Chip(
-      padding: EdgeInsets.symmetric(horizontal: m.sc(8, 6), vertical: m.sc(4, 3)),
+      border: highlighted ? AppColors.turnGlow.withValues(alpha: 0.7) : null,
+      padding: EdgeInsets.symmetric(
+        horizontal: m.sc(8, 6),
+        vertical: m.sc(4, 3),
+      ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Host badge leads the name so it reads as a title, and sits apart
-          // from the transient dealer mark trailing it.
           if (isHost) ...[
             Container(
-              width: m.sc(13, 10),
-              height: m.sc(13, 10),
+              width: badge,
+              height: badge,
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: AppColors.gold.withValues(alpha: 0.18),
                 borderRadius: BorderRadius.circular(m.sc(4, 3)),
               ),
-              child: Icon(Icons.workspace_premium_rounded, size: m.sc(9, 7), color: AppColors.gold),
+              child: Icon(
+                Icons.workspace_premium_rounded,
+                size: badge * 0.72,
+                color: AppColors.gold,
+              ),
             ),
             SizedBox(width: m.sc(4, 3)),
           ],
           ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: m.sc(84, 62)),
+            constraints: BoxConstraints(maxWidth: m.sc(84, 64)),
             child: Text(
               player.name,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: AppText.semiBold(m.sc(11, 9), AppColors.textPrimary),
+              style: AppText.semiBold(
+                m.sc(11.5, 10),
+                highlighted ? AppColors.goldLight : AppColors.textPrimary,
+              ),
             ),
           ),
           if (isDealer) ...[
             SizedBox(width: m.sc(4, 3)),
             Container(
-              width: m.sc(13, 10),
-              height: m.sc(13, 10),
+              width: badge,
+              height: badge,
               alignment: Alignment.center,
               decoration: BoxDecoration(
-                color: AppColors.gold.withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(m.sc(4, 3)),
+                gradient: goldButtonGradient,
+                borderRadius: BorderRadius.circular(badge / 2),
               ),
-              child: Text('D', style: AppText.bold(m.sc(8, 7), AppColors.gold)),
+              child: Text(
+                'D',
+                style: AppText.bold(badge * 0.6, AppColors.onGold),
+              ),
             ),
           ],
         ],
@@ -439,43 +647,149 @@ class _NameChip extends StatelessWidget {
   }
 }
 
-class _BidChip extends StatelessWidget {
+/// Tricks won against the bid, as "won/bid" with a thin progress bar under it.
+/// Turns green with a check once the bid is made, and floats a "+1" off itself
+/// whenever a trick is taken.
+class _BidChip extends StatefulWidget {
   const _BidChip({required this.bid, required this.tricksWon});
 
   final int? bid;
   final int tricksWon;
 
   @override
+  State<_BidChip> createState() => _BidChipState();
+}
+
+class _BidChipState extends State<_BidChip>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pop = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 800),
+  );
+
+  @override
+  void didUpdateWidget(_BidChip old) {
+    super.didUpdateWidget(old);
+    if (widget.tricksWon > old.tricksWon) _pop.forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    _pop.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
-    final made = bid != null && tricksWon >= bid!;
+    final bid = widget.bid;
+    final won = widget.tricksWon;
+    final made = bid != null && won >= bid;
+    final progress = bid == null || bid == 0
+        ? 0.0
+        : (won / bid).clamp(0.0, 1.0);
+    final accent = made ? AppColors.success : AppColors.gold;
 
-    return _Chip(
-      padding: EdgeInsets.symmetric(horizontal: m.sc(7, 5), vertical: m.sc(4, 3)),
-      child: Row(
+    final chip = _Chip(
+      border: made ? AppColors.success.withValues(alpha: 0.6) : null,
+      padding: EdgeInsets.fromLTRB(
+        m.sc(8, 6),
+        m.sc(4, 3),
+        m.sc(8, 6),
+        m.sc(4, 3),
+      ),
+      child: Column(
         mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.baseline,
-        textBaseline: TextBaseline.alphabetic,
         children: [
-          Text(bid?.toString() ?? '–', style: AppText.bold(m.sc(12, 10), AppColors.gold)),
-          SizedBox(width: m.sc(3, 2)),
-          Text(
-            '/',
-            style: AppText.semiBold(
-              m.sc(11, 9),
-              AppColors.textPrimary.withValues(alpha: 0.35),
-            ),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              if (made) ...[
+                Icon(
+                  Icons.check_rounded,
+                  size: m.sc(12, 10),
+                  color: AppColors.success,
+                ),
+                SizedBox(width: m.sc(2, 1)),
+              ],
+              Text(
+                bid == null ? '–' : '$won',
+                style: AppText.bold(
+                  m.sc(13, 11),
+                  bid == null ? AppColors.textMuted : accent,
+                ),
+              ),
+              Text(
+                bid == null ? '' : '/$bid',
+                style: AppText.semiBold(
+                  m.sc(11, 9.5),
+                  AppColors.textPrimary.withValues(alpha: 0.6),
+                ),
+              ),
+            ],
           ),
-          SizedBox(width: m.sc(3, 2)),
-          Text(
-            '$tricksWon',
-            style: AppText.bold(
-              m.sc(12, 10),
-              made ? AppColors.success : AppColors.textOnDark,
+          if (bid != null) ...[
+            SizedBox(height: m.sc(3, 2)),
+            Container(
+              width: m.sc(26, 20),
+              height: m.sc(3, 2.5),
+              alignment: Alignment.centerLeft,
+              decoration: BoxDecoration(
+                color: AppColors.hairlineStrong,
+                borderRadius: BorderRadius.circular(2),
+              ),
+              child: AnimatedFractionallySizedBox(
+                duration: const Duration(milliseconds: 320),
+                curve: Motion.emphasized,
+                widthFactor: progress,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: accent,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
             ),
-          ),
+          ],
         ],
       ),
+    );
+
+    return AnimatedBuilder(
+      animation: _pop,
+      child: chip,
+      builder: (context, child) {
+        final t = _pop.value;
+        final popping = _pop.isAnimating;
+        final bump = popping
+            ? 0.18 * math.sin(math.pi * (t * 2.5).clamp(0.0, 1.0))
+            : 0.0;
+        return Stack(
+          clipBehavior: Clip.none,
+          alignment: Alignment.center,
+          children: [
+            Transform.scale(scale: 1 + bump, child: child),
+            if (popping)
+              Positioned(
+                top: -m.s(14) - m.s(18) * Motion.enter.transform(t),
+                child: IgnorePointer(
+                  child: Opacity(
+                    opacity: (1 - t).clamp(0.0, 1.0),
+                    child: Text(
+                      '+1',
+                      style: AppText.bold(m.s(14), AppColors.turnGlow).copyWith(
+                        shadows: const [
+                          Shadow(color: Color(0xCC000000), blurRadius: 6),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
     );
   }
 }

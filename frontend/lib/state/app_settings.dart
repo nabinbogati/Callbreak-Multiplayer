@@ -49,6 +49,8 @@ class AppSettings extends ChangeNotifier {
   bool _autoThrowLastSuitCard = true;
   bool _musicEnabled = true;
   bool _sfxEnabled = true;
+  bool _hapticsEnabled = true;
+  bool _tapTwiceToPlay = false;
   AnimationSpeed _animationSpeed = AnimationSpeed.normal;
   bool _debugMode = false;
 
@@ -98,6 +100,17 @@ class AppSettings extends ChangeNotifier {
 
   /// Whether card-play and trick-collect sound effects play. Defaults on.
   bool get sfxEnabled => _sfxEnabled;
+
+  /// Whether the table answers touches with a short vibration — a tick as
+  /// the finger slides from card to card, a thump when one is thrown. Defaults
+  /// on; it is the cheapest way to make a card feel picked up.
+  bool get hapticsEnabled => _hapticsEnabled;
+
+  /// Whether a tap only raises a card, and a second tap on the raised card
+  /// plays it. Off by default, so one tap plays as it always has; players who
+  /// keep misfiring on a crowded fan can opt into the safety catch. Dragging
+  /// a card toward the table always plays it straight away either way.
+  bool get tapTwiceToPlay => _tapTwiceToPlay;
 
   /// Relative speed of transient UI animations. Defaults to normal (1.0x).
   AnimationSpeed get animationSpeed => _animationSpeed;
@@ -187,6 +200,18 @@ class AppSettings extends ChangeNotifier {
     notifyListeners();
   }
 
+  set hapticsEnabled(bool value) {
+    if (_hapticsEnabled == value) return;
+    _hapticsEnabled = value;
+    notifyListeners();
+  }
+
+  set tapTwiceToPlay(bool value) {
+    if (_tapTwiceToPlay == value) return;
+    _tapTwiceToPlay = value;
+    notifyListeners();
+  }
+
   set animationSpeed(AnimationSpeed value) {
     if (_animationSpeed == value) return;
     _animationSpeed = value;
@@ -207,6 +232,15 @@ class SettingsScope extends InheritedNotifier<AppSettings> {
 
   static AppSettings of(BuildContext context) {
     final scope = context.dependOnInheritedWidgetOfExactType<SettingsScope>();
+    assert(scope != null, 'No SettingsScope found in context');
+    return scope!.notifier!;
+  }
+
+  /// Like [of], without subscribing the caller to changes — for gesture
+  /// callbacks and timers, which read a setting once and must not register a
+  /// rebuild dependency from outside a build.
+  static AppSettings read(BuildContext context) {
+    final scope = context.getInheritedWidgetOfExactType<SettingsScope>();
     assert(scope != null, 'No SettingsScope found in context');
     return scope!.notifier!;
   }

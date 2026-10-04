@@ -3,11 +3,12 @@ import 'dart:math' as math;
 
 import 'package:clock/clock.dart';
 import 'package:flutter/foundation.dart'
-    show kDebugMode, listEquals, debugPrint;
+    show kDebugMode, listEquals, debugPrint, ValueListenable;
 import 'package:flutter/material.dart';
 
 import '../../audio/audio_controller.dart';
 import '../../design/metrics.dart';
+import '../../design/motion.dart';
 import '../../design/tokens.dart';
 import '../../engine/card.dart';
 import '../../engine/game.dart';
@@ -17,8 +18,10 @@ import '../../net/remote_session.dart' show kQuickplayRoom, RemoteSession;
 import '../../net/session.dart';
 import '../../state/active_game_binding.dart' show wireActiveGamePersistence;
 import '../../state/app_settings.dart';
+import '../haptics.dart';
 import '../widgets/backdrop.dart';
 import '../widgets/bid_panel.dart';
+import '../widgets/buttons.dart';
 import '../widgets/felt_table.dart';
 import '../widgets/hand_fan.dart';
 import '../widgets/playing_card_view.dart';
@@ -26,6 +29,7 @@ import '../widgets/pulse_ripple.dart';
 import '../widgets/quick_settings_panel.dart';
 import '../widgets/round_history.dart';
 import '../widgets/scoreboard.dart';
+import '../widgets/suit_glyph.dart';
 import 'settings_sheet.dart' show RoundsCard;
 import '../widgets/seat_view.dart';
 import '../widgets/winner_screen.dart';
@@ -43,147 +47,90 @@ class TableScreen extends StatefulWidget {
   State<TableScreen> createState() => _TableScreenState();
 }
 
+/// The width of the player's own hand cards. Shared by the hand area and the
+/// throw-flight layer, which starts each thrown card at the size it left at.
+double _handCardWidth(Metrics m) => m.sc(58, 62);
+
+/// How long a thrown card may wait, landed, for the table to confirm it
+/// before it is treated as refused and handed back to the hand.
+const _throwConfirmTimeout = Duration(milliseconds: 2500);
+
 class _TableScreenState extends State<TableScreen> {
   bool _showRoundHistory = false;
 
-  /// Game-event subscription for table sounds (a card lands, a trick is won).
-  /// Fired from the session's event stream so it covers local throws, bots and
-  /// remote plays alike.
+  /// Game-event subscription for table sounds and haptics.
   StreamSubscription<GameEvent>? _eventsSub;
 
-  // Persist for the whole screen's lifetime (not recreated on every build)
-  // so the GlobalKeys stay attached to the same seat/hand widgets across
-  // rebuilds — TrickCluster measures real on-screen positions through these.
+  // Persist for the whole screen's lifetime so the GlobalKeys stay attached
+  // to the same seat/felt widgets across rebuilds — TrickCluster and the
+  // flight layers measure real on-screen positions through these.
   final Map<SeatSlot, GlobalKey> _seatKeys = {
     for (final slot in SeatSlot.values) slot: GlobalKey(),
   };
   final GlobalKey _feltStackKey = GlobalKey();
 
-  /// Key for the outer table Stack (built in [_TableBody]) — the flight
-  /// layer positions itself relative to this, since (unlike the felt or the
-  /// hand) it's a common ancestor of both and painted last, on top of both.
+  /// Key for the outer table Stack — the flight layers position themselves
+  /// relative to this, since it is a common ancestor of the felt and the hand
+  /// and paints on top of both.
   final GlobalKey _tableStackKey = GlobalKey();
 
-  /// Where this client's own thrown cards should start their arc, keyed by
-  /// [PlayingCard.id] and expressed relative to the felt's centre (the same
-  /// origin [TrickCluster.seatAnchors] already uses). Populated the moment a
-  /// card leaves the hand — see [_handleCardThrown] — so the throw reads as
-  /// coming from wherever the gesture actually released it rather than from
-  /// the seat avatar. Pruned as tricks clear so it never grows unbounded.
+  /// Where this client's own thrown cards started, keyed by card id, relative
+  /// to the felt's centre. Pruned as tricks clear.
   final Map<String, Offset> _throwOrigins = {};
 
-  /// This client's own thrown cards still mid-entrance, keyed by
-  /// [PlayingCard.id]. A local throw starts right next to (or under) the
-  /// remaining hand, and the felt is painted before the hand in the widget
-  /// tree — so [TrickCluster]'s own copy of the card would render *behind*
-  /// the hand for that first stretch. Instead it's kept invisible
-  /// ([TrickCluster.hiddenIds]) and a [_ThrowFlight] renders the entrance in
-  /// the outer table Stack instead, which paints above everything. Entries
-  /// remove themselves once that entrance finishes — see [_handleCardThrown].
+  /// This client's own thrown cards currently drawn by the top-level flight
+  /// layer (above the hand), keyed by card id. A flight runs its path, then
+  /// holds at rest until the table confirms the play — on a networked table
+  /// that is a round trip away — so the handoff to [TrickCluster] is seamless
+  /// however long the confirmation takes.
   final Map<String, _Flight> _flights = {};
 
+  /// Card ids that arrived via a flight: [TrickCluster] mounts them already at
+  /// rest instead of replaying the throw. Pruned alongside throw origins.
+  final Set<String> _flownIds = {};
+
+  /// Watches landed flights the table has not confirmed yet.
+  Timer? _flightCheck;
+
   /// Viewer-seat plays already on the table when this table first observed a
-  /// trick — a rejoin lands mid-hand and must not re-fly those cards. Set on
-  /// the first [_maybeStartAutoplayFlight], pruned alongside throw origins
-  /// once the trick clears.
+  /// trick — a rejoin lands mid-hand and must not re-fly those cards.
   Set<String>? _seenViewerPlayIds;
 
-  /// Cached from the most recent build's [MetricsScope] — [_handleCardThrown]
-  /// fires from a gesture callback, outside any build, and needs it to
-  /// reproduce [_Felt]'s own card-size formula for [_flightTargetGlobal].
+  /// Cached from the most recent build's [MetricsScope] — gesture callbacks
+  /// run outside build and need it for the flight geometry.
   Metrics? _metrics;
 
-  /// The last hand we saw the session deal, so [_onSessionChanged] can spot a
-  /// brand-new hand and play the dealing flourish. Null until the first deal.
+  /// The last hand we saw the session deal, so a brand-new hand plays the
+  /// dealing flourish exactly once.
   int? _lastDealtHand;
 
   /// Whether this table was opened to reclaim a seat in a game already under
-  /// way (the "Rejoin your game?" path), detected from the constructor-passed
-  /// [RemoteSession.resumeToken] before any `joined` frame can reissue one.
-  ///
-  /// Consumed by the first deal attempt: only the hand that was already dealt
-  /// while the app was away is skipped, so every hand (and game) after it still
-  /// plays its dealing flourish. A rejoin that lands on a freshly dealt hand
-  /// therefore only misses that one animation, never the ones that follow.
+  /// way (the "Rejoin your game?" path). Consumed by the first deal attempt.
   late bool _rejoined;
 
-  /// A key that changes every time a deal starts, so [_DealOverlay] re-runs its
-  /// entrance for each new hand. Null while no deal is being animated.
+  /// Changes every time a deal starts, so [_DealOverlay] re-runs for each new
+  /// hand. Null while no deal is being animated.
   Key? _dealKey;
 
-  /// How many of the local player's 13 cards the hand fan has revealed so far
-  /// during the current deal. Starts at zero when a deal begins and climbs as
-  /// each card is dealt, so the player's hand is never on screen whole before
-  /// the dealing flourish, and instead fills in card-by-card in real time.
-  /// Always 13 (the full hand) once the deal has finished or no deal is
-  /// running.
-  int _handRevealed = 13;
-
   /// How many cards each seat has been dealt so far during the current deal,
-  /// by seat index. Non-null only while a deal runs — it starts at all-zero
-  /// and climbs as each card lands, so the opponents' face-down fans fill in
-  /// in real time; null once the deal finishes (seats then show their real
-  /// [GameView.handCounts]).
-  List<int>? _dealRevealed;
+  /// by seat index; null once the deal is done. A notifier rather than state
+  /// so the 52 ticks of a deal rebuild only the hand and the seat fans that
+  /// listen to it — not the whole table each time a card lands.
+  final ValueNotifier<List<int>?> _dealProgress = ValueNotifier(null);
 
-  /// Global centre of every resting card slot in the player's hand fan, as
-  /// reported by [HandFan]. The dealing flourish uses these to land each
-  /// flying card on the exact slot the real card will occupy rather than on
-  /// the seat avatar. Null until the fan has been laid out at least once.
-  List<Offset>? _handCardCenters;
+  /// The hand fan's resting slots by card id, as last laid out. The deal lands
+  /// each card on its slot; throw-less plays (autoplay) start from it.
+  Map<String, FanSlot>? _handSlots;
 
-  /// Slot centres of the hand fan as last laid out, aligned with
-  /// [_handSlotIds] (the card ids that occupied them), tracked during play as
-  /// well as dealing. Throw-less plays of the viewer's own seat (autoplay)
-  /// start their top-level flight from the card's actual resting slot here,
-  /// so they follow the same path a finger release would have taken.
-  List<Offset>? _handSlotCenters;
-  List<String>? _handSlotIds;
+  /// A short line of help above the hand — why a card was refused.
+  _HandHint? _hint;
+  Timer? _hintTimer;
 
-  void _onHandSlotsMeasured(List<Offset> centers) {
-    final hand = widget.session.view?.hand;
-    final ids = hand == null ? null : [for (final c in hand) c.id];
-    if (ids == null) return;
-    if (_dealKey != null) {
-      // The dealing flourish needs these to land the player's own cards on
-      // their exact slots; during the deal the fan is laid out for the full
-      // hand, which is also a valid playing-time layout.
-      if (listEquals(centers, _handCardCenters)) return;
-      setState(() {
-        _handCardCenters = centers;
-        _handSlotCenters = centers;
-        _handSlotIds = ids;
-      });
-      return;
-    }
-    // Outside a deal, only the throw-start tracking matters. Ignore reports
-    // from an empty hand (scoreboard, lift) by comparing against what we
-    // already have.
-    if (listEquals(centers, _handSlotCenters)) return;
-    setState(() {
-      _handSlotCenters = centers;
-      _handSlotIds = ids;
-    });
-  }
-
-  /// The last-known global centre of [cardId]'s resting slot in the hand fan,
-  /// or null if it wasn't in the most recently laid-out hand. Used to start
-  /// throw-less flights (autoplay, client auto-throw) from where the card
-  /// actually sat.
-  Offset? _handSlotCenterFor(String cardId) {
-    final ids = _handSlotIds;
-    final centers = _handSlotCenters;
-    if (ids == null || centers == null) return null;
-    final index = ids.indexOf(cardId);
-    if (index < 0 || index >= centers.length) return null;
-    return centers[index];
-  }
-
-  /// The "someone dropped / someone is back" banner currently showing, if any.
-  /// A player's connection changing is easy to miss on a seat avatar alone, so
-  /// it is also announced once, briefly, where the eye already is.
+  /// The "someone dropped / someone is back" banner currently showing.
   _PresenceNotice? _presenceNotice;
   Timer? _presenceTimer;
+
+  void _onHandSlotsMeasured(Map<String, FanSlot> slots) => _handSlots = slots;
 
   void _toggleRoundHistory() =>
       setState(() => _showRoundHistory = !_showRoundHistory);
@@ -194,13 +141,9 @@ class _TableScreenState extends State<TableScreen> {
     unawaited(showQuickSettingsSheet(context));
   }
 
-  /// The "Play again" button at game over.
-  ///
-  /// On a quickplay table this always means going back into matchmaking for a
-  /// fresh set of opponents — never a same-table re-deal. A same-table rematch
-  /// can only re-pit the player against whoever is left at the table, which is
-  /// exactly what the matchmaker exists to avoid. Other modes have no
-  /// matchmaking to return to, so they just re-deal the same seats.
+  /// The "Play again" button at game over. On a quickplay table this always
+  /// means going back into matchmaking for fresh opponents; other modes just
+  /// re-deal the same seats.
   void _handlePlayAgain() {
     if (widget.session.mode == GameMode.online) {
       _startQuickplayRematch();
@@ -210,8 +153,7 @@ class _TableScreenState extends State<TableScreen> {
   }
 
   /// Leaves this (stale) quickplay table and immediately re-enters
-  /// matchmaking against the same server and hand count, so "Play again"
-  /// never boils down to a solo game versus bots.
+  /// matchmaking against the same server and hand count.
   void _startQuickplayRematch() {
     final settings = SettingsScope.of(context);
     final previous = widget.session;
@@ -241,23 +183,17 @@ class _TableScreenState extends State<TableScreen> {
     _rejoined = session is RemoteSession && session.resumeToken != null;
     session.addListener(_onSessionChanged);
     _eventsSub = session.events.listen(_onGameEvent);
-    // A real session may already have dealt by the time this screen builds — a
-    // LocalSession publishes its first (bidding/playing) view from its own
-    // constructor, before this listener exists — so if it has, start the
-    // dealing flourish here rather than waiting for a notify. Otherwise the
-    // full hand would sit on screen for a stretch and only then be covered by
-    // the animation. Test stubs (plain GameSession/NetworkSession subclasses)
-    // present an already-playable view on purpose and are left alone so they
-    // don't get an unexpected dealing overlay.
+    // A real session may already have dealt by the time this screen builds (a
+    // LocalSession publishes from its own constructor), so start the flourish
+    // now rather than letting the full hand flash on screen first. Test stubs
+    // present an already-playable view on purpose and are left alone.
     if (_isRealSession) {
       _maybeStartDeal();
     }
   }
 
-  /// True for the concrete table sessions ([LocalSession], [RemoteSession],
-  /// [LanHostSession]) as opposed to the plain [GameSession] stubs used in
-  /// widget tests. Only those real sessions deal a hand and therefore warrant
-  /// the dealing flourish; a stub hands the table a ready-made view instead.
+  /// True for the concrete table sessions as opposed to the plain
+  /// [GameSession] stubs used in widget tests. Only real sessions deal.
   bool get _isRealSession =>
       widget.session is LocalSession ||
       widget.session is RemoteSession ||
@@ -267,7 +203,10 @@ class _TableScreenState extends State<TableScreen> {
   void dispose() {
     _autoPlayTimer?.cancel();
     _presenceTimer?.cancel();
+    _hintTimer?.cancel();
+    _flightCheck?.cancel();
     _eventsSub?.cancel();
+    _dealProgress.dispose();
     // Leaving mid-deal must not leave the deal loop playing to nobody.
     AudioController.instance?.stopDeal();
     widget.session.removeListener(_onSessionChanged);
@@ -275,18 +214,22 @@ class _TableScreenState extends State<TableScreen> {
     super.dispose();
   }
 
-  /// Turns discrete happenings into table sounds: a card hitting the felt and
-  /// the winner taking the trick.
+  /// Turns discrete happenings into table sounds and touch feedback.
   void _onGameEvent(GameEvent event) {
     if (event is PresenceChanged) {
       _announce(_PresenceNotice.from(event), skipSeat: event.seat);
       return;
     }
     if (event is AutoplayChanged) {
-      // Your own seat is not announced here: it gets the standing banner
-      // instead, which stays up for as long as the condition does.
+      // Your own seat gets the standing banner instead.
       _announce(_PresenceNotice.autoplay(event), skipSeat: event.seat);
       return;
+    }
+
+    if (event is TrickWon &&
+        mounted &&
+        event.seat == widget.session.view?.you) {
+      Haptics.thud(context);
     }
 
     final audio = AudioController.instance;
@@ -302,12 +245,8 @@ class _TableScreenState extends State<TableScreen> {
     }
   }
 
-  /// Whether [card] is a trump landing into a trick that a normal (non-trump)
-  /// suit led — the "the lead suit no longer matters" moment that earns the
-  /// trump flourish. A trick led with trumps is ordinary gameplay, so those
-  /// plays keep just the plain card shot. Safe against a slightly-stale view:
-  /// a trump can only ever read as "into a side suit" when the trick already
-  /// had a non-trump lead in it.
+  /// Whether [card] is a trump landing into a trick that a non-trump suit led
+  /// — the moment that earns the trump flourish.
   bool _isTrumpIntoSideSuit(PlayingCard card) {
     if (!card.isTrump) return false;
     final view = widget.session.view;
@@ -319,17 +258,9 @@ class _TableScreenState extends State<TableScreen> {
     return plays.first.card.suit != trumpSuit;
   }
 
-  /// Shows a notice about somebody else's seat for a few seconds, then lets it
-  /// fade.
-  ///
-  /// [skipSeat] suppresses news about the viewer's own seat: their own
-  /// connection dropping is not something they can act on from here (the
-  /// reconnect overlay covers it), and their own autoplay has a standing banner
-  /// that says what to do about it.
+  /// Shows a notice about somebody else's seat for a few seconds.
   void _announce(_PresenceNotice notice, {required int skipSeat}) {
     if (widget.session.view?.you == skipSeat) return;
-    // Over the winner screen a seat notice has nothing useful to say — the
-    // game is over, there is no seat action left to announce.
     if (widget.session.view?.phase == GamePhase.gameOver) return;
 
     _presenceTimer?.cancel();
@@ -339,24 +270,34 @@ class _TableScreenState extends State<TableScreen> {
     });
   }
 
+  /// Shows a line of help above the hand for a moment.
+  void _showHint(_HandHint hint) {
+    _hintTimer?.cancel();
+    setState(() => _hint = hint);
+    _hintTimer = Timer(const Duration(milliseconds: 2200), () {
+      if (mounted) setState(() => _hint = null);
+    });
+  }
+
+  void _handleIllegal(PlayingCard card) {
+    final view = widget.session.view;
+    if (view == null) return;
+    _showHint(_HandHint.illegal(view, card));
+  }
+
+  void _handleNotYourTurn() => _showHint(const _HandHint.waiting());
+
   /// Any touch anywhere is proof the player is still at the table, so it takes
-  /// their seat back from autoplay.
-  ///
-  /// This is a [Listener] rather than a gesture recogniser on purpose: it must
-  /// not compete in the gesture arena with the card fan underneath it, and a
-  /// pointer-down is the earliest and most forgiving signal of "someone is
-  /// there" — it does not require the touch to resolve into a tap.
+  /// their seat back from autoplay. A [Listener], so it never competes with
+  /// the hand's own gestures.
   void _handleTouch(PointerDownEvent _) {
     final view = widget.session.view;
     final you = view?.you;
     if (view == null || you == null) return;
     if (!view.players[you].autoplay) return;
 
-    // One frame is enough; the seat is released the moment the server reads it.
-    // Until that answer arrives the view still says autoplay, so a player
-    // drumming on the screen out of frustration would keep sending — and the
-    // server drops connections that exceed their frame budget. A floor between
-    // sends keeps a burst of taps well inside it whatever the latency.
+    // A floor between sends keeps a burst of frustrated taps well inside the
+    // server's frame budget.
     final now = clock.now();
     final last = _lastWake;
     if (last != null &&
@@ -372,12 +313,11 @@ class _TableScreenState extends State<TableScreen> {
   void _onSessionChanged() {
     _pruneThrowOrigins();
     _maybeAutoPlay();
-    // Spot server/bot plays of the viewer's own seat (autoplay) and give them
-    // the same above-the-hand flight a local throw gets.
+    // Server/bot plays of the viewer's own seat (autoplay) get the same
+    // above-the-hand flight a local throw gets.
     _maybeStartAutoplayFlight();
-    // If the game just ended while a notice was on screen, clear it so it does
-    // not linger over the winner screen (the build also hides the banners
-    // there, but an already-shown notice would otherwise keep its own timer).
+    // A confirmation may be what a landed flight was waiting for.
+    _settleFlights();
     if (widget.session.view?.phase == GamePhase.gameOver) {
       _presenceTimer?.cancel();
       _presenceNotice = null;
@@ -388,90 +328,54 @@ class _TableScreenState extends State<TableScreen> {
 
   /// Spots a freshly dealt hand and kicks off the dealing flourish once.
   ///
-  /// A view reaching the playing (or bidding) phase with a hand number we have
-  /// not seen yet is the moment the cards were dealt. We only fire on the
-  /// *first* such view for each hand (guarded by [_lastDealtHand]) so a
-  /// reconnect re-sending the same hand — or the session notifying repeatedly
-  /// about an unchanged view — cannot replay the animation.
-  ///
-  /// Sets the deal state fields directly rather than calling setState, because
-  /// it is also invoked from [initState] before the first build (a session that
-  /// has already dealt publishes from its constructor, so the flourish must
-  /// start immediately or the full hand would flash on screen first). Callers
-  /// that run after a build are responsible for their own setState.
+  /// Sets fields directly rather than calling setState, because it also runs
+  /// from [initState] before the first build. Callers that run after a build
+  /// are responsible for their own setState.
   void _maybeStartDeal() {
     final view = widget.session.view;
-    if (view == null) {
-      debugPrint('[DEAL] _maybeStartDeal: view is null');
-      return;
-    }
+    if (view == null) return;
     if (view.phase != GamePhase.bidding && view.phase != GamePhase.playing) {
-      debugPrint(
-        '[DEAL] _maybeStartDeal: phase=${view.phase}, not bidding/playing',
-      );
       return;
     }
-    if (_lastDealtHand == view.handIndex) {
-      debugPrint(
-        '[DEAL] _maybeStartDeal: SKIP _lastDealtHand=$_lastDealtHand == handIndex=${view.handIndex}',
-      );
-      return;
-    }
+    if (_lastDealtHand == view.handIndex) return;
     debugPrint(
-      '[DEAL] _maybeStartDeal: STARTING DEAL _lastDealtHand=$_lastDealtHand -> handIndex=${view.handIndex}, phase=${view.phase}',
+      '[DEAL] starting deal for hand ${view.handIndex} (was $_lastDealtHand), phase=${view.phase}',
     );
     _lastDealtHand = view.handIndex;
-    // A rejoin picks up a hand that may already be under way — replaying the
-    // flourish over live cards would be noise. But only skip it if there is
-    // actually progress (a bid placed or a card played): a rejoin that lands
-    // on a just-dealt hand still gets its deal, and the flag is consumed so
-    // every later hand and game plays its flourish too.
+    // A rejoin picks up a hand that may already be under way — only skip the
+    // flourish if there is actual progress, and consume the flag either way.
     if (_rejoined) {
       _rejoined = false;
       final handInProgress =
           view.phase == GamePhase.playing || view.bids.any((b) => b != null);
-      if (handInProgress) {
-        debugPrint(
-          '[DEAL] _maybeStartDeal: rejoined an in-progress hand, skipping its deal',
-        );
-        return;
-      }
-      debugPrint(
-        '[DEAL] _maybeStartDeal: rejoined a fresh hand, playing its deal',
-      );
+      if (handInProgress) return;
     }
-    _handRevealed = 0;
-    _dealRevealed = [0, 0, 0, 0];
+    _dealProgress.value = const [0, 0, 0, 0];
     _dealKey = UniqueKey();
-    _handCardCenters = null;
     AudioController.instance?.playDeal();
   }
 
   /// Clears the dealing flourish once its cards have all landed.
   void _clearDeal() {
     if (_dealKey == null) return;
-    setState(() {
-      _dealKey = null;
-      // The whole hand is now revealed and stands on its own.
-      _handRevealed = 13;
-      _dealRevealed = null;
-    });
-    // The cards are down; the deal's looping sound has nothing left to keep
-    // time with.
+    setState(() => _dealKey = null);
+    _dealProgress.value = null;
     AudioController.instance?.stopDeal();
-    // The hand is now on screen, so a convenience auto-throw that was deferred
-    // while the cards were hidden can be scheduled again.
+    // A convenience auto-throw deferred while the cards were hidden can now
+    // be scheduled.
     _maybeAutoPlay();
   }
 
-  /// The card the table should throw for the player right now, or null.
-  ///
-  /// Two convenience rules, both all-but-forced so no real choice is skipped:
-  /// 1. the player's very last card — with one card left every play is legal;
-  /// 2. the only remaining card of the led suit — following suit is forced.
-  /// Both are played through [_handleCardThrown] with no gesture position, so
-  /// the card still arcs in above the hand instead of rendering its entrance
-  /// underneath the remaining hand cards.
+  void _onDealProgress(List<int> counts) {
+    if (!mounted) return;
+    if (!listEquals(counts, _dealProgress.value)) {
+      _dealProgress.value = List.unmodifiable(counts);
+    }
+  }
+
+  /// The card the table should throw for the player right now, or null:
+  /// the very last card, or the only remaining card of the led suit — both
+  /// forced, so no real choice is skipped.
   PlayingCard? _autoPlayCandidate(GameView view, AppSettings settings) {
     final hand = view.hand;
     final legal = view.legalMoveIds;
@@ -490,10 +394,6 @@ class _TableScreenState extends State<TableScreen> {
   }
 
   /// Pending auto-throw: which turn and card it belongs to, plus its timer.
-  ///
-  /// The key is kept until the view shows the throw actually gone, so a slow
-  /// network re-notifying the same view can't schedule it twice. It is cleared
-  /// the moment the turn moves on or the card leaves the hand.
   ({int turn, String cardId})? _autoPlayKey;
   Timer? _autoPlayTimer;
 
@@ -534,45 +434,46 @@ class _TableScreenState extends State<TableScreen> {
       if (current == null || current.turn != seat) return;
       if (!current.hand.any((c) => c.id == card.id)) return;
       if (!current.legalMoveIds.contains(card.id)) return;
-      // Thrown with no gesture position: [.._handleCardThrown] starts the
-      // flight from the player's own seat anchor so the card still arcs in
-      // above the hand instead of rendering its entrance underneath it.
+      if (_flights.containsKey(card.id)) return;
       _handleCardThrown(card, null);
     });
   }
 
-  /// Drops any recorded origin for a card that's no longer part of the
-  /// in-progress trick or the one currently lingering before it's cleared —
-  /// otherwise a card id (there are only 52) could resurface in a later hand
-  /// and briefly reuse a stale screen position from a previous throw. Also
-  /// prunes the rejoin snapshot so a later hand's plays of the same card ids
-  /// aren't suppressed.
+  /// Drops bookkeeping for cards no longer in the trick in progress or the
+  /// one lingering before it clears — card ids recur every hand.
   void _pruneThrowOrigins() {
-    if (_throwOrigins.isEmpty && _seenViewerPlayIds?.isEmpty != false) return;
+    if (_throwOrigins.isEmpty &&
+        _flownIds.isEmpty &&
+        _seenViewerPlayIds?.isEmpty != false) {
+      return;
+    }
+    final liveIds = _liveTrickIds();
+    _throwOrigins.removeWhere((id, _) => !liveIds.contains(id));
+    _flownIds.removeWhere(
+      (id) => !liveIds.contains(id) && !_flights.containsKey(id),
+    );
+    _seenViewerPlayIds?.removeWhere((id) => !liveIds.contains(id));
+  }
+
+  Set<String> _liveTrickIds() {
     final view = widget.session.view;
-    final liveIds = {
+    return {
       if (view != null) ...view.trick.map((p) => p.card.id),
       if (view?.lastTrick != null)
         ...view!.lastTrick!.plays.map((p) => p.card.id),
     };
-    _throwOrigins.removeWhere((id, _) => !liveIds.contains(id));
-    _seenViewerPlayIds?.removeWhere((id) => !liveIds.contains(id));
   }
 
-  /// Handles a card leaving the hand (tap, drag-release, or an auto-throw):
-  /// records where it left from, then forwards the play to the session exactly
-  /// as before.
-  void _handleCardThrown(PlayingCard card, Offset? releasePosition) {
-    _startFlight(card, releasePosition);
+  /// A card left the hand (tap, drag, or an auto-throw): start its flight,
+  /// then forward the play to the session.
+  void _handleCardThrown(PlayingCard card, ThrowRelease? release) {
+    _startFlight(card, release);
     widget.session.play(card);
   }
 
-  /// Spots plays of the viewer's own seat that arrive through the session with
-  /// no gesture — the seat going on autoplay (idle/away) while the server or a
-  /// bot plays it. Those cards would otherwise render their entrance inside
-  /// the felt, underneath the hand. Run them through the same top-level flight
-  /// layer, starting from the card's resting slot, so the z-order rule (stay
-  /// above the hand until the destination) holds during autoplay too.
+  /// Spots plays of the viewer's own seat that arrive with no gesture — the
+  /// seat on autoplay while the server or a bot plays it — and flies them
+  /// above the hand like a local throw.
   void _maybeStartAutoplayFlight() {
     final view = widget.session.view;
     final you = view?.you;
@@ -581,63 +482,96 @@ class _TableScreenState extends State<TableScreen> {
         ? view.lastTrick?.plays ?? const <TrickPlay>[]
         : view.trick;
     // First observation of a live trick: a rejoin landing mid-hand. Cards
-    // already on the table must not re-fly, so snapshot them and skip forever
-    // (pruned alongside throw origins once the trick clears).
+    // already on the table must not re-fly.
     _seenViewerPlayIds ??= {
       for (final p in plays)
         if (p.seat == you) p.card.id,
     };
     for (final play in plays) {
       if (play.seat != you) continue;
-      // Already on the table when we first looked (rejoin), thrown locally (a
-      // throw origin was recorded), or a flight is already running.
       if (_seenViewerPlayIds!.contains(play.card.id)) continue;
       if (_throwOrigins.containsKey(play.card.id)) continue;
       if (_flights.containsKey(play.card.id)) continue;
+      if (_flownIds.contains(play.card.id)) continue;
       _startFlight(play.card, null);
     }
   }
 
-  /// Starts the top-level flight that carries a locally-thrown card above the
-  /// hand to its destination, and records the throw origin so the settled card
-  /// [TrickCluster] reveals is where the flight landed. A null
-  /// [releasePosition] (auto-throw, autoplay) falls back to the card's resting
-  /// slot, then to the player's own seat anchor.
-  void _startFlight(PlayingCard card, Offset? releasePosition) {
+  /// Starts the top-level flight that carries a card from the hand to its
+  /// resting spot on the felt, above everything else on the table.
+  void _startFlight(PlayingCard card, ThrowRelease? release) {
+    final m = _metrics;
+    final slot = _handSlots?[card.id];
     final startGlobal =
-        releasePosition ??
-        _handSlotCenterFor(card.id) ??
-        _ownSeatAnchorGlobal();
+        release?.center ?? slot?.center ?? _ownSeatAnchorGlobal();
     final origin = _feltRelativeOffset(startGlobal, _feltStackKey);
-    if (origin != null) {
-      _throwOrigins[card.id] = origin;
-    }
+    if (origin != null) _throwOrigins[card.id] = origin;
     final target = _flightTargetGlobal();
-    if (startGlobal != null && target != null) {
-      final flight = _Flight(
-        card: card,
-        startGlobal: startGlobal,
-        targetGlobal: target.center,
-        cardWidth: target.cardWidth,
-      );
-      setState(() => _flights[card.id] = flight);
-      // Must match _ThrownCardState._entranceBaseMs in felt_table.dart —
-      // TrickCluster's own copy of this card stays hidden for exactly this
-      // long (see TrickCluster.hiddenIds), so it's already settled at rest
-      // the instant the flight layer above removes itself.
-      final scale = SettingsScope.of(context).animationSpeed.durationScale;
-      Future.delayed(Duration(milliseconds: (520 * scale).round()), () {
-        if (mounted) setState(() => _flights.remove(card.id));
+    if (m == null || startGlobal == null || target == null) return;
+
+    final handWidth = _handCardWidth(m);
+    final flight = _Flight(
+      card: card,
+      startGlobal: startGlobal,
+      targetGlobal: target.center,
+      cardWidth: target.cardWidth,
+      startScale: (release?.scale ?? 1) * handWidth / target.cardWidth,
+      startAngle: release?.angle ?? slot?.angle ?? 0,
+      startedAt: clock.now(),
+    );
+    setState(() {
+      _flights[card.id] = flight;
+      _flownIds.add(card.id);
+    });
+  }
+
+  /// A flight finished its path; it can hand off once the table agrees.
+  void _onFlightLanded(String cardId) {
+    final flight = _flights[cardId];
+    if (flight == null) return;
+    flight.landed = true;
+    _settleFlights();
+  }
+
+  /// Removes landed flights whose card the table now shows in the trick (the
+  /// settled copy in [TrickCluster] takes over in the same frame), and hands
+  /// back any the table never confirmed — a refused or lost play — so the
+  /// card returns to the hand instead of hanging over the felt.
+  void _settleFlights() {
+    if (_flights.isEmpty) return;
+    final live = _liveTrickIds();
+    final now = clock.now();
+    final done = <String>[];
+    var waiting = false;
+    for (final flight in _flights.values) {
+      if (!flight.landed) continue;
+      final id = flight.card.id;
+      if (live.contains(id)) {
+        done.add(id);
+      } else if (now.difference(flight.startedAt) >= _throwConfirmTimeout) {
+        done.add(id);
+        _flownIds.remove(id);
+        _throwOrigins.remove(id);
+      } else {
+        waiting = true;
+      }
+    }
+    if (done.isNotEmpty && mounted) {
+      setState(() {
+        for (final id in done) {
+          _flights.remove(id);
+        }
       });
+    }
+    _flightCheck?.cancel();
+    if (waiting) {
+      _flightCheck = Timer(const Duration(milliseconds: 250), _settleFlights);
     }
   }
 
-  /// The point (screen-global) and card size a locally-thrown card's flight
-  /// should land on: reproduces [_Felt]'s own `cardWidth` clamp and
-  /// [TrickCluster]'s bottom-seat rest offset (the 0.55 constant) off the
-  /// felt's last measured size, so [_ThrowFlight] lands exactly where
-  /// [TrickCluster] itself will settle the real card. Null before the felt
-  /// has been laid out at least once.
+  /// Where a thrown card's flight lands (screen-global) and the width it
+  /// lands at — exactly where and how [TrickCluster] rests the bottom seat's
+  /// card. Null before the felt has been laid out.
   ({Offset center, double cardWidth})? _flightTargetGlobal() {
     final m = _metrics;
     final feltBox = _feltStackKey.currentContext?.findRenderObject();
@@ -648,28 +582,18 @@ class _TableScreenState extends State<TableScreen> {
       return null;
     }
     final size = feltBox.size;
-    final cardWidth = m
-        .s(44)
-        .clamp(
-          0.0,
-          [
-            size.width * 0.16,
-            size.height * 0.3,
-          ].reduce((a, b) => a < b ? a : b),
-        );
-    final cardHeight = cardWidth * PlayingCardView.aspect;
+    final cardWidth = trickCardWidth(m, size);
     final feltCenterGlobal = feltBox.localToGlobal(size.center(Offset.zero));
-    final bias = _feltCenterBias(size, m.isPortrait);
-    return (
-      center: feltCenterGlobal + Offset(0, cardHeight * 0.55 + bias),
-      cardWidth: cardWidth,
+    final rest = TrickCluster.restOffsetFor(
+      SeatSlot.bottom,
+      cardWidth,
+      Offset(0, _feltCenterBias(size, m.isPortrait)),
     );
+    return (center: feltCenterGlobal + rest, cardWidth: cardWidth);
   }
 
-  /// The player's own seat avatar centre in screen-global coordinates — the
-  /// fallback start for a thrown card's flight when there is no gesture to
-  /// measure (auto-throws). Same anchor [TrickCluster] would use for the
-  /// bottom seat, so the flight and the settled card agree.
+  /// The player's own plate centre in screen-global coordinates — the last
+  /// fallback start for a flight with no gesture and no measured slot.
   Offset? _ownSeatAnchorGlobal() {
     final box = _seatKeys[SeatSlot.bottom]?.currentContext?.findRenderObject();
     if (box is! RenderBox || !box.attached || !box.hasSize) return null;
@@ -685,11 +609,8 @@ class _TableScreenState extends State<TableScreen> {
     }
     final confirmed = await _confirmQuit(context);
     if (confirmed && mounted) {
-      // An explicit quit forfeits the seat, so the seat record that would
-      // otherwise offer a "Rejoin your game?" popup next time the home screen
-      // opens must go with it. The session's own dispose never reaches the
-      // active-game binding (it closes without notifying), so this is the only
-      // place a deliberate quit can clear it.
+      // An explicit quit forfeits the seat, so the stored seat record that
+      // would offer a rejoin next time must go with it.
       if (session case final RemoteSession remote) {
         final identity = SettingsScope.of(context).identity;
         final stored = identity.activeGame;
@@ -721,8 +642,6 @@ class _TableScreenState extends State<TableScreen> {
     };
     // A mid-game reconnect keeps the last deal on screen while its connection
     // is being brought back, so the table is never swapped for a blank page.
-    // `isResuming` only ever turns true with a view already in hand, so a
-    // reconnect always has something to render beneath the overlay.
     final resuming = debugNetwork?.isResuming ?? false;
     final showTable = session.isReady || (resuming && session.view != null);
 
@@ -738,19 +657,14 @@ class _TableScreenState extends State<TableScreen> {
               colors: palette.tableBackground,
               glow: palette.glow,
               horizontal: !m.isPortrait,
-              glowAlignment: const Alignment(0, -0.6),
-              glowScale: 1.4,
+              glowAlignment: const Alignment(0, -0.2),
+              glowScale: 1.5,
               child: SafeArea(
-                // Extra buffer on top of the OS-reported safe inset: on
-                // notched/cutout devices in landscape the reported padding
-                // sometimes runs right up against the cutout with no
-                // breathing room, so the felt and seat avatars end up
-                // visually flush against it.
+                // A little breathing room past a landscape cutout.
                 minimum: EdgeInsets.symmetric(horizontal: m.sc(0, 8)),
                 child: Listener(
-                  // Wraps the whole table so a touch anywhere counts as a sign
-                  // of life. Translucent so it also sees touches on bare felt,
-                  // and a Listener so it never intercepts anything.
+                  // Any touch is a sign of life; translucent and a Listener so
+                  // it sees touches on bare felt and never intercepts any.
                   behavior: HitTestBehavior.translucent,
                   onPointerDown: _handleTouch,
                   child: Stack(
@@ -769,46 +683,31 @@ class _TableScreenState extends State<TableScreen> {
                                 tableStackKey: _tableStackKey,
                                 throwOrigins: _throwOrigins,
                                 flights: _flights,
+                                flownIds: _flownIds,
+                                onFlightLanded: _onFlightLanded,
                                 onCardThrown: _handleCardThrown,
+                                onIllegal: _handleIllegal,
+                                onNotYourTurn: _handleNotYourTurn,
+                                hint: _hint,
                                 dealKey: _dealKey,
-                                handRevealed: _handRevealed,
-                                dealRevealed: _dealRevealed,
+                                dealProgress: _dealProgress,
                                 onDealComplete: _clearDeal,
-                                onDealProgress: (counts) {
-                                  if (!mounted) return;
-                                  final you = session.view?.you;
-                                  final revealed =
-                                      you != null && you < counts.length
-                                      ? counts[you]
-                                      : 0;
-                                  if (revealed != _handRevealed ||
-                                      !listEquals(counts, _dealRevealed)) {
-                                    setState(() {
-                                      _handRevealed = revealed;
-                                      _dealRevealed = List.of(counts);
-                                    });
-                                  }
-                                },
+                                onDealProgress: _onDealProgress,
                                 onHandSlotsMeasured: _onHandSlotsMeasured,
-                                handCardCenters: _handCardCenters,
+                                handSlots: () => _handSlots,
                               )
                             : _ConnectionState(session: session),
                       ),
 
-                      // While a mid-game connection is being reclaimed the table
-                      // stays visible behind a small centered card instead of a
-                      // full-page spinner.
+                      // While a mid-game connection is being reclaimed the
+                      // table stays visible behind a small centred card.
                       if (resuming && !session.isReady)
                         Positioned.fill(
                           child: _ReconnectOverlay(network: debugNetwork!),
                         ),
 
-                      // The debug "Go offline" button, armed by the settings panel's Developer
-                      // section. It floats at the top where the HUD has a clear
-                      // gap between its icon pills and the round pill, so it
-                      // never forces the HUD to overflow on a narrow screen.
-                      // Only a live networked mid-game table has a connection
-                      // worth severing.
+                      // The debug "Go offline" button, armed from the settings
+                      // Developer section, for live networked tables only.
                       if (debugNetwork != null &&
                           debugNetwork.isReady &&
                           !gameOver &&
@@ -828,15 +727,10 @@ class _TableScreenState extends State<TableScreen> {
                           ),
                         ),
 
-                      // Announcements ride above the table rather than inside it,
-                      // so they never disturb the felt's measured geometry — the
-                      // card-flight code reads real on-screen positions from it.
-                      // The winner screen takes the whole screen over at game
-                      // over, so neither banner is useful there: "take your seat
-                      // back" is meaningless once the game has ended, and a
-                      // presence toast over the podium is just noise.
+                      // Announcements ride above the table rather than inside
+                      // it, so they never disturb the felt's measured geometry.
                       Positioned(
-                        top: m.s(8),
+                        top: m.s(52),
                         left: 0,
                         right: 0,
                         child: IgnorePointer(
@@ -865,11 +759,9 @@ class _TableScreenState extends State<TableScreen> {
 
 /// The standing "we are playing your hand for you" banner.
 ///
-/// Unlike the presence notices this does not time out, because the condition it
-/// describes does not: it is up for exactly as long as the seat is on autoplay,
-/// and it names the way out. Ignoring pointers is deliberate — the whole screen
-/// is the button, so a banner that swallowed the touch would be the one place
-/// tapping did not work.
+/// Unlike the presence notices this does not time out: it is up for exactly as
+/// long as the seat is on autoplay, and it names the way out. It ignores
+/// pointers — the whole screen is the button.
 class _AutoplayBanner extends StatelessWidget {
   const _AutoplayBanner({required this.showing});
 
@@ -881,6 +773,16 @@ class _AutoplayBanner extends StatelessWidget {
 
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 260),
+      transitionBuilder: (child, a) => FadeTransition(
+        opacity: a,
+        child: SlideTransition(
+          position: Tween(
+            begin: const Offset(0, -0.3),
+            end: Offset.zero,
+          ).animate(a),
+          child: child,
+        ),
+      ),
       child: !showing
           ? const SizedBox.shrink()
           : Padding(
@@ -889,20 +791,17 @@ class _AutoplayBanner extends StatelessWidget {
                 margin: EdgeInsets.symmetric(horizontal: m.s(16)),
                 padding: EdgeInsets.symmetric(
                   horizontal: m.s(14),
-                  vertical: m.s(9),
+                  vertical: m.s(10),
                 ),
                 decoration: BoxDecoration(
-                  color: const Color(0xF00A1207),
+                  gradient: surfaceGradient,
                   border: Border.all(
-                    color: AppColors.goldMid.withValues(alpha: 0.75),
+                    color: AppColors.goldMid.withValues(alpha: 0.8),
                   ),
-                  borderRadius: BorderRadius.circular(m.s(12)),
-                  boxShadow: const [
-                    BoxShadow(
-                      color: Color(0x99000000),
-                      blurRadius: 18,
-                      offset: Offset(0, 5),
-                    ),
+                  borderRadius: BorderRadius.circular(m.s(14)),
+                  boxShadow: [
+                    ...AppShadows.high,
+                    ...AppShadows.glow(AppColors.goldDeep, strength: 0.6),
                   ],
                 ),
                 child: Row(
@@ -910,10 +809,10 @@ class _AutoplayBanner extends StatelessWidget {
                   children: [
                     Icon(
                       Icons.smart_toy_outlined,
-                      size: m.s(15),
+                      size: m.s(18),
                       color: AppColors.goldMid,
                     ),
-                    SizedBox(width: m.s(9)),
+                    SizedBox(width: m.s(10)),
                     Flexible(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -921,7 +820,7 @@ class _AutoplayBanner extends StatelessWidget {
                         children: [
                           Text(
                             'Autoplay is on',
-                            style: AppText.bold(m.s(12), AppColors.goldMid),
+                            style: AppText.bold(m.s(13), AppColors.goldMid),
                           ),
                           Text(
                             'Tap anywhere to take your seat back.',
@@ -938,40 +837,52 @@ class _AutoplayBanner extends StatelessWidget {
   }
 }
 
-/// One local throw's flight, rendered by [_ThrowFlight] in the outer table
-/// Stack while [TrickCluster]'s own copy of [card] stays hidden.
+/// One local throw's flight, drawn by [_ThrowFlight] above the hand while
+/// [TrickCluster]'s own copy of [card] stays hidden.
 class _Flight {
-  const _Flight({
+  _Flight({
     required this.card,
     required this.startGlobal,
     required this.targetGlobal,
     required this.cardWidth,
+    required this.startScale,
+    required this.startAngle,
+    required this.startedAt,
   });
 
   final PlayingCard card;
   final Offset startGlobal;
   final Offset targetGlobal;
+
+  /// The width the card lands at (the felt's card size).
   final double cardWidth;
+
+  /// Scale at take-off relative to [cardWidth] — a hand card is bigger than a
+  /// felt card, and a previewed one bigger still.
+  final double startScale;
+  final double startAngle;
+  final DateTime startedAt;
+
+  /// Reached the felt; waiting for the table to confirm before handing off.
+  bool landed = false;
 }
 
-/// Renders one [_Flight]'s entrance — a straight-line move from
-/// [_Flight.startGlobal] to [_Flight.targetGlobal] — positioned in
-/// [tableStackKey] (the outer table Stack)'s coordinate space rather than the
-/// felt's, so it paints above both the felt and the hand regardless of which
-/// one the path happens to cross. The card stays solid for the whole flight
-/// (it was already visible in the hand when it was thrown), so the only
-/// stacking change happens at the destination, where the settled card in
-/// [TrickCluster] takes over. Removes itself (via the parent's [_Flight] map)
-/// once the entrance finishes; see [_TableScreenState._handleCardThrown].
+/// Renders one [_Flight] along the same [ThrowPath] [TrickCluster] uses, in
+/// the outer table Stack's coordinate space so it paints above the felt and
+/// the hand alike. Once it lands it holds still at rest (reporting
+/// [onLanded]) until the parent removes it — which it does in the same frame
+/// [TrickCluster] reveals its settled copy, so there is no visible handoff.
 class _ThrowFlight extends StatefulWidget {
   const _ThrowFlight({
     super.key,
     required this.flight,
     required this.tableStackKey,
+    required this.onLanded,
   });
 
   final _Flight flight;
   final GlobalKey tableStackKey;
+  final ValueChanged<String> onLanded;
 
   @override
   State<_ThrowFlight> createState() => _ThrowFlightState();
@@ -979,18 +890,9 @@ class _ThrowFlight extends StatefulWidget {
 
 class _ThrowFlightState extends State<_ThrowFlight>
     with SingleTickerProviderStateMixin {
-  // Must match _ThrownCardState._entranceBaseMs/curve in felt_table.dart —
-  // this stands in for that card's own entrance while it stays hidden, so
-  // the two need to move in lockstep.
-  static const _entranceBaseMs = 520;
-
   late final AnimationController _controller = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: _entranceBaseMs),
-  );
-  late final Animation<double> _entrance = CurvedAnimation(
-    parent: _controller,
-    curve: Curves.easeOut,
+    duration: const Duration(milliseconds: Motion.throwMs),
   );
 
   bool _started = false;
@@ -1000,11 +902,15 @@ class _ThrowFlightState extends State<_ThrowFlight>
     super.didChangeDependencies();
     if (_started) return;
     _started = true;
-    final scale = SettingsScope.of(context).animationSpeed.durationScale;
-    _controller.duration = Duration(
-      milliseconds: (_entranceBaseMs * scale).round(),
+    _controller.duration = Motion.scaled(
+      Motion.throwMs,
+      Motion.trickScale(SettingsScope.of(context).animationSpeed.durationScale),
     );
-    _controller.forward();
+    _controller.forward().whenCompleteOrCancel(() {
+      if (mounted && _controller.isCompleted) {
+        widget.onLanded(widget.flight.card.id);
+      }
+    });
   }
 
   @override
@@ -1020,52 +926,62 @@ class _ThrowFlightState extends State<_ThrowFlight>
       return const SizedBox.shrink();
     }
     final flight = widget.flight;
-    final startLocal = tableBox.globalToLocal(flight.startGlobal);
-    final targetLocal = tableBox.globalToLocal(flight.targetGlobal);
-    final half = Offset(
-      flight.cardWidth / 2,
-      flight.cardWidth * PlayingCardView.aspect / 2,
+    final path = ThrowPath(
+      start: tableBox.globalToLocal(flight.startGlobal),
+      end: tableBox.globalToLocal(flight.targetGlobal),
+      startScale: flight.startScale,
+      startAngle: flight.startAngle,
+      endAngle: TrickCluster.restAngleFor(flight.card),
     );
+    final w = flight.cardWidth;
+    final h = w * PlayingCardView.aspect;
     return AnimatedBuilder(
-      animation: _entrance,
+      animation: _controller,
       builder: (context, child) {
-        final t = _entrance.value;
-        final topLeft = Offset.lerp(startLocal, targetLocal, t)! - half;
-        return Positioned(left: topLeft.dx, top: topLeft.dy, child: child!);
+        final t = ThrowPath.curve.transform(_controller.value);
+        final center = path.positionAt(t);
+        return Positioned(
+          left: center.dx - w / 2,
+          top: center.dy - h / 2,
+          child: Transform.rotate(
+            angle: path.angleAt(t),
+            child: Transform.scale(scale: path.scaleAt(t), child: child),
+          ),
+        );
       },
-      child: PlayingCardView(card: flight.card, width: flight.cardWidth),
+      child: IgnorePointer(
+        child: PlayingCardView(card: flight.card, width: w, elevation: 0.6),
+      ),
     );
   }
 }
 
 // --------------------------------------------------------------- dealing
 
-/// The global (screen) landing centre for a seat's dealt cards: the seat
-/// avatar for the three opponents, and the local player's hand area below the
-/// felt for their own flight. Falls back to an approximate reach toward that
-/// seat's side of the table when the seat hasn't been laid out yet (the very
-/// first frame).
+/// The global (screen) centre of a seat, for its dealt cards to land on.
+/// Falls back to an approximate reach before the seat has been laid out.
 Offset _dealTargetGlobal(SeatSlot slot, Map<SeatSlot, GlobalKey> seatKeys) {
   final box = seatKeys[slot]?.currentContext?.findRenderObject();
   if (box is RenderBox && box.attached && box.hasSize) {
     return box.localToGlobal(box.size.center(Offset.zero));
   }
-  // Approximate reach when unmeasured; the overlay only exists for a few
-  // hundred milliseconds, and the seat is almost always laid out by then.
   return switch (slot) {
     SeatSlot.bottom => Offset.zero,
-    SeatSlot.left => Offset(-200, 0),
-    SeatSlot.top => Offset(0, -200),
-    SeatSlot.right => Offset(200, 0),
+    SeatSlot.left => const Offset(-200, 0),
+    SeatSlot.top => const Offset(0, -200),
+    SeatSlot.right => const Offset(200, 0),
   };
 }
 
-/// The dealing flourish: a fan of face-down cards deals out from the centre
-/// of the felt to all four seats, staggered so it reads as a real deal rather
-/// than a burst. Painted in the outer table Stack's coordinate space (so it
-/// sits above the felt, hand and seats), and re-keyed by the parent for each
-/// new hand. Once every card has landed it fades out and reports completion,
-/// at which point the real hand below stands alone.
+/// The dealing flourish, in three beats: the deck drops onto the felt, gets
+/// two quick riffles, then deals out — one card at a time round the table,
+/// each arcing to its seat with a spin and shrinking to the size of that
+/// seat's face-down fan. The player's own cards fly to the exact slot they
+/// will occupy and turn edge-on as they arrive; the hand finishes the flip as
+/// the real face-up card appears (see the hand fan's flip-in).
+///
+/// Drawn by a single builder each frame, which emits only the deck and the
+/// handful of cards actually in the air — never 52 animated widgets.
 class _DealOverlay extends StatefulWidget {
   const _DealOverlay({
     super.key,
@@ -1073,7 +989,7 @@ class _DealOverlay extends StatefulWidget {
     required this.seatKeys,
     required this.feltStackKey,
     required this.tableStackKey,
-    required this.handCardCenters,
+    required this.handSlots,
     required this.onDone,
     required this.onProgress,
   });
@@ -1083,19 +999,14 @@ class _DealOverlay extends StatefulWidget {
   final GlobalKey feltStackKey;
   final GlobalKey tableStackKey;
 
-  /// The player's hand fan's card-slot centres, in global coordinates — one
-  /// per revealed slot in deal order. Flights for the player's own seat aim
-  /// at these instead of the seat avatar, so each flying card lands exactly
-  /// where the real card is being revealed underneath it. Null before the fan
-  /// has been laid out, in which case the seat target is used.
-  final List<Offset>? handCardCenters;
+  /// The hand fan's latest resting slots by card id (read every frame, so the
+  /// overlay never needs the table to rebuild it when the fan reports them).
+  final Map<String, FanSlot>? Function() handSlots;
 
   /// Fired once the deal finishes, so the parent clears the overlay.
   final VoidCallback onDone;
 
-  /// Fired as each card lands, with how many cards each seat has been dealt
-  /// so far (indexed by seat), so every player's hand fills in card-by-card
-  /// during the deal.
+  /// Fired as cards land, with how many each seat has been dealt so far.
   final ValueChanged<List<int>> onProgress;
 
   @override
@@ -1104,21 +1015,13 @@ class _DealOverlay extends StatefulWidget {
 
 class _DealOverlayState extends State<_DealOverlay>
     with SingleTickerProviderStateMixin {
-  // One card landing every ~55ms, plus a short tail fade: the whole flourish
-  // is comfortably under a second at normal animation speed.
-  static const _cardGapMs = 55;
-  static const _flightBaseMs = 420;
-  static const _fadeBaseMs = 220;
-
   late final AnimationController _controller = AnimationController(vsync: this);
 
   double _scale = 1.0;
   bool _started = false;
 
-  /// The order seats receive cards, exactly as laid out in [build]: starting
-  /// just past the dealer, one card to each seat in turn, 13 rounds. Computed
-  /// lazily so [._onDealTick] can count each seat's landed cards without
-  /// re-deriving it.
+  /// Seat receiving each of the 52 cards: starting just past the dealer, one
+  /// card to each seat in turn, 13 rounds.
   late final List<int> _order = [
     for (var round = 0; round < 13; round++)
       for (var d = 1; d <= 4; d++) (widget.view.dealer + d) % 4,
@@ -1126,40 +1029,39 @@ class _DealOverlayState extends State<_DealOverlay>
 
   List<int>? _lastReported;
 
+  double get _dealStart => (Motion.dealIntroMs + Motion.shuffleMs) * _scale;
+  double _beginOf(int i) => _dealStart + i * Motion.dealGapMs * _scale;
+  double get _flightMs => Motion.dealFlightMs * _scale;
+  double get _elapsed =>
+      _controller.value * _controller.duration!.inMilliseconds;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Set the total controller window from the (possibly changed) animation
-    // speed before starting, exactly like the other one-shot animations here.
     _scale = SettingsScope.of(context).animationSpeed.durationScale;
-    final ms = (_cardGapMs * 52 + _flightBaseMs + _fadeBaseMs) * _scale;
-    _controller.duration = Duration(milliseconds: ms.round());
+    _controller.duration = Duration(
+      milliseconds: (Motion.dealTotalMs * _scale).round(),
+    );
     if (!_started) {
       _started = true;
-      _controller.addListener(_onDealTick);
+      _controller.addListener(_onTick);
       _controller.forward().whenComplete(() {
         if (mounted) widget.onDone();
       });
     }
   }
 
-  /// As each of the local player's own cards lands, reports the new reveal
-  /// count so the real hand fills in in real time (a card every ~55ms).
-  /// As each card lands, reports how many cards each seat has been dealt so
-  /// far, so every player's hand — the local one and the opponents' fans —
-  /// fills in in real time rather than all appearing at once.
-  void _onDealTick() {
-    final you = widget.view.you;
-    if (you == null) return;
-    final elapsed = _controller.value * _controller.duration!.inMilliseconds;
-
+  /// Reports each seat's landed-card count as it changes, so every hand —
+  /// the player's and the opponents' fans — fills in card by card.
+  void _onTick() {
+    if (widget.view.you == null) return;
+    final elapsed = _elapsed;
     final counts = [0, 0, 0, 0];
     for (var i = 0; i < _order.length; i++) {
-      final end = (i * _cardGapMs + _flightBaseMs) * _scale;
-      if (elapsed >= end) counts[_order[i]]++;
+      if (elapsed >= _beginOf(i) + _flightMs) counts[_order[i]]++;
     }
     if (!listEquals(counts, _lastReported)) {
-      _lastReported = List.of(counts);
+      _lastReported = counts;
       widget.onProgress(counts);
     }
   }
@@ -1170,14 +1072,15 @@ class _DealOverlayState extends State<_DealOverlay>
     super.dispose();
   }
 
-  /// The real on-screen centre of the table felt, in the overlay's own
-  /// (table Stack) coordinate space. This is where every card starts its
-  /// flight. Returns null if the felt hasn't been laid out yet.
-  Offset? _startLocal() {
-    final tableBox = widget.tableStackKey.currentContext?.findRenderObject();
-    if (tableBox is! RenderBox || !tableBox.attached || !tableBox.hasSize) {
-      return null;
-    }
+  RenderBox? get _tableBox {
+    final box = widget.tableStackKey.currentContext?.findRenderObject();
+    return box is RenderBox && box.attached && box.hasSize ? box : null;
+  }
+
+  /// The felt's centre in this overlay's (table Stack) coordinates.
+  Offset? _deckCenter() {
+    final tableBox = _tableBox;
+    if (tableBox == null) return null;
     final feltBox = widget.feltStackKey.currentContext?.findRenderObject();
     if (feltBox is! RenderBox || !feltBox.attached || !feltBox.hasSize) {
       return tableBox.size.center(Offset.zero);
@@ -1187,259 +1090,182 @@ class _DealOverlayState extends State<_DealOverlay>
     );
   }
 
-  /// Converts a seat target's global centre into the overlay's coordinate
-  /// space, falling back to the raw value before the table has laid out.
-  Offset _targetLocal(SeatSlot slot) =>
-      _tableLocal(_dealTargetGlobal(slot, widget.seatKeys));
-
-  /// Converts a global point into the overlay's (table Stack) coordinate
-  /// space, falling back to the raw value before the table has laid out.
-  Offset _tableLocal(Offset global) {
-    final tableBox = widget.tableStackKey.currentContext?.findRenderObject();
-    if (tableBox is! RenderBox || !tableBox.attached || !tableBox.hasSize) {
-      return global;
-    }
-    return tableBox.globalToLocal(global);
-  }
+  Offset _local(Offset global) => _tableBox?.globalToLocal(global) ?? global;
 
   @override
   Widget build(BuildContext context) {
-    final start = _startLocal();
-    if (start == null) {
-      // Felt not yet measured — keep trying next frame without replaying.
-      return const SizedBox.shrink();
-    }
+    final m = Metrics.of(context);
     final palette = SettingsScope.of(context).palette;
-
-    // Deal order: starting just past the dealer, one card to each seat in
-    // turn, 13 rounds.
+    final deckWidth = m.s(46);
+    final handWidth = _handCardWidth(m);
+    final fanWidth = m.sc(24, 20);
     final you = widget.view.you;
-    final order = _order;
-
-    // The player's own cards land on the exact slot they will occupy in the
-    // hand fan (handCardCenters, in deal order), rather than on the seat
-    // avatar, so the flight hands off cleanly to the real card being revealed
-    // underneath it.
-    final targets = <Offset>[];
-    final endRotations = <double>[];
-    var playerCardsSeen = 0;
-    for (var i = 0; i < order.length; i++) {
-      final slot = slotFor(seat: order[i], viewer: you);
-      final centers = widget.handCardCenters;
-      final isPlayer = slot == SeatSlot.bottom;
-      if (isPlayer && centers != null && playerCardsSeen < centers.length) {
-        targets.add(_tableLocal(centers[playerCardsSeen]));
-      } else {
-        targets.add(_targetLocal(slot));
-      }
-      if (isPlayer) playerCardsSeen++;
-      // The card arrives already turned the way its seat's face-down fan holds
-      // cards — upright at the top seat, sideways toward the table centre for
-      // the side seats (matching [_handFanCards]); the player's own flight
-      // stays upright as it turns over into the real hand.
-      endRotations.add(switch (slot) {
-        SeatSlot.top => 0.0,
-        SeatSlot.left => -math.pi / 2,
-        SeatSlot.right => math.pi / 2,
-        SeatSlot.bottom => 0.0,
-      });
-    }
 
     return Positioned.fill(
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          // The deck at the table centre: a stack of face-down cards that
-          // thins as each card flies out to its seat, instead of every card
-          // lingering stacked on the same spot (which read as a static shadow).
-          _DealDeck(
-            start: start,
-            controller: _controller,
-            scale: _scale,
-            cardSize: 44.0 * _scale,
-            palette: palette,
-          ),
-          for (var i = 0; i < order.length; i++)
-            Builder(
-              key: ValueKey(i),
-              builder: (context) {
-                // Every seat gets the flight, the player's own included. The
-                // card flies face-down from the centre to the hand, and the
-                // real face-up card is revealed underneath the moment it lands
-                // (see onProgress/_handRevealed) — the brief overlap as the
-                // flight fades reads as the card turning over into the fan.
-                // Skipping the bottom seat here left the player's own deal
-                // invisible, showing only the other three seats' flights.
-                return _DealtCard(
+      child: IgnorePointer(
+        child: AnimatedBuilder(
+          animation: _controller,
+          builder: (context, _) {
+            // Measured every frame, not once: the overlay's first build can
+            // come before the table has been laid out, and nothing else
+            // rebuilds it while the deal runs.
+            final start = _deckCenter();
+            if (start == null) return const SizedBox.shrink();
+            final elapsed = _elapsed;
+            final slots = widget.handSlots();
+            final hand = widget.view.hand;
+            final children = <Widget>[
+              ..._deck(elapsed, start, deckWidth, palette),
+            ];
+            var playerCards = 0;
+            for (var i = 0; i < _order.length; i++) {
+              final slot = slotFor(seat: _order[i], viewer: you);
+              final isPlayer = slot == SeatSlot.bottom;
+              final playerIndex = isPlayer ? playerCards++ : -1;
+              final begin = _beginOf(i);
+              if (elapsed < begin || elapsed >= begin + _flightMs) continue;
+              final raw = (elapsed - begin) / _flightMs;
+
+              Offset target;
+              double endAngle;
+              double endWidth;
+              FanSlot? fanSlot;
+              if (isPlayer && playerIndex < hand.length) {
+                fanSlot = slots?[hand[playerIndex].id];
+              }
+              if (fanSlot != null) {
+                target = _local(fanSlot.center);
+                endAngle = fanSlot.angle;
+                endWidth = handWidth;
+              } else {
+                target = _local(_dealTargetGlobal(slot, widget.seatKeys));
+                endAngle = switch (slot) {
+                  SeatSlot.top => 0.0,
+                  SeatSlot.left => -math.pi / 2,
+                  SeatSlot.right => math.pi / 2,
+                  SeatSlot.bottom => 0.0,
+                };
+                endWidth = isPlayer ? handWidth : fanWidth;
+              }
+              children.add(
+                _dealtCard(
+                  raw: raw,
                   start: start,
-                  target: targets[i],
-                  endRotation: endRotations[i],
-                  cardIndex: i,
-                  controller: _controller,
-                  scale: _scale,
+                  target: target,
+                  endAngle: endAngle,
+                  startWidth: deckWidth,
+                  endWidth: endWidth,
+                  flipAtEnd: isPlayer,
+                  spin: isPlayer ? 0.25 : (i.isEven ? math.pi : -math.pi),
                   palette: palette,
-                );
-              },
-            ),
-        ],
+                ),
+              );
+            }
+            return Stack(clipBehavior: Clip.none, children: children);
+          },
+        ),
       ),
     );
   }
-}
 
-/// One face-down card in the dealing flourish. It waits in the deck at the
-/// table centre (rendered by [_DealDeck]) until its turn, then flies in a
-/// straight line to its seat and fades out, handing off to the real card
-/// already waiting underneath.
-class _DealtCard extends StatelessWidget {
-  const _DealtCard({
-    required this.start,
-    required this.target,
-    required this.endRotation,
-    required this.cardIndex,
-    required this.controller,
-    required this.scale,
-    required this.palette,
-  });
-
-  final Offset start;
-  final Offset target;
-
-  /// The rotation the card should finish its flight at, matching how its
-  /// seat's face-down fan holds cards (upright at the top seat, sideways at
-  /// the side seats, upright into the player's own hand).
-  final double endRotation;
-  final int cardIndex;
-  final AnimationController controller;
-  final double scale;
-  final ThemePalette palette;
-
-  @override
-  Widget build(BuildContext context) {
-    // Each card flies during its own [cardIndex]-sized window, after the
-    // cards before it. Before that window it is part of the deck and is not
-    // drawn here at all.
-    final begin = cardIndex * _DealOverlayState._cardGapMs * scale;
-    final end = begin + _DealOverlayState._flightBaseMs * scale;
-    final fadeEnd = end + _DealOverlayState._fadeBaseMs * scale;
-
-    final cardSize = 44.0 * scale;
-    final half = Offset(cardSize / 2, cardSize * CardBackView.aspect / 2);
-
-    return AnimatedBuilder(
-      animation: controller,
-      builder: (context, child) {
-        final elapsed = controller.value * controller.duration!.inMilliseconds;
-        if (elapsed < begin) {
-          // Still in the deck — [_DealDeck] draws it.
-          return const SizedBox.shrink();
-        }
-        if (elapsed >= fadeEnd) return const SizedBox.shrink();
-        final t = ((elapsed - begin) / (end - begin)).clamp(0.0, 1.0);
-        final pos = Offset.lerp(start, target, t)!;
-        final opacity = elapsed < end
-            ? 1.0
-            : 1.0 - ((elapsed - end) / (fadeEnd - end)).clamp(0.0, 1.0);
-        return Positioned(
-          left: pos.dx - half.dx,
-          top: pos.dy - half.dy,
-          child: Opacity(
-            opacity: opacity,
-            child: Transform.rotate(
-              // Start with a slight travel tilt (so the card reads as being
-              // flipped off the deck) and turn toward the seat's resting
-              // orientation as it lands, so a side-seat card arrives sideways.
-              angle: endRotation * t + 0.2 * (1 - t),
-              child: child,
-            ),
-          ),
-        );
-      },
-      child: CardBackView(width: cardSize, palette: palette),
-    );
-  }
-}
-
-/// The deck of face-down cards sitting at the table centre during a deal. The
-/// cards are dealt one at a time to the four seats, so the deck starts thick
-/// and thins to nothing as the last card leaves.
-class _DealDeck extends StatelessWidget {
-  const _DealDeck({
-    required this.start,
-    required this.controller,
-    required this.scale,
-    required this.cardSize,
-    required this.palette,
-  });
-
-  final Offset start;
-  final AnimationController controller;
-  final double scale;
-  final double cardSize;
-  final ThemePalette palette;
-
-  /// The most offset layers worth drawing at once — a real deck this thick
-  /// reads the same whether it holds fifty cards or a dozen.
-  static const _maxLayers = 12;
-  static const _layerStep = 2.0;
-  static const _totalCards = 52;
-
-  int _remaining() {
-    final elapsed = controller.value * controller.duration!.inMilliseconds;
+  /// The deck at the centre: dropping in, riffling twice, then thinning as
+  /// cards leave it.
+  List<Widget> _deck(
+    double elapsed,
+    Offset center,
+    double width,
+    ThemePalette palette,
+  ) {
     var remaining = 0;
-    for (var i = 0; i < _totalCards; i++) {
-      final begin = i * _DealOverlayState._cardGapMs * scale;
-      if (elapsed < begin) remaining++;
+    for (var i = 0; i < _order.length; i++) {
+      if (elapsed < _beginOf(i)) remaining++;
     }
-    return remaining;
+    if (remaining <= 0) return const [];
+    final layers = ((remaining * 10) / 52).ceil().clamp(1, 10);
+    final height = width * CardBackView.aspect;
+    const step = 1.6;
+
+    final introMs = Motion.dealIntroMs * _scale;
+    final shuffleMs = Motion.shuffleMs * _scale;
+    var drop = 0.0;
+    var scale = 1.0;
+    var split = 0.0;
+    if (elapsed < introMs) {
+      final t = Motion.enter.transform(elapsed / introMs);
+      drop = -width * 0.9 * (1 - t);
+      scale = 1.25 - 0.25 * t;
+    } else if (elapsed < introMs + shuffleMs) {
+      // Two riffles: split apart, swing back together, twice.
+      final u = (elapsed - introMs) / shuffleMs;
+      split = math.sin(((u * 2) % 1) * math.pi);
+    }
+
+    Widget layer(int i, double dx, double angle) => Positioned(
+      left: center.dx - width / 2 + dx + i * step * 0.5,
+      top: center.dy - height / 2 + drop - i * step,
+      child: Transform.rotate(
+        angle: angle,
+        child: Transform.scale(
+          scale: scale,
+          child: CardBackView(width: width, palette: palette, shadow: i == 0),
+        ),
+      ),
+    );
+
+    if (split <= 0.001) {
+      return [for (var i = 0; i < layers; i++) layer(i, 0, 0)];
+    }
+    // The halves interleave as they come back together.
+    final apart = width * 0.62 * split;
+    return [
+      for (var i = 0; i < layers; i++)
+        layer(i, i.isEven ? -apart : apart, (i.isEven ? -0.14 : 0.14) * split),
+    ];
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final half = Offset(cardSize / 2, cardSize * CardBackView.aspect / 2);
-    return AnimatedBuilder(
-      animation: controller,
-      builder: (context, child) {
-        final remaining = _remaining();
-        if (remaining <= 0) return const SizedBox.shrink();
-        // Deck thickness tracks how many cards are still in it, so it thins
-        // in step with the deal.
-        var layers = (remaining * _maxLayers) ~/ _totalCards;
-        if (layers < 1) layers = 1;
-        if (layers > _maxLayers) layers = _maxLayers;
-        final edge = (layers - 1) * _layerStep;
-        final width = cardSize + edge;
-        final height = cardSize * CardBackView.aspect + edge;
-        return Positioned(
-          left: start.dx - half.dx,
-          top: start.dy - half.dy,
-          // A SizedBox keeps the deck's inner Stack on bounded constraints (a
-          // Stack whose children are all Positioned has no intrinsic size).
-          child: SizedBox(
-            width: width,
-            height: height,
-            child: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                // Painted back to front: the bottom layer is offset furthest,
-                // the top card sits flat at the centre.
-                for (var i = layers - 1; i >= 0; i--)
-                  Positioned(
-                    left: i * _layerStep,
-                    top: i * _layerStep,
-                    // Only the top card casts a shadow; the offset layers
-                    // beneath are the deck's edge, not a shadow blob.
-                    child: CardBackView(
-                      width: cardSize,
-                      palette: palette,
-                      shadow: i == 0,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        );
-      },
+  Widget _dealtCard({
+    required double raw,
+    required Offset start,
+    required Offset target,
+    required double endAngle,
+    required double startWidth,
+    required double endWidth,
+    required bool flipAtEnd,
+    required double spin,
+    required ThemePalette palette,
+  }) {
+    final t = Curves.easeOutCubic.transform(raw);
+    final path = ThrowPath(
+      start: start,
+      end: target,
+      startAngle: endAngle - spin,
+      endAngle: endAngle,
+      bulge: 0.1,
+    );
+    final pos = path.positionAt(t);
+    // Drawn at one fixed size and scaled, rather than re-laid-out at a new
+    // width every frame, so a card in the air never has to repaint.
+    final width = startWidth + (endWidth - startWidth) * t;
+    final height = startWidth * CardBackView.aspect;
+    final scale = width / startWidth * (1 + 0.1 * math.sin(math.pi * t));
+
+    Widget card = CardBackView(width: startWidth, palette: palette);
+    if (flipAtEnd && raw > 0.6) {
+      card = Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.identity()
+          ..setEntry(3, 2, 0.0015)
+          ..rotateY((raw - 0.6) / 0.4 * math.pi / 2),
+        child: card,
+      );
+    }
+    return Positioned(
+      left: pos.dx - startWidth / 2,
+      top: pos.dy - height / 2,
+      child: Transform.rotate(
+        angle: path.angleAt(t),
+        child: Transform.scale(scale: scale, child: card),
+      ),
     );
   }
 }
@@ -1669,16 +1495,21 @@ class _ConnectFailure extends StatelessWidget {
                   children: [
                     if (onRetry != null) ...[
                       Expanded(
-                        child: _FailureButton(
+                        child: GoldButton(
                           label: 'Try again',
-                          primary: true,
+                          icon: Icons.refresh_rounded,
+                          dense: true,
                           onTap: onRetry!,
                         ),
                       ),
                       SizedBox(width: m.s(10)),
                     ],
                     Expanded(
-                      child: _FailureButton(label: 'Back', onTap: onBack),
+                      child: GhostButton(
+                        label: 'Back',
+                        dense: true,
+                        onTap: onBack,
+                      ),
                     ),
                   ],
                 ),
@@ -1769,50 +1600,6 @@ class _AttentionPulseState extends State<_AttentionPulse>
   }
 }
 
-/// One of the two choices on the "can't connect" screen. Primary is the gold
-/// gradient of every main action; the secondary is the quiet panel of Back.
-class _FailureButton extends StatelessWidget {
-  const _FailureButton({
-    required this.label,
-    required this.onTap,
-    this.primary = false,
-  });
-
-  final String label;
-  final VoidCallback onTap;
-  final bool primary;
-
-  @override
-  Widget build(BuildContext context) {
-    final m = Metrics.of(context);
-
-    return PressFeedback(
-      onTap: onTap,
-      child: Container(
-        alignment: Alignment.center,
-        padding: EdgeInsets.symmetric(vertical: m.s(13)),
-        decoration: BoxDecoration(
-          gradient: primary
-              ? const LinearGradient(
-                  colors: [AppColors.gold, AppColors.goldDeep],
-                )
-              : null,
-          color: primary ? null : AppColors.panel,
-          borderRadius: BorderRadius.circular(m.s(13)),
-          border: primary ? null : Border.all(color: AppColors.hairlineStrong),
-        ),
-        child: Text(
-          label,
-          style: AppText.bold(
-            m.s(13),
-            primary ? AppColors.onGold : AppColors.textOnDark,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 /// A small centered card shown while a mid-game connection is being brought
 /// back. Unlike the full-page [_ConnectionState], the table stays fully
 /// visible around it; a transparent, hit-testable barrier underneath absorbs
@@ -1837,25 +1624,14 @@ class _ReconnectOverlay extends StatelessWidget {
         // receiving taps, while still showing it in full.
         Positioned.fill(child: Container(color: Colors.transparent)),
         Center(
-          child: Container(
+          child: ConstrainedBox(
             constraints: BoxConstraints(maxWidth: m.s(300)),
-            padding: EdgeInsets.all(m.s(20)),
-            decoration: BoxDecoration(
-              color: AppColors.panel,
-              borderRadius: BorderRadius.circular(m.s(18)),
-              border: Border.all(color: AppColors.hairline),
-              boxShadow: const [
-                BoxShadow(
-                  color: Color(0x99000000),
-                  blurRadius: 30,
-                  offset: Offset(0, 12),
-                ),
-              ],
-            ),
-            child: _ReconnectNotice(
-              resuming: true,
-              showBackOnline: showBackOnline,
-              onBackOnline: () => network.simulateOffline(false),
+            child: GlassPanel(
+              child: _ReconnectNotice(
+                resuming: true,
+                showBackOnline: showBackOnline,
+                onBackOnline: () => network.simulateOffline(false),
+              ),
             ),
           ),
         ),
@@ -2375,30 +2151,15 @@ class _LobbyButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
-
-    return PressFeedback(
-      onTap: onTap,
-      child: Container(
-        padding: EdgeInsets.symmetric(horizontal: m.s(28), vertical: m.s(12)),
-        decoration: BoxDecoration(
-          gradient: primary
-              ? const LinearGradient(
-                  colors: [AppColors.gold, AppColors.goldDeep],
-                )
-              : null,
-          border: primary
-              ? null
-              : Border.all(color: AppColors.textMuted.withValues(alpha: 0.4)),
-          borderRadius: BorderRadius.circular(m.s(12)),
-        ),
-        child: Text(
-          label,
-          style: AppText.bold(
-            m.s(13),
-            primary ? AppColors.onGold : AppColors.textMuted,
-          ),
-        ),
-      ),
+    return ConstrainedBox(
+      constraints: BoxConstraints(minWidth: m.s(180)),
+      child: primary
+          ? GoldButton(
+              label: label,
+              icon: Icons.play_arrow_rounded,
+              onTap: onTap,
+            )
+          : GhostButton(label: label, dense: true, onTap: onTap),
     );
   }
 }
@@ -2492,14 +2253,18 @@ class _TableBody extends StatelessWidget {
     required this.tableStackKey,
     required this.throwOrigins,
     required this.flights,
+    required this.flownIds,
+    required this.onFlightLanded,
     required this.onCardThrown,
+    required this.onIllegal,
+    required this.onNotYourTurn,
+    required this.hint,
     required this.dealKey,
-    required this.handRevealed,
+    required this.dealProgress,
     required this.onDealComplete,
     required this.onDealProgress,
     required this.onHandSlotsMeasured,
-    required this.handCardCenters,
-    required this.dealRevealed,
+    required this.handSlots,
   });
 
   final GameSession session;
@@ -2513,69 +2278,49 @@ class _TableBody extends StatelessWidget {
   final GlobalKey tableStackKey;
   final Map<String, Offset> throwOrigins;
   final Map<String, _Flight> flights;
-  final void Function(PlayingCard card, Offset? releasePosition) onCardThrown;
+  final Set<String> flownIds;
+  final ValueChanged<String> onFlightLanded;
+  final void Function(PlayingCard card, ThrowRelease? release) onCardThrown;
+  final ValueChanged<PlayingCard> onIllegal;
+  final VoidCallback onNotYourTurn;
+  final _HandHint? hint;
 
-  /// Non-null only while a new hand is being dealt. Re-keyed each deal so
-  /// [_DealOverlay] replays its entrance; null clears it.
+  /// Non-null only while a new hand is being dealt.
   final Key? dealKey;
 
-  /// How many of the local player's cards are revealed so far (see
-  /// [_TableScreenState._handRevealed]). Drives the real hand filling in
-  /// card-by-card as the dealing flourish runs.
-  final int handRevealed;
-
-  /// Called by [_DealOverlay] once every card has landed, so the parent can
-  /// clear [_TableBody.dealKey] and let the real cards stand alone.
+  /// Cards dealt to each seat so far (null outside a deal).
+  final ValueListenable<List<int>?> dealProgress;
   final VoidCallback onDealComplete;
-
-  /// Called by [_DealOverlay] as each card lands, with how many cards each
-  /// seat has been dealt so far, so every hand fills in in real time.
   final ValueChanged<List<int>> onDealProgress;
-
-  /// Reports the global centre of every card's resting slot in the hand fan
-  /// (forwarded out of [HandFan]), so [_DealOverlay] can aim the player's own
-  /// flights at the exact slot each card will occupy.
-  final ValueChanged<List<Offset>> onHandSlotsMeasured;
-
-  /// The latest [HandFan] slot centres, in global coordinates. Forwarded into
-  /// [_DealOverlay] so the player's flights land on the fan, not the seat.
-  final List<Offset>? handCardCenters;
-
-  /// How many cards each seat has been dealt so far in the current deal, by
-  /// seat index. Non-null only while dealing, so opponents' face-down fans
-  /// fill in card-by-card; null once the deal is done (seats then show their
-  /// real [GameView.handCounts]).
-  final List<int>? dealRevealed;
+  final ValueChanged<Map<String, FanSlot>> onHandSlotsMeasured;
+  final Map<String, FanSlot>? Function() handSlots;
 
   @override
   Widget build(BuildContext context) {
     final view = session.view!;
     final m = Metrics.of(context);
-    // The hand and bid UI stay hidden until the dealing flourish has finished,
-    // so nothing that depends on seeing the cards (bidding, throwing) can
-    // happen before this player has actually been dealt them.
+    // The hand and bid UI stay hidden until the deal is down, so nothing that
+    // depends on seeing the cards can happen before they have been dealt.
     final dealing = dealKey != null;
-    // The turn clock starts the moment the deal view lands, while the dealing
-    // flourish is still running. Hide the countdowns until the cards are down
-    // so the deal does not appear to eat into anyone's bid or play time.
-    // Only real table sessions get the hide — plain GameSession stubs used in
-    // widget tests are never in the middle of an actual deal and must keep
-    // their clocks visible so widget tests on TurnClock still pass.
+    // The turn clock starts when the deal view lands; hide the countdowns
+    // until the cards are down so the deal does not appear to eat into
+    // anyone's time. Test stubs are never mid-deal and keep their clocks.
     final isReal =
         session is RemoteSession ||
         session is LocalSession ||
         session is LanHostSession;
     final clockDeadline = (dealing && isReal) ? null : session.turnDeadline;
+    final hidden = flights.keys.toSet();
 
     return Stack(
       key: tableStackKey,
       children: [
         Padding(
           padding: EdgeInsets.fromLTRB(
-            m.sc(14, 7),
+            m.sc(12, 7),
             m.sc(8, 4),
-            m.sc(14, 7),
-            m.sc(10, 4),
+            m.sc(12, 7),
+            m.sc(14, 4),
           ),
           child: Column(
             children: [
@@ -2585,10 +2330,9 @@ class _TableBody extends StatelessWidget {
                   onTapRoundPill: onToggleRoundHistory,
                   onTapSettings: onOpenSettings,
                 ),
-                SizedBox(height: m.sc(8, 4)),
+                SizedBox(height: m.sc(6, 4)),
               ] else
-                // Clears the floating HUD and shifts the felt itself down,
-                // trading that space for a tighter gap to the hand below.
+                // Clears the floating HUD.
                 SizedBox(height: m.s(34)),
               Expanded(
                 child: _Felt(
@@ -2597,36 +2341,39 @@ class _TableBody extends StatelessWidget {
                   seatKeys: seatKeys,
                   feltStackKey: feltStackKey,
                   throwOrigins: throwOrigins,
-                  hiddenIds: flights.keys.toSet(),
+                  hiddenIds: hidden,
+                  settledIds: flownIds,
                   turnDeadline: clockDeadline,
-                  dealRevealed: dealRevealed,
+                  dealing: dealing,
+                  dealProgress: dealProgress,
                 ),
               ),
-              SizedBox(height: m.sc(10, 0)),
+              SizedBox(height: m.sc(4, 0)),
               _HandArea(
                 view: view,
                 seatKeys: seatKeys,
                 onCardThrown: onCardThrown,
+                onIllegal: onIllegal,
+                onNotYourTurn: onNotYourTurn,
+                hint: hint,
                 dealing: dealing,
-                revealed: handRevealed,
+                dealProgress: dealProgress,
+                hiddenIds: hidden,
                 turnDeadline: clockDeadline,
                 onHandSlotsMeasured: onHandSlotsMeasured,
               ),
             ],
           ),
         ),
-        // Local throws in flight: rendered here, above the Padding/Column
-        // above (so above both the felt and the hand) rather than inside
-        // the felt itself — see [_TableScreenState._flights].
+        // Local throws in flight, above both the felt and the hand.
         for (final flight in flights.values)
           _ThrowFlight(
             key: ValueKey(flight.card.id),
             flight: flight,
             tableStackKey: tableStackKey,
+            onLanded: onFlightLanded,
           ),
-        // The dealing flourish, when a hand is being dealt. Painted above the
-        // felt, hand and seats (and above any throw flights already finishing)
-        // so the flying cards are never hidden behind a seat avatar.
+        // The dealing flourish, above the felt, hand and seats.
         if (dealKey != null)
           _DealOverlay(
             key: dealKey,
@@ -2634,20 +2381,19 @@ class _TableBody extends StatelessWidget {
             seatKeys: seatKeys,
             feltStackKey: feltStackKey,
             tableStackKey: tableStackKey,
-            handCardCenters: handCardCenters,
+            handSlots: handSlots,
             onDone: onDealComplete,
             onProgress: onDealProgress,
           ),
         // In landscape the HUD floats over the felt so the table can run to
-        // the very top edge of the screen; portrait keeps it in flow above
-        // the table.
+        // the top edge; portrait keeps it in flow above the table.
         if (!m.isPortrait)
           Positioned(
             left: 0,
             right: 0,
             top: 0,
             child: Padding(
-              padding: EdgeInsets.fromLTRB(m.s(14), m.s(12), m.s(14), 0),
+              padding: EdgeInsets.fromLTRB(m.s(14), m.s(10), m.s(14), 0),
               child: _Hud(
                 view: view,
                 onTapRoundPill: onToggleRoundHistory,
@@ -2661,11 +2407,16 @@ class _TableBody extends StatelessWidget {
             !dealing)
           Center(
             child: ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: m.s(300)),
-              child: BidPanel(
-                hand: view.hand,
-                onBid: session.placeBid,
-                deadline: session.turnDeadline,
+              constraints: BoxConstraints(maxWidth: m.s(320)),
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: m.s(16)),
+                child: PopIn(
+                  child: BidPanel(
+                    hand: view.hand,
+                    onBid: session.placeBid,
+                    deadline: session.turnDeadline,
+                  ),
+                ),
               ),
             ),
           ),
@@ -2696,108 +2447,17 @@ class _TableBody extends StatelessWidget {
 Future<bool> _confirmQuit(BuildContext context) async {
   final confirmed = await showDialog<bool>(
     context: context,
-    barrierColor: Colors.transparent,
+    barrierColor: const Color(0x8C000000),
     barrierDismissible: false,
-    builder: (context) => const _QuitConfirmDialog(),
+    builder: (context) => const ConfirmDialog(
+      title: 'Quit game?',
+      message: 'Your progress in this round will be lost.',
+      confirmLabel: 'Quit',
+      cancelLabel: 'Cancel',
+      icon: Icons.logout_rounded,
+    ),
   );
   return confirmed ?? false;
-}
-
-class _QuitConfirmDialog extends StatelessWidget {
-  const _QuitConfirmDialog();
-
-  @override
-  Widget build(BuildContext context) {
-    final m = Metrics.of(context);
-
-    return Dialog(
-      backgroundColor: Colors.transparent,
-      elevation: 0,
-      insetPadding: EdgeInsets.symmetric(horizontal: m.s(32)),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(maxWidth: m.s(300)),
-        child: Container(
-          padding: EdgeInsets.all(m.s(20)),
-          decoration: BoxDecoration(
-            color: const Color(0xE604120D),
-            borderRadius: BorderRadius.circular(m.s(18)),
-            border: Border.all(
-              color: AppColors.goldBorder.withValues(alpha: 0.35),
-            ),
-            boxShadow: const [
-              BoxShadow(
-                color: Color(0x99000000),
-                blurRadius: 30,
-                offset: Offset(0, 12),
-              ),
-            ],
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                'Quit game?',
-                textAlign: TextAlign.center,
-                style: AppText.bold(m.s(16), AppColors.textPrimary),
-              ),
-              SizedBox(height: m.s(8)),
-              Text(
-                'Your progress in this round will be lost.',
-                textAlign: TextAlign.center,
-                style: AppText.medium(m.s(13), AppColors.textMuted),
-              ),
-              SizedBox(height: m.s(20)),
-              Row(
-                children: [
-                  Expanded(
-                    child: PressFeedback(
-                      onTap: () => Navigator.of(context).pop(false),
-                      child: Container(
-                        alignment: Alignment.center,
-                        padding: EdgeInsets.symmetric(vertical: m.s(13)),
-                        decoration: BoxDecoration(
-                          color: AppColors.panel,
-                          borderRadius: BorderRadius.circular(m.s(14)),
-                          border: Border.all(color: AppColors.hairlineStrong),
-                        ),
-                        child: Text(
-                          'Cancel',
-                          style: AppText.semiBold(
-                            m.s(13),
-                            AppColors.textOnDark,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  SizedBox(width: m.s(12)),
-                  Expanded(
-                    child: PressFeedback(
-                      onTap: () => Navigator.of(context).pop(true),
-                      child: Container(
-                        alignment: Alignment.center,
-                        padding: EdgeInsets.symmetric(vertical: m.s(13)),
-                        decoration: BoxDecoration(
-                          gradient: const LinearGradient(
-                            colors: [AppColors.gold, AppColors.goldDeep],
-                          ),
-                          borderRadius: BorderRadius.circular(m.s(14)),
-                        ),
-                        child: Text(
-                          'Quit',
-                          style: AppText.bold(m.s(13), AppColors.onGold),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 class _Overlay extends StatelessWidget {
@@ -2810,12 +2470,16 @@ class _Overlay extends StatelessWidget {
     final m = Metrics.of(context);
 
     return Positioned.fill(
-      child: Container(
-        color: const Color(0x99000000),
-        alignment: Alignment.center,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxWidth: m.s(340)),
-          child: Padding(padding: EdgeInsets.all(m.s(20)), child: child),
+      child: ColoredBox(
+        color: AppColors.scrim,
+        child: Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: m.s(360)),
+            child: Padding(
+              padding: EdgeInsets.all(m.sc(20, 12)),
+              child: PopIn(child: child),
+            ),
+          ),
         ),
       ),
     );
@@ -2825,16 +2489,10 @@ class _Overlay extends StatelessWidget {
 // --------------------------------------------------------------------- hud
 
 /// The debug "Go offline" / "Back online" button for a networked table.
-///
-/// A single click severs the live connection exactly like a real drop would
-/// (or, when already simulating that, brings it straight back), which is what
-/// makes it useful for driving the reconnection UI on demand. Only ever shown
-/// once debug mode is armed — see [AppSettings.debugMode].
+/// Only ever shown once debug mode is armed — see [AppSettings.debugMode].
 class _GoOfflinePill extends StatelessWidget {
   const _GoOfflinePill({required this.offline, required this.onTap});
 
-  /// Whether this table is currently pretending to be disconnected; flips the
-  /// label and accent.
   final bool offline;
   final VoidCallback onTap;
 
@@ -2888,47 +2546,106 @@ class _Hud extends StatelessWidget {
   final VoidCallback onTapRoundPill;
   final VoidCallback onTapSettings;
 
+  String? get _progress => switch (view.phase) {
+    GamePhase.bidding => 'Bidding',
+    GamePhase.playing => 'Trick ${math.min(view.trickNumber + 1, 13)} of 13',
+    _ => null,
+  };
+
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
+    final progress = _progress;
 
     return Row(
       children: [
-        GlassPill(
-          radius: m.sc(16, 15),
-          padding: EdgeInsets.all(m.sc(8, 9)),
-          border: AppColors.hairlineStrong,
+        _HudButton(
+          icon: Icons.arrow_back_rounded,
           onTap: () => Navigator.of(context).maybePop(),
-          child: Icon(
-            Icons.arrow_back_rounded,
-            size: m.sc(16, 19),
-            color: AppColors.textOnDark,
-          ),
         ),
         SizedBox(width: m.s(8)),
-        GlassPill(
-          radius: m.sc(16, 15),
-          padding: EdgeInsets.all(m.sc(8, 9)),
-          border: AppColors.hairlineStrong,
-          onTap: onTapSettings,
-          child: Icon(
-            Icons.tune_rounded,
-            size: m.sc(16, 19),
-            color: AppColors.textOnDark,
-          ),
-        ),
-        const Spacer(),
-        GlassPill(
-          radius: m.sc(16, 15),
-          padding: EdgeInsets.symmetric(
-            horizontal: m.sc(14, 16),
-            vertical: m.sc(8, 9),
-          ),
-          border: AppColors.goldBorder.withValues(alpha: 0.35),
-          onTap: onTapRoundPill,
-          child: Text(
-            'Round ${view.handNumber} / ${view.handsPerGame}',
-            style: AppText.semiBold(m.sc(12, 13), AppColors.gold),
+        _HudButton(icon: Icons.tune_rounded, onTap: onTapSettings),
+        SizedBox(width: m.s(8)),
+        // Scales down rather than overflowing on the narrowest phones.
+        Expanded(
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerRight,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Spades are always trump — said once, quietly, where it can be
+                  // checked at a glance.
+                  GlassPill(
+                    radius: m.sc(14, 13),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: m.sc(10, 10),
+                      vertical: m.sc(7, 7),
+                    ),
+                    border: AppColors.goldBorder.withValues(alpha: 0.3),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SuitGlyph(
+                          suit: Suit.spades,
+                          size: m.sc(14, 14),
+                          color: AppColors.gold,
+                        ),
+                        SizedBox(width: m.s(5)),
+                        Text(
+                          'Trump',
+                          style: AppText.semiBold(m.sc(11, 11), AppColors.gold),
+                        ),
+                      ],
+                    ),
+                  ),
+                  SizedBox(width: m.s(8)),
+                  GlassPill(
+                    radius: m.sc(14, 13),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: m.sc(12, 14),
+                      vertical: m.sc(
+                        progress == null ? 9 : 5,
+                        progress == null ? 9 : 5,
+                      ),
+                    ),
+                    border: AppColors.goldBorder.withValues(alpha: 0.45),
+                    onTap: onTapRoundPill,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              'Round ${view.handNumber} / ${view.handsPerGame}',
+                              style: AppText.bold(m.sc(12, 12), AppColors.gold),
+                            ),
+                            if (progress != null)
+                              Text(
+                                progress,
+                                style: AppText.medium(
+                                  m.sc(10, 10),
+                                  AppColors.textMuted,
+                                ),
+                              ),
+                          ],
+                        ),
+                        SizedBox(width: m.s(4)),
+                        Icon(
+                          Icons.leaderboard_rounded,
+                          size: m.sc(15, 15),
+                          color: AppColors.gold.withValues(alpha: 0.8),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ],
@@ -2936,13 +2653,29 @@ class _Hud extends StatelessWidget {
   }
 }
 
+class _HudButton extends StatelessWidget {
+  const _HudButton({required this.icon, required this.onTap});
+
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Metrics.of(context);
+    return GlassPill(
+      radius: m.sc(14, 13),
+      padding: EdgeInsets.all(m.sc(9, 9)),
+      border: AppColors.hairlineStrong,
+      onTap: onTap,
+      child: Icon(icon, size: m.sc(18, 18), color: AppColors.textOnDark),
+    );
+  }
+}
+
 // -------------------------------------------------------------------- felt
 
-/// Reads a [GlobalKey]'s [RenderBox] after layout to find how far its centre
-/// sits from [feltKey]'s own centre, in the same logical-pixel units the
-/// felt's internal (un-positioned, centre-aligned) offsets already use.
-/// Returns `null` when either widget hasn't been laid out yet (e.g. the very
-/// first frame) — callers should fall back to an approximate offset then.
+/// How far [seatKey]'s centre sits from [feltKey]'s centre, after layout, or
+/// null when either hasn't been laid out yet (callers fall back).
 Offset? _measureSeatAnchor(GlobalKey seatKey, GlobalKey feltKey) {
   final seatBox = seatKey.currentContext?.findRenderObject();
   final feltBox = feltKey.currentContext?.findRenderObject();
@@ -2962,11 +2695,8 @@ Offset? _measureSeatAnchor(GlobalKey seatKey, GlobalKey feltKey) {
   return seatCenterGlobal - feltCenterGlobal;
 }
 
-/// Converts a screen (global) position — typically where a drag/tap gesture
-/// released a card — into the same felt-centred coordinate space as
-/// [_measureSeatAnchor], so it can stand in for a seat anchor as a throw's
-/// start point. Returns null if there's no position to convert or the felt
-/// hasn't been laid out yet.
+/// Converts a screen position into the felt-centred space of
+/// [_measureSeatAnchor]. Null without a position or before layout.
 Offset? _feltRelativeOffset(Offset? globalPosition, GlobalKey feltKey) {
   if (globalPosition == null) return null;
   final feltBox = feltKey.currentContext?.findRenderObject();
@@ -2979,38 +2709,29 @@ Offset? _feltRelativeOffset(Offset? globalPosition, GlobalKey feltKey) {
   return globalPosition - feltCenterGlobal;
 }
 
-/// The felt's long axis relative to its short one. It's the same oval in both
-/// orientations — only turned to suit the screen, so the table reads alike
-/// however the device is held.
-const _feltAspect = 1.66;
+/// The table's long axis relative to its short one — the same shape in both
+/// orientations, only turned to suit the screen.
+const _feltAspect = 1.62;
 
 // Landscape's placement within its box, as fractions of the box's height. It
-// deliberately runs past the bottom by [_feltOverhang] so its rim disappears
-// behind the hand fan rather than stopping short of it.
-const _feltTopInset = 0.03;
+// runs past the bottom by [_feltOverhang] so its rim tucks behind the hand.
+const _feltTopInset = 0.04;
 const _feltBottomInset = _feltTopInset * (1 - 0.33);
-const _feltOverhang = 0.14;
+const _feltOverhang = 0.12;
 const _feltHeightFactor = 1 + _feltOverhang - _feltTopInset - _feltBottomInset;
 
-/// The felt's size, and its top edge's distance from its box's top edge.
-///
-/// Landscape lays the oval on its side, long axis running left seat to right
-/// seat. Portrait stands the same oval on end — a quarter turn — so the long
-/// axis instead runs from the top seat down to the player's own, which is the
-/// way a tall screen wants it. Either way the near end of the table is the
-/// player's end.
+/// The table's size, and its top edge's distance from its box's top edge.
+/// Portrait stands the oval on end (long axis from the top seat down to the
+/// player's own); landscape lays it on its side.
 ({double width, double height, double top}) _feltGeometry(
   BoxConstraints c,
   bool isPortrait,
 ) {
   if (isPortrait) {
-    // Height leads and width follows from the aspect, so the oval keeps its
-    // shape; the second term only bites on a screen too narrow to stand the
-    // full-height oval up in.
-    final height = [
-      c.maxHeight * 0.79,
-      c.maxWidth * 0.94 * _feltAspect,
-    ].reduce((a, b) => a < b ? a : b);
+    final height = math.min(
+      c.maxHeight * 0.86,
+      c.maxWidth * 0.86 * _feltAspect,
+    );
     return (
       width: height / _feltAspect,
       height: height,
@@ -3018,17 +2739,14 @@ const _feltHeightFactor = 1 + _feltOverhang - _feltTopInset - _feltBottomInset;
     );
   }
   return (
-    width: c.maxWidth * 0.575,
+    width: c.maxWidth * 0.6,
     height: c.maxHeight * _feltHeightFactor,
     top: c.maxHeight * _feltTopInset,
   );
 }
 
-/// How far the felt's visual centre sits below its box's centre — positive
-/// means down. Zero in portrait, where the felt is vertically centred in its
-/// box; positive in landscape, where the felt is pushed down so its bottom
-/// tucks under the player's hand. Thrown cards land on this offset, so the
-/// resting diamond reads as mid-table rather than crowding the opposite seat.
+/// How far the table's visual centre sits below its box's centre. Thrown
+/// cards rest on this offset so they read as mid-table.
 double _feltCenterBias(Size box, bool isPortrait) {
   final felt = _feltGeometry(
     BoxConstraints(maxWidth: box.width, maxHeight: box.height),
@@ -3045,8 +2763,10 @@ class _Felt extends StatelessWidget {
     required this.feltStackKey,
     required this.throwOrigins,
     required this.hiddenIds,
+    required this.settledIds,
     required this.turnDeadline,
-    required this.dealRevealed,
+    required this.dealing,
+    required this.dealProgress,
   });
 
   final GameView view;
@@ -3055,15 +2775,10 @@ class _Felt extends StatelessWidget {
   final GlobalKey feltStackKey;
   final Map<String, Offset> throwOrigins;
   final Set<String> hiddenIds;
-
-  /// When the seat on the clock runs out of time. Null when nobody is being
-  /// waited on — a bot's turn, or an offline game.
+  final Set<String> settledIds;
   final DateTime? turnDeadline;
-
-  /// How many cards each seat has been dealt so far during the current deal,
-  /// by seat index. Non-null only while dealing, so opponents' face-down fans
-  /// grow card-by-card in real time; null lets seats show their real counts.
-  final List<int>? dealRevealed;
+  final bool dealing;
+  final ValueListenable<List<int>?> dealProgress;
 
   @override
   Widget build(BuildContext context) {
@@ -3072,56 +2787,36 @@ class _Felt extends StatelessWidget {
         ? view.lastTrick!.plays
         : view.trick;
     final winner = view.awaitingTrickClear ? view.lastTrick!.winner : null;
+    final waitingOn =
+        !dealing &&
+            view.turn != null &&
+            !view.awaitingTrickClear &&
+            (view.phase == GamePhase.bidding || view.phase == GamePhase.playing)
+        ? slotFor(seat: view.turn!, viewer: view.you)
+        : null;
+    final leadSuit = !view.awaitingTrickClear && view.trick.isNotEmpty
+        ? view.trick.first.card.suit
+        : null;
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        // Clamp against height as well as width — in landscape the felt is
-        // wide but short, and cards sized purely off width would overflow
-        // the available height (and crowd the seats around it).
-        final cardWidth = m
-            .s(44)
-            .clamp(
-              0.0,
-              [
-                constraints.maxWidth * 0.16,
-                constraints.maxHeight * 0.3,
-              ].reduce((a, b) => a < b ? a : b),
-            );
-        final spread = (constraints.maxHeight * 0.19).clamp(
-          0.0,
-          constraints.maxWidth * 0.22,
-        );
-
-        // Felt geometry as an explicit size and placement rather than four
-        // independent insets, so the two orientations can be compared — and
-        // matched — directly. [top] is measured from the box's own top edge;
-        // where top + height runs past the box, the felt paints beyond its
-        // bottom and tucks under the hand fan (see the OverflowBox below),
-        // and where width exceeds the box it bleeds off both side edges.
+        final cardWidth = trickCardWidth(m, constraints.biggest);
         final felt = _feltGeometry(constraints, m.isPortrait);
-        // Left/right seats are measured in from the box edge, so they track
-        // the felt's own rim — clamped at 0 for a felt wider than the box.
-        final feltInsetH = ((constraints.maxWidth - felt.width) / 2).clamp(
+        // Side seats are measured in from the box edge so they track the
+        // table's rim.
+        final feltInsetH = math.max(
           0.0,
-          double.infinity,
+          (constraints.maxWidth - felt.width) / 2,
         );
-        final seatOverlap = m.sc(14, 10);
+        final seatOverlap = m.sc(16, 12);
         final seatInsetH = (feltInsetH - seatOverlap).clamp(0.0, feltInsetH);
 
-        // Real measured seat/hand anchors, relative to the felt stack's own
-        // centre — this is the coordinate origin TrickCluster's internal
-        // offsets are already relative to, since the Stack below centres its
-        // un-positioned children. Slots not yet laid out (first frame or
-        // two) are simply absent; TrickCluster falls back for those.
+        // Real measured seat anchors relative to this stack's centre (the
+        // origin TrickCluster's offsets use). Unmeasured slots fall back.
         final seatAnchors = <SeatSlot, Offset>{
           for (final slot in SeatSlot.values)
             slot: ?_measureSeatAnchor(seatKeys[slot]!, feltStackKey),
         };
-
-        // In landscape the felt is pushed down so its bottom tucks under the
-        // hand, leaving its visual centre below this stack's centre; bias the
-        // thrown-card diamond down by that gap so cards land mid-table instead
-        // of crowding the opposite seat.
         final restBias = Offset(
           0,
           _feltCenterBias(constraints.biggest, m.isPortrait),
@@ -3130,22 +2825,13 @@ class _Felt extends StatelessWidget {
         return Stack(
           key: feltStackKey,
           alignment: Alignment.center,
-          // A thrown card's flight starts down at the player's hand, well
-          // below this stack's own box — with the default hardEdge clip
-          // that portion is cut off until it crosses back inside, so the
-          // card seems to pop into view partway through the throw instead
-          // of visibly leaving the hand. Clip.none keeps the whole path
-          // visible and continuous.
+          // Thrown cards travel in from well outside this box; Clip.none keeps
+          // the whole path visible.
           clipBehavior: Clip.none,
           children: [
-            // Reports constraints.biggest as its own size whatever the felt
-            // measures, so this Stack's size and centre never move — seat
-            // anchors, TrickCluster's origin and the card-throw flight target
-            // are all measured off them. The felt itself is laid out at its
-            // own size, top-aligned then pushed down by [felt.top], so any
-            // excess spills past the box's bottom and side edges instead of
-            // resizing anything. The Column paints the felt before the hand,
-            // so a bottom spill lands under the player's cards, not over them.
+            // Reports constraints.biggest as its size whatever the table
+            // measures, so the anchors measured off this stack never move;
+            // excess spills past the box (under the hand) instead.
             OverflowBox(
               alignment: Alignment.topCenter,
               minWidth: 0,
@@ -3157,7 +2843,11 @@ class _Felt extends StatelessWidget {
                 child: SizedBox(
                   width: felt.width,
                   height: felt.height,
-                  child: FeltSurface(palette: palette),
+                  child: FeltSurface(
+                    palette: palette,
+                    spotlight: waitingOn,
+                    leadSuit: leadSuit,
+                  ),
                 ),
               ),
             ),
@@ -3165,11 +2855,11 @@ class _Felt extends StatelessWidget {
               plays: trickCards,
               viewer: view.you,
               cardWidth: cardWidth,
-              spread: spread,
               winner: winner,
               seatAnchors: seatAnchors,
               throwOrigins: throwOrigins,
               hiddenIds: hiddenIds,
+              settledIds: settledIds,
               restBias: restBias,
             ),
             for (final seat in [0, 1, 2, 3])
@@ -3180,7 +2870,7 @@ class _Felt extends StatelessWidget {
                 horizontalInset: seatInsetH,
                 feltTopEdge: felt.top,
                 turnDeadline: turnDeadline,
-                dealRevealed: dealRevealed,
+                dealProgress: dealProgress,
               ),
           ],
         );
@@ -3197,7 +2887,7 @@ class _SeatAt extends StatelessWidget {
     required this.horizontalInset,
     required this.feltTopEdge,
     required this.turnDeadline,
-    required this.dealRevealed,
+    required this.dealProgress,
   });
 
   final GameView view;
@@ -3206,42 +2896,46 @@ class _SeatAt extends StatelessWidget {
   final double horizontalInset;
   final DateTime? turnDeadline;
 
-  /// Distance from the stack's own top edge down to the felt surface's real
-  /// top edge — where the top seat's avatar should straddle, half above the
-  /// rim and half over the felt.
+  /// Distance from the stack's top edge down to the table's real top edge —
+  /// where the top seat straddles the rim.
   final double feltTopEdge;
 
-  /// How many cards this seat has been dealt so far during the current deal,
-  /// by seat index. Non-null only while dealing, so the face-down fan grows
-  /// card-by-card; null lets the seat show its real [GameView.handCounts].
-  final List<int>? dealRevealed;
+  /// Cards dealt per seat so far, while dealing; the face-down fan grows
+  /// card by card. Only this seat rebuilds as it ticks.
+  final ValueListenable<List<int>?> dealProgress;
 
   @override
   Widget build(BuildContext context) {
     final slot = slotFor(seat: seat, viewer: view.you);
     if (slot == SeatSlot.bottom) return const SizedBox.shrink();
+    final palette = SettingsScope.of(context).palette;
 
-    final seatView = SeatView(
-      key: seatKeys[slot],
-      player: view.players[seat],
-      slot: slot,
-      palette: SettingsScope.of(context).palette,
-      bid: view.bids[seat],
-      tricksWon: view.tricksWon[seat],
-      isTurn: view.turn == seat,
-      isDealer: view.dealer == seat,
-      isHost: view.hostSeat == seat,
-      deadline: view.turn == seat ? turnDeadline : null,
-      handCount: dealRevealed != null && seat < dealRevealed!.length
-          ? dealRevealed![seat]
-          : (seat < view.handCounts.length ? view.handCounts[seat] : null),
+    final seatView = ValueListenableBuilder<List<int>?>(
+      valueListenable: dealProgress,
+      builder: (context, dealt, _) => SeatView(
+        key: seatKeys[slot],
+        player: view.players[seat],
+        slot: slot,
+        palette: palette,
+        // Nothing about the bidding shows until this screen's deal is down: a
+        // table whose clock this app does not run (or a deal slowed by the
+        // animation-speed setting) can bid while cards are still in the air
+        // here. Bids made meanwhile pop up the moment the deal ends.
+        bid: dealt != null ? null : view.bids[seat],
+        tricksWon: view.tricksWon[seat],
+        isTurn: dealt == null && view.turn == seat,
+        isDealer: view.dealer == seat,
+        isHost: view.hostSeat == seat,
+        deadline: view.turn == seat ? turnDeadline : null,
+        handCount: dealt != null && seat < dealt.length
+            ? dealt[seat]
+            : (seat < view.handCounts.length ? view.handCounts[seat] : null),
+      ),
     );
 
     return switch (slot) {
-      // Anchored at the felt's actual top edge, then pulled up by exactly
-      // half its own height so it straddles the rim — half sitting above
-      // the felt, half over it — instead of resting low enough to overlap
-      // the top seat's thrown card, which lands just beneath it.
+      // Anchored at the table's top edge and pulled up by half its own height,
+      // so it straddles the rim.
       SeatSlot.top => Positioned(
         top: feltTopEdge,
         child: FractionalTranslation(
@@ -3263,78 +2957,259 @@ class _HandArea extends StatelessWidget {
     required this.view,
     required this.seatKeys,
     required this.onCardThrown,
+    required this.onIllegal,
+    required this.onNotYourTurn,
+    required this.hint,
     required this.dealing,
-    required this.revealed,
+    required this.dealProgress,
+    required this.hiddenIds,
     required this.turnDeadline,
     required this.onHandSlotsMeasured,
   });
 
   final GameView view;
   final Map<SeatSlot, GlobalKey> seatKeys;
-  final void Function(PlayingCard card, Offset? releasePosition) onCardThrown;
+  final void Function(PlayingCard card, ThrowRelease? release) onCardThrown;
+  final ValueChanged<PlayingCard> onIllegal;
+  final VoidCallback onNotYourTurn;
+  final _HandHint? hint;
 
-  /// True while a new hand is still being dealt out. The dealt cards are not
-  /// this player's to touch until the flourish has finished, so the fan stays
-  /// inert during it; the felt and seat geometry also stay fixed.
+  /// True while the hand is still being dealt — the fan stays inert.
   final bool dealing;
 
-  /// How many of the player's cards are revealed so far, which while dealing
-  /// grows from 0 to 13 so the hand fills in card-by-card in real time instead
-  /// of appearing all at once.
-  final int revealed;
+  /// Cards dealt per seat so far; the hand reveals card by card from it.
+  final ValueListenable<List<int>?> dealProgress;
 
-  /// When the seat on the clock runs out. Nulled out while dealing so the
-  /// flourish does not render a draining clock.
+  /// Thrown cards awaiting confirmation, kept out of the fan.
+  final Set<String> hiddenIds;
+
+  /// When the seat on the clock runs out; nulled while dealing.
   final DateTime? turnDeadline;
 
-  /// Reports the global centre of every card's resting slot in the fan, so the
-  /// dealing flourish can land each flying card on the slot it will actually
-  /// occupy rather than on the seat avatar. Forwarded from [HandFan].
-  final ValueChanged<List<Offset>> onHandSlotsMeasured;
+  final ValueChanged<Map<String, FanSlot>> onHandSlotsMeasured;
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
     final you = view.you;
-    final cardWidth = m.sc(54, 61);
-    // Reveal the dealt cards progressively, but always anchor layout to the
-    // full hand so the fan and the seats never shift as it fills in.
-    final shown = dealing ? revealed : view.hand.length;
+    final interactive =
+        !dealing && view.phase == GamePhase.playing && view.isMyTurn;
 
+    final fan = ValueListenableBuilder<List<int>?>(
+      valueListenable: dealProgress,
+      builder: (context, dealt, _) {
+        final revealed = !dealing
+            ? null
+            : (dealt != null && you != null && you < dealt.length
+                  ? dealt[you]
+                  : 0);
+        return HandFan(
+          cards: view.hand,
+          revealedCount: revealed,
+          hiddenIds: hiddenIds,
+          legalIds: view.legalMoveIds,
+          interactive: interactive,
+          gesturesEnabled: !dealing,
+          cardWidth: _handCardWidth(m),
+          onPlay: onCardThrown,
+          onIllegal: onIllegal,
+          onNotYourTurn: onNotYourTurn,
+          onSlotsMeasured: onHandSlotsMeasured,
+        );
+      },
+    );
+
+    final plate = you == null
+        ? null
+        : SeatView(
+            key: seatKeys[SeatSlot.bottom],
+            player: view.players[you],
+            slot: SeatSlot.bottom,
+            palette: SettingsScope.of(context).palette,
+            bid: dealing ? null : view.bids[you],
+            tricksWon: view.tricksWon[you],
+            isTurn: !dealing && view.turn == you,
+            isDealer: view.dealer == you,
+            isHost: view.hostSeat == you,
+            deadline: view.turn == you ? turnDeadline : null,
+            axis: m.isPortrait ? Axis.horizontal : Axis.vertical,
+          );
+
+    final shownHint = hint ?? (interactive ? const _HandHint.yourTurn() : null);
+    final hintLine = IgnorePointer(child: _HintLine(hint: shownHint));
+
+    if (m.isPortrait) {
+      // The player's own plate sits between the table and the hand, never on
+      // top of the cards.
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Stack(
+            clipBehavior: Clip.none,
+            alignment: Alignment.center,
+            children: [
+              plate ?? SizedBox(height: m.s(40)),
+              Positioned(top: -m.s(40), child: hintLine),
+            ],
+          ),
+          SizedBox(height: m.s(2)),
+          fan,
+        ],
+      );
+    }
+
+    // Landscape has width to spare and no height: the plate stands at the
+    // left edge, level with the hand.
+    final side = m.s(104);
     return Stack(
       clipBehavior: Clip.none,
       alignment: Alignment.bottomCenter,
       children: [
         Padding(
-          // Nudges the fan up so its cards clear the overlaid avatar/chips
-          // instead of being hidden underneath them. Landscape bumped to
-          // match the bigger landscape avatar size.
-          padding: EdgeInsets.only(bottom: m.sc(30, 30)),
-          child: HandFan(
-            cards: view.hand,
-            revealedCount: shown,
-            legalIds: view.legalMoveIds,
-            interactive:
-                !dealing && view.phase == GamePhase.playing && view.isMyTurn,
-            cardWidth: cardWidth,
-            onPlay: onCardThrown,
-            onSlotsMeasured: onHandSlotsMeasured,
-          ),
+          padding: EdgeInsets.symmetric(horizontal: side),
+          child: fan,
         ),
-        if (you != null)
-          SeatView(
-            key: seatKeys[SeatSlot.bottom],
-            player: view.players[you],
-            slot: SeatSlot.bottom,
-            palette: SettingsScope.of(context).palette,
-            bid: view.bids[you],
-            tricksWon: view.tricksWon[you],
-            isTurn: view.turn == you,
-            isDealer: view.dealer == you,
-            isHost: view.hostSeat == you,
-            deadline: view.turn == you ? turnDeadline : null,
-          ),
+        if (plate != null) Positioned(left: 0, bottom: m.s(2), child: plate),
+        Positioned(top: -m.s(30), child: hintLine),
       ],
+    );
+  }
+}
+
+enum _HintTone { turn, refused, info }
+
+/// One line of help above the hand: whose move it is, or why a card was
+/// refused ("Follow suit — play a heart").
+class _HandHint {
+  const _HandHint._(this.text, this.tone, {this.suit, this.icon});
+
+  const _HandHint.yourTurn()
+    : text = 'Your turn',
+      tone = _HintTone.turn,
+      suit = null,
+      icon = Icons.touch_app_rounded;
+
+  const _HandHint.waiting()
+    : text = 'Wait for your turn',
+      tone = _HintTone.info,
+      suit = null,
+      icon = Icons.hourglass_top_rounded;
+
+  /// Explains, from the rules, why [card] cannot be played into the trick.
+  factory _HandHint.illegal(GameView view, PlayingCard card) {
+    const fallback = _HandHint._(
+      "That card can't be played right now",
+      _HintTone.refused,
+      icon: Icons.block_rounded,
+    );
+    final trick = view.trick;
+    if (trick.isEmpty) return fallback;
+    final led = trick.first.card.suit;
+    final hand = view.hand;
+    if (hand.any((c) => c.suit == led)) {
+      if (card.suit != led) {
+        return _HandHint._(
+          'Follow suit — play a ${_one(led)}',
+          _HintTone.refused,
+          suit: led,
+        );
+      }
+      return _HandHint._(
+        'Beat the trick — play a higher ${_one(led)}',
+        _HintTone.refused,
+        suit: led,
+      );
+    }
+    if (hand.any((c) => c.isTrump)) {
+      final trumped = trick.any((p) => p.card.isTrump);
+      return _HandHint._(
+        trumped
+            ? 'Overtrump — play a higher spade'
+            : 'No ${_one(led)}s left — you must play a spade',
+        _HintTone.refused,
+        suit: Suit.spades,
+      );
+    }
+    return fallback;
+  }
+
+  final String text;
+  final _HintTone tone;
+  final Suit? suit;
+  final IconData? icon;
+
+  static String _one(Suit s) => switch (s) {
+    Suit.spades => 'spade',
+    Suit.hearts => 'heart',
+    Suit.diamonds => 'diamond',
+    Suit.clubs => 'club',
+  };
+}
+
+class _HintLine extends StatelessWidget {
+  const _HintLine({required this.hint});
+
+  final _HandHint? hint;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Metrics.of(context);
+    final h = hint;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      switchInCurve: Curves.easeOutBack,
+      switchOutCurve: Curves.easeIn,
+      transitionBuilder: (child, a) => FadeTransition(
+        opacity: a,
+        child: ScaleTransition(
+          scale: Tween(begin: 0.85, end: 1.0).animate(a),
+          child: child,
+        ),
+      ),
+      child: h == null ? const SizedBox.shrink() : _pill(m, h),
+    );
+  }
+
+  Widget _pill(Metrics m, _HandHint h) {
+    final turn = h.tone == _HintTone.turn;
+    final refused = h.tone == _HintTone.refused;
+    final fg = turn
+        ? AppColors.onGold
+        : (refused ? const Color(0xFFFFB4AC) : AppColors.textOnDark);
+    return Container(
+      key: ValueKey(h.text),
+      padding: EdgeInsets.symmetric(horizontal: m.s(12), vertical: m.s(6)),
+      decoration: BoxDecoration(
+        gradient: turn ? goldButtonGradient : surfaceGradient,
+        borderRadius: BorderRadius.circular(m.s(20)),
+        border: Border.all(
+          color: turn
+              ? const Color(0x66FFF6D8)
+              : refused
+              ? AppColors.danger.withValues(alpha: 0.7)
+              : AppColors.hairlineStrong,
+        ),
+        boxShadow: turn
+            ? AppShadows.glow(AppColors.goldDeep, strength: 0.9)
+            : AppShadows.low,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (h.suit != null)
+            SuitGlyph(
+              suit: h.suit!,
+              size: m.s(13),
+              color: h.suit!.isRed
+                  ? const Color(0xFFFF8A7E)
+                  : AppColors.textPrimary,
+            )
+          else if (h.icon != null)
+            Icon(h.icon, size: m.s(14), color: fg),
+          SizedBox(width: m.s(6)),
+          Text(h.text, style: AppText.bold(m.s(12), fg)),
+        ],
+      ),
     );
   }
 }

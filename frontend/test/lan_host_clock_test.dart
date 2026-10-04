@@ -55,6 +55,13 @@ void _hostPlaysHand(FakeAsync async, LanHostSession session) {
   fail('the hand never finished with the host playing');
 }
 
+/// Long enough for the three bots to bid ahead of the host: bidding opens
+/// once the deal animation is over, then each bot takes at most its full
+/// think time.
+final _botsBidFirst =
+    TablePacing.dealGrace +
+    (TablePacing.botThinkMin + TablePacing.botThinkExtra) * 3;
+
 void main() {
   test('the host cannot start a LAN table with no guests', () {
     final session = LanHostSession(playerName: 'You', roomCode: 'TEST');
@@ -81,7 +88,7 @@ void main() {
 
       // The engine deals to seat 1, so the three bots bid first and the host
       // is left as the only seat the hand is waiting on.
-      async.elapse(const Duration(seconds: 5));
+      async.elapse(_botsBidFirst);
       expect(session.view!.phase, GamePhase.bidding);
       expect(session.view!.turn, LanHostSession.hostSeat);
       expect(
@@ -114,7 +121,7 @@ void main() {
       final session = _table();
       addTearDown(session.dispose);
 
-      async.elapse(const Duration(seconds: 5));
+      async.elapse(_botsBidFirst);
       expect(session.view!.turn, LanHostSession.hostSeat);
       session.placeBid(3);
 

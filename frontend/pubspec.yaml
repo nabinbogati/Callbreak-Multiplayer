@@ -31,6 +31,10 @@ dev_dependencies:
   # Winds a hosted table's clocks forward, so a test does not sit through a
   # twenty-second turn timeout in real time.
   fake_async: ^1.3.1
+  # Lets a test stand in for the native audio plugin (the platform-interface
+  # pattern's own seam), to pin down how many native players the sound effects
+  # create. Already resolved as a transitive dependency of audioplayers.
+  audioplayers_platform_interface: ^7.2.0
 
 flutter:
   uses-material-design: true

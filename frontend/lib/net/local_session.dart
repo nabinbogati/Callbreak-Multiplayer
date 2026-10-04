@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:clock/clock.dart';
+
 import '../bots/bot.dart';
 import '../engine/card.dart';
 import '../engine/game.dart';
@@ -22,10 +24,11 @@ class TablePacing {
   /// hurried.
   static const bidTimeout = Duration(seconds: 5);
 
-  /// Extra time given to the very first bidder of a hand. The turn clock is
-  /// anchored the moment the deal view goes out, while the dealing animation
-  /// is still on screen, so the grace keeps that animation from eating into
-  /// the bid.
+  /// How long after a deal bidding opens. The deal view goes out the moment
+  /// the cards are dealt, while the dealing animation (`Motion.dealTotalMs`)
+  /// is still playing; until it is over no bot bids and no bid clock runs, so
+  /// nobody's bid appears — or is hurried — mid-deal. Matches the server's
+  /// `Pacing.DealGrace`.
   static const dealGrace = Duration(milliseconds: 3500);
 
   /// How long a human seat has to play a card, indexed by how many cards are
@@ -215,7 +218,29 @@ class LocalSession extends GameSession {
     final brain = _brains[seat];
     if (brain == null) return;
 
-    _timer = Timer(_thinkTime(), () => _takeBotTurn(seat, brain));
+    _timer = Timer(
+      _untilBiddingOpens() + _thinkTime(),
+      () => _takeBotTurn(seat, brain),
+    );
+  }
+
+  /// The game and hand the deal time below belongs to, so a new hand — or a
+  /// restarted game, which starts again at hand 0 — is stamped afresh.
+  (CallBreakGame, int)? _dealtFor;
+  DateTime _dealtAt = DateTime(0);
+
+  /// How long until bidding opens: [TablePacing.dealGrace] after the deal,
+  /// scaled like the dealing animation itself. Zero outside bidding and once
+  /// it has passed.
+  Duration _untilBiddingOpens() {
+    if (_game.phase != GamePhase.bidding) return Duration.zero;
+    final hand = (_game, _game.handIndex);
+    if (_dealtFor != hand) {
+      _dealtFor = hand;
+      _dealtAt = clock.now();
+    }
+    final left = _dealtAt.add(_scaled(TablePacing.dealGrace)).difference(clock.now());
+    return left.isNegative ? Duration.zero : left;
   }
 
   /// Scales a [TablePacing] duration by the user's animation speed setting.

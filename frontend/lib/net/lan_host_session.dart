@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:clock/clock.dart';
+
 import '../bots/bot.dart';
 import '../engine/card.dart';
 import '../engine/game.dart';
@@ -588,26 +590,44 @@ class LanHostSession extends GameSession {
     final seat = _game.turn;
     if (seat == null) return;
 
+    // Bidding opens only once the dealing animation is over on every screen:
+    // until then no bot bids and no person's bid clock runs.
+    final opensIn = _untilBiddingOpens();
+
     if (_isServerDriven(seat)) {
-      _timer = Timer(_thinkTime(), () => _takeServerTurn(seat));
+      _timer = Timer(opensIn + _thinkTime(), () => _takeServerTurn(seat));
       return;
     }
 
     // A person is on the clock. Give them a real turn, then play it for them.
     // Mid-trick, less thinking time is fair: whoever leads decides the suit
     // from scratch, and each seat after sees more of the trick already down.
-    var timeout = _game.phase == GamePhase.bidding
-        ? TablePacing.bidTimeout
-        : TablePacing.playTimeouts[_game.trick.length];
-    // The clock is anchored while the dealing animation is still on screen.
-    // The hand's very first bidder gets extra time so the animation does not
-    // eat into their bid.
-    if (_game.phase == GamePhase.bidding &&
-        _game.bids.every((b) => b == null)) {
-      timeout += TablePacing.dealGrace;
-    }
+    final timeout = opensIn +
+        (_game.phase == GamePhase.bidding
+            ? TablePacing.bidTimeout
+            : TablePacing.playTimeouts[_game.trick.length]);
     _turnDeadline = DateTime.now().add(timeout);
     _timer = Timer(timeout, () => _timeOutSeat(seat));
+  }
+
+  /// The game and hand the deal time below belongs to, so a new hand — or a
+  /// restarted game, which starts again at hand 0 — is stamped afresh.
+  (CallBreakGame, int)? _dealtFor;
+  DateTime _dealtAt = DateTime(0);
+
+  /// How long until bidding opens: [TablePacing.dealGrace] after the deal,
+  /// measured from the deal itself so a republish (a guest joining, a tap)
+  /// cannot push it back. Unscaled, like the server's: the guests' animation
+  /// speed is theirs to choose. Zero outside bidding and once it has passed.
+  Duration _untilBiddingOpens() {
+    if (_game.phase != GamePhase.bidding) return Duration.zero;
+    final hand = (_game, _game.handIndex);
+    if (_dealtFor != hand) {
+      _dealtFor = hand;
+      _dealtAt = clock.now();
+    }
+    final left = _dealtAt.add(TablePacing.dealGrace).difference(clock.now());
+    return left.isNegative ? Duration.zero : left;
   }
 
   /// Time left until [due], never negative — a `Timer` given a negative
