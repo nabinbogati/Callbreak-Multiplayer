@@ -55,6 +55,13 @@ class AudioController with WidgetsBindingObserver {
   static const _dealRate = 3.0;
 
   final AppSettings _settings;
+
+  /// Reusable voices for the short effects — see [_Voices] for why a fresh
+  /// player per sound is not an option.
+  late final _shotVoices = _Voices(_cardShot, 3);
+  late final _collectVoices = _Voices(_collect, 2);
+  late final _trumpVoices = _Voices(_trump, 1);
+
   AudioPlayer? _musicPlayer;
   AudioPlayer? _tickPlayer;
   AudioPlayer? _dealPlayer;
@@ -118,7 +125,7 @@ class AudioController with WidgetsBindingObserver {
   }
 
   /// The card-hits-the-table sound.
-  void playShot() => unawaited(_oneShot(_cardShot));
+  void playShot() => unawaited(_oneShot(_shotVoices));
 
   /// Starts the dealing flourish: the card sound loops for the whole deal, so
   /// each card leaving the deck keeps time with the audio. Stops with
@@ -157,7 +164,7 @@ class AudioController with WidgetsBindingObserver {
   void playCollect() {
     unawaited(
       Future<void>.delayed(const Duration(milliseconds: 110), () async {
-        await _oneShot(_collect);
+        await _oneShot(_collectVoices);
       }),
     );
   }
@@ -165,7 +172,7 @@ class AudioController with WidgetsBindingObserver {
   /// The flourish for a trump landing into a trick led by a normal (non-trump)
   /// suit — the moment the lead suit stops mattering. Plays alongside the card
   /// shot the table already fires.
-  void playTrump() => unawaited(_oneShot(_trump));
+  void playTrump() => unawaited(_oneShot(_trumpVoices));
 
   /// Starts the turn clock's ticking, once a player's countdown enters its
   /// alarm window. The sample is a continuous ticking loop, so it plays for
@@ -197,19 +204,70 @@ class AudioController with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _oneShot(Source source) async {
+  Future<void> _oneShot(_Voices voices) async {
     if (!_settings.sfxEnabled) return;
-    final player = AudioPlayer();
+    await voices.play();
+  }
+}
+
+/// A few low-latency players for one short sound effect, created once and
+/// replayed round-robin.
+///
+/// Each play used to create a brand-new [AudioPlayer] and dispose it on
+/// `onPlayerComplete`. In low-latency mode (Android's SoundPool) the plugin
+/// never reports completion, so that dispose was never reached: every card
+/// played, trick collected and trump landed leaked a native player and its
+/// event channel — several hundred per game, for the life of the process.
+/// Calling `play(source)` again on one player is no cure either, since every
+/// call re-registers the player against the sound in the plugin. So the source
+/// is set once, and each play is a stop (rewinds the SoundPool stream) then a
+/// resume. [count] voices let quick successive shots overlap, as fresh players
+/// did.
+class _Voices {
+  _Voices(this.source, this.count);
+
+  final Source source;
+  final int count;
+  final _players = <AudioPlayer>[];
+  Future<void>? _ready;
+  var _next = 0;
+
+  Future<void> _prepare() async {
     try {
-      await player.play(source, mode: PlayerMode.lowLatency);
-      await player.onPlayerComplete.first;
-      await player.dispose();
-    } catch (_) {
-      try {
-        await player.dispose();
-      } catch (_) {
-        // Nothing else we can do — a sound must never crash the game.
+      for (var i = 0; i < count; i++) {
+        final player = AudioPlayer();
+        _players.add(player);
+        await player.setPlayerMode(PlayerMode.lowLatency);
+        await player.setReleaseMode(ReleaseMode.stop);
+        await player.setSource(source);
       }
+    } catch (_) {
+      // Audio unavailable. Drop the half-built voices so a later play can try
+      // again from scratch.
+      final built = [..._players];
+      _players.clear();
+      _ready = null;
+      for (final player in built) {
+        try {
+          await player.dispose();
+        } catch (_) {
+          // Nothing else to do — a sound must never crash the game.
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> play() async {
+    try {
+      await (_ready ??= _prepare());
+      if (_players.isEmpty) return;
+      final player = _players[_next];
+      _next = (_next + 1) % _players.length;
+      await player.stop();
+      await player.resume();
+    } catch (_) {
+      // A sound must never crash the game.
     }
   }
 }

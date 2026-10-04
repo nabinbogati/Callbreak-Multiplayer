@@ -1243,11 +1243,13 @@ class _DealOverlayState extends State<_DealOverlay>
       bulge: 0.1,
     );
     final pos = path.positionAt(t);
+    // Drawn at one fixed size and scaled, rather than re-laid-out at a new
+    // width every frame, so a card in the air never has to repaint.
     final width = startWidth + (endWidth - startWidth) * t;
-    final height = width * CardBackView.aspect;
-    final lift = 1 + 0.1 * math.sin(math.pi * t);
+    final height = startWidth * CardBackView.aspect;
+    final scale = width / startWidth * (1 + 0.1 * math.sin(math.pi * t));
 
-    Widget card = CardBackView(width: width, palette: palette);
+    Widget card = CardBackView(width: startWidth, palette: palette);
     if (flipAtEnd && raw > 0.6) {
       card = Transform(
         alignment: Alignment.center,
@@ -1258,11 +1260,11 @@ class _DealOverlayState extends State<_DealOverlay>
       );
     }
     return Positioned(
-      left: pos.dx - width / 2,
+      left: pos.dx - startWidth / 2,
       top: pos.dy - height / 2,
       child: Transform.rotate(
         angle: path.angleAt(t),
-        child: Transform.scale(scale: lift, child: card),
+        child: Transform.scale(scale: scale, child: card),
       ),
     );
   }

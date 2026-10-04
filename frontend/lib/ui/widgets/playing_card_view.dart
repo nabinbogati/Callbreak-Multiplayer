@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../../design/tokens.dart';
@@ -302,8 +304,7 @@ class _BackPatternPainter extends CustomPainter {
   final double radius;
   final _Emblem emblem;
 
-  /// Small cards get a sparser lattice so the pattern stays a texture rather
-  /// than turning into noise.
+  /// Small cards draw no lattice — see [paint].
   final bool fine;
 
   @override
@@ -314,27 +315,20 @@ class _BackPatternPainter extends CustomPainter {
     );
     final gold = AppColors.goldBorder;
 
-    // Lattice, clipped to the inner frame.
-    canvas.save();
-    canvas.clipRRect(rrect);
-    final step = size.width * (fine ? 0.34 : 0.2);
-    final lattice = Paint()
-      ..color = gold.withValues(alpha: fine ? 0.16 : 0.2)
-      ..strokeWidth = fine ? 0.6 : 0.8;
-    final span = size.width + size.height;
-    for (var d = -size.height; d < span; d += step) {
-      canvas.drawLine(
-        Offset(d, 0),
-        Offset(d + size.height, size.height),
-        lattice,
-      );
-      canvas.drawLine(
-        Offset(d + size.height, 0),
-        Offset(d, size.height),
-        lattice,
+    // Lattice. Small cards (the opponents' face-down fans — 39 of them on
+    // screen at once) skip it: at that size it is noise, and drawn per card
+    // it was hundreds of strokes and dozens of clips every frame. Larger
+    // cards draw it as one cached path, trimmed to the frame by geometry
+    // instead of a clip.
+    if (!fine) {
+      canvas.drawPath(
+        _latticeFor(size),
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..color = gold.withValues(alpha: 0.2)
+          ..strokeWidth = 0.8,
       );
     }
-    canvas.restore();
 
     // Inner frame.
     canvas.drawRRect(
@@ -388,6 +382,33 @@ class _BackPatternPainter extends CustomPainter {
         ),
     );
     canvas.restore();
+  }
+
+  static final Map<Size, Path> _lattices = {};
+
+  /// Both diagonals of the lattice as a single path, each segment cut to the
+  /// card's rectangle. Cached per size: the same few card sizes recur.
+  static Path _latticeFor(Size size) {
+    final cached = _lattices[size];
+    if (cached != null) return cached;
+    if (_lattices.length > 24) _lattices.clear();
+    final w = size.width;
+    final h = size.height;
+    final step = w * 0.2;
+    final path = Path();
+    for (var d = -h; d < w; d += step) {
+      // y = x - d (falling to the right) and y = d + h - x (rising), both kept
+      // to 0 <= x <= w; the x-range is where each stays within 0..h.
+      final x0 = math.max(0.0, d);
+      final x1 = math.min(w, d + h);
+      if (x1 <= x0) continue;
+      path
+        ..moveTo(x0, x0 - d)
+        ..lineTo(x1, x1 - d)
+        ..moveTo(x0, d + h - x0)
+        ..lineTo(x1, d + h - x1);
+    }
+    return _lattices[size] = path;
   }
 
   @override

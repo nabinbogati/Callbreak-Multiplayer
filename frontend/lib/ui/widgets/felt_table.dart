@@ -136,18 +136,24 @@ class _FeltPainter extends CustomPainter {
         ).createShader(felt.outerRect),
     );
 
-    // Inner shadow where the felt meets the rail.
-    canvas.save();
-    canvas.clipRRect(felt);
+    // Where the felt meets the rail: a dark lip and a faint highlight inside
+    // it, drawn as plain strokes. (A blurred inner shadow looked a touch
+    // softer, but the renderer redraws the whole frame for every animation
+    // frame, and a blur this size was a real cost on low-end GPUs.)
     canvas.drawRRect(
-      felt.inflate(rail * 0.35),
+      felt.deflate(rail * 0.12),
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = rail * 0.9
-        ..color = const Color(0x8C000000)
-        ..maskFilter = MaskFilter.blur(BlurStyle.normal, rail * 0.55),
+        ..strokeWidth = rail * 0.3
+        ..color = const Color(0x73000000),
     );
-    canvas.restore();
+    canvas.drawRRect(
+      felt.deflate(rail * 0.32),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0x14FFFFFF),
+    );
 
     // The faint "pot" ring.
     canvas.drawRRect(

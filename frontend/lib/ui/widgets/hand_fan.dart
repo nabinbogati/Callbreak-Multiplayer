@@ -674,18 +674,50 @@ class _HandFanState extends State<HandFan> with TickerProviderStateMixin {
       scale: pose.scale,
       offset: extra,
       tilt: tilt,
-      child: _FlipIn(
-        child: RepaintBoundary(
-          child: PlayingCardView(
-            card: card,
-            width: layout.cardWidth,
-            dimmed: widget.interactive && widget.legalIds.isNotEmpty && !legal,
-            highlighted: widget.interactive && legal,
-            elevation: pose.elevation,
-          ),
+      child: _faceFor(
+        card,
+        width: layout.cardWidth,
+        dimmed: widget.interactive && widget.legalIds.isNotEmpty && !legal,
+        highlighted: widget.interactive && legal,
+        elevation: pose.elevation,
+      ),
+    );
+  }
+
+  /// Card faces as last built, by card id, with the inputs they were built
+  /// from. Handing Flutter the very same widget instance lets it skip that
+  /// card's whole subtree: while a finger drags or scrubs, only the held card
+  /// actually changes, so the other twelve cost nothing per pointer move.
+  final Map<String, (double, bool, bool, double, Widget)> _faces = {};
+
+  Widget _faceFor(
+    PlayingCard card, {
+    required double width,
+    required bool dimmed,
+    required bool highlighted,
+    required double elevation,
+  }) {
+    final cached = _faces[card.id];
+    if (cached != null &&
+        cached.$1 == width &&
+        cached.$2 == dimmed &&
+        cached.$3 == highlighted &&
+        cached.$4 == elevation) {
+      return cached.$5;
+    }
+    final face = _FlipIn(
+      child: RepaintBoundary(
+        child: PlayingCardView(
+          card: card,
+          width: width,
+          dimmed: dimmed,
+          highlighted: highlighted,
+          elevation: elevation,
         ),
       ),
     );
+    _faces[card.id] = (width, dimmed, highlighted, elevation, face);
+    return face;
   }
 }
 
