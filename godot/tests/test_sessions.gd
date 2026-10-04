@@ -143,6 +143,54 @@ func test_lan_guest_timeout_hands_seat_to_autoplay_and_back() -> void:
 	host.shutdown()
 
 
+# Bidding must not start while the cards are still being dealt on screen. In
+# each table below the dealer is seat 0, so seat 1 — a bot — bids first; left
+# to its usual think time it would bid well inside the deal animation.
+
+func _any_bid(v: GameView) -> bool:
+	return v != null and v.bids.any(func(b): return b >= 0)
+
+
+func test_a_solo_table_holds_the_bots_bids_until_the_deal_is_down() -> void:
+	_before()
+	# At a fifth of the normal pace the deal (and the wait) last 0.7 s.
+	var session := LocalSession.new("You", "normal", 3, 0.2, 7)
+	add_child(session)
+	var dealt := Time.get_ticks_msec()
+	expect_eq(session.view.phase, GameView.BIDDING)
+	expect_eq(session.view.turn, 1, "a bot is first to bid")
+	await get_tree().create_timer(GameSession.DEAL_GRACE * 0.2 - 0.15).timeout
+	expect_true(not _any_bid(session.view), "nobody bids mid-deal")
+	expect_true(await wait_until(func(): return session.view.bids[1] >= 0, 2.0), "the first bot bids once it opens")
+	expect_true(Time.get_ticks_msec() - dealt >= GameSession.DEAL_GRACE * 0.2 * 1000 - 20, "not before")
+	session.shutdown()
+
+
+func test_a_restarted_solo_game_waits_for_its_own_deal_too() -> void:
+	_before()
+	var session := LocalSession.new("You", "normal", 3, 0.2, 7)
+	add_child(session)
+	expect_true(await wait_until(func(): return _any_bid(session.view), 3.0), "bids came in")
+	session.restart()
+	await get_tree().create_timer(GameSession.DEAL_GRACE * 0.2 - 0.15).timeout
+	expect_true(not _any_bid(session.view), "a fresh deal, a fresh wait")
+	session.shutdown()
+
+
+func test_a_lan_host_holds_the_bots_bids_until_the_deal_is_down() -> void:
+	_before()
+	# The LAN wait is not scaled — a guest's animation speed is theirs — so
+	# this one runs the full 3.5 s.
+	var host := LanHostSession.new("You", "TEST", "normal", 3, 0.2)
+	add_child(host)
+	host.start_game()
+	expect_eq(host.view.turn, 1, "a bot is first to bid")
+	await get_tree().create_timer(GameSession.DEAL_GRACE - 0.2).timeout
+	expect_true(not _any_bid(host.view), "nobody bids mid-deal")
+	expect_true(await wait_until(func(): return host.view.bids[1] >= 0, 2.0), "the first bot bids once it opens")
+	host.shutdown()
+
+
 func test_lan_discovery_finds_a_broadcast_table() -> void:
 	var discovery := LanDiscovery.new()
 	add_child(discovery)

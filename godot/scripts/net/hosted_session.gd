@@ -32,6 +32,10 @@ var _rng := RandomNumberGenerator.new()
 var _timer: Timer
 var _timer_action := Callable()
 var _started := false
+## The game and hand [member _dealt_at_ms] belongs to.
+var _dealt_game: CallBreakGame
+var _dealt_hand := -1
+var _dealt_at_ms := 0
 
 
 func _init() -> void:
@@ -222,20 +226,43 @@ func _schedule_next() -> void:
 	if seat < 0:
 		return
 
+	# Bidding opens only once the dealing animation is over on every screen:
+	# until then no bot bids and no person's bid clock runs.
+	var opens_in := _until_bidding_opens()
+
 	if _is_server_driven(seat):
-		_schedule(_think_time(), func(): _take_server_turn(seat))
+		_schedule(opens_in + _think_time(), func(): _take_server_turn(seat))
 		return
 
 	if not timed:
 		return
 
 	# A person is on the clock: give them a real turn, then play it for them.
-	var timeout: float = BID_TIMEOUT if _game.phase == GameView.BIDDING \
-			else PLAY_TIMEOUTS[_game.trick.size()]
-	if _game.phase == GameView.BIDDING and _game.bids.count(-1) == 4:
-		timeout += DEAL_GRACE
+	var timeout: float = opens_in + (BID_TIMEOUT if _game.phase == GameView.BIDDING \
+			else PLAY_TIMEOUTS[_game.trick.size()])
 	turn_deadline_ms = Time.get_ticks_msec() + int(timeout * 1000)
 	_schedule(timeout, func(): _time_out_seat(seat))
+
+
+## Seconds until bidding opens: [method _deal_grace] after the deal, measured
+## from the deal itself so a republish (a guest joining, a tap) cannot push it
+## back. Zero outside bidding and once it has passed. The stamp is keyed to the
+## game and hand, so a new hand — or a restarted game, which starts again at
+## hand 0 — is stamped afresh.
+func _until_bidding_opens() -> float:
+	if _game.phase != GameView.BIDDING:
+		return 0.0
+	if _dealt_game != _game or _dealt_hand != _game.hand_index:
+		_dealt_game = _game
+		_dealt_hand = _game.hand_index
+		_dealt_at_ms = Time.get_ticks_msec()
+	return maxf(0.0, _deal_grace() - (Time.get_ticks_msec() - _dealt_at_ms) / 1000.0)
+
+
+## How long after a deal bidding opens. Unscaled, like the server's: a guest's
+## animation speed is theirs to choose.
+func _deal_grace() -> float:
+	return DEAL_GRACE
 
 
 ## Whether the host plays this seat: a bot, a player who dropped, or one

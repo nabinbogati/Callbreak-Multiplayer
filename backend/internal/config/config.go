@@ -72,8 +72,8 @@ type Config struct {
 	HandAdvanceWait time.Duration
 	// How long an empty room lives before it is collected.
 	RoomIdleTTL time.Duration
-	// DealGrace is added to the first bidder's bid clock so the dealing
-	// animation does not eat into their thinking time.
+	// DealGrace is how long after a deal bidding opens, so the dealing
+	// animation is over on every screen before anyone bids.
 	DealGrace time.Duration
 
 	// Quickplay: once MatchMinPlayers are seated, wait this long for more before

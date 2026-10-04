@@ -33,10 +33,10 @@ test also fails that test. `TEST_FILTER=lan` runs only the matching tests.
 | Suite | Covers |
 |---|---|
 | `test_engine.gd` | Port of the Flutter `engine_test.dart`: 40 simulated games, scoring, legal moves, bid suggestion, view redaction, and decoding the Go server's own golden `view` frames (read from `backend/testdata/`, with a copy in `tests/fixtures/` for standalone use). |
-| `test_sessions.gd` | A whole solo game through the real timers. A LAN host and guest playing a full game over a loopback socket. Timeout to autoplay and back. LAN discovery over UDP. Identity and uuid. |
+| `test_sessions.gd` | A whole solo game through the real timers. A LAN host and guest playing a full game over a loopback socket. Timeout to autoplay and back. Bots holding their bids until the deal is down, on the solo and LAN tables. LAN discovery over UDP. Identity and uuid. |
 | `test_server_e2e.gd` | Against the real Go server: create a private room, join, deal, play, drop the connection and reclaim the same seat, and check that server error messages reach the player. Skipped unless `E2E_SERVER_URL` is set. |
 | `test_ui.gd` | Drives every screen of the real app shell. Plays a full game through the table screen, taps and drags cards, opens every sheet, and covers the rejoin prompt and the failure states. |
-| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, and the animation budget: the trick sequence inside the hosts' 1100 ms linger at every speed. |
+| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, and the animation budgets: the trick sequence inside the hosts' 1100 ms linger at every speed, and the deal inside the wait before bidding opens. |
 
 End-to-end against the backend:
 
@@ -103,7 +103,8 @@ tests/      runner, suites, server fixture, screenshot tour
   Icons font (`assets/fonts/MaterialIcons-Subset.otf`, licence alongside it).
 - **Motion lives in `motion.gd`.** Every gameplay timing and curve sits in one
   place, because several have to agree: the throw, gather and sweep of a trick
-  must finish inside the hosts' 1100 ms linger. The tests check it.
+  must finish inside the hosts' 1100 ms linger, and the deal inside the
+  3.5 s wait before bidding opens. The tests check both.
 - **Antialiasing is one device pixel wide.** Godot's antialiased lines feather
   by a whole canvas unit, which is two or three device pixels on a phone and
   makes every border read thick and soft. `Draw` strokes and fills with its

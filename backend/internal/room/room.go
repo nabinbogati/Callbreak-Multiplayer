@@ -67,8 +67,8 @@ type Pacing struct {
 	HandAdvanceWait time.Duration
 	IdleTTL         time.Duration
 	StartCountdown  time.Duration
-	// DealGrace is added to the first bidder's deadline so the dealing
-	// animation does not eat into their bid time.
+	// DealGrace is how long after the deal bidding opens, so the dealing
+	// animation has finished on every screen before anyone bids.
 	DealGrace time.Duration
 }
 
@@ -190,9 +190,13 @@ type Room struct {
 	// startedAt is when the first hand was dealt; the dashboard shows it so an
 	// operator can see how long a table has been running. Zero until then.
 	startedAt time.Time
-	game      *engine.Game
-	brains    [4]*bot.Brain
-	rng       *mrand.Rand
+	// dealtAt is when the hand in progress was dealt. Bidding opens
+	// [Pacing.DealGrace] after it, once the dealing animation is over on every
+	// screen — see scheduleNextAction.
+	dealtAt time.Time
+	game    *engine.Game
+	brains  [4]*bot.Brain
+	rng     *mrand.Rand
 	deadlines
 	lastActivity time.Time
 	countdownAt  time.Time

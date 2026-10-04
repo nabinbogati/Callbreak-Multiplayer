@@ -180,8 +180,11 @@ const TRICK_LINGER := 1.1
 ## How long a human seat has to bid on a LAN table before it is played for
 ## them. A solo game against bots is never hurried.
 const BID_TIMEOUT := 5.0
-## Extra time for the first bidder of a hand, so the deal animation does not
-## eat into their bid.
+## How long after a deal bidding opens. The deal view goes out the moment the
+## cards are dealt, while the dealing animation ([constant Motion.DEAL_TOTAL])
+## is still playing; until it is over no bot bids and no bid clock runs, so
+## nobody's bid appears — or is hurried — mid-deal. Matches the server's
+## `Pacing.DealGrace`.
 const DEAL_GRACE := 3.5
 ## Play timeouts indexed by cards already down this trick: the leader thinks
 ## longest.

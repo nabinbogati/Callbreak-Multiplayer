@@ -305,3 +305,6 @@ func test_the_trick_sequence_fits_the_host_linger_at_every_speed() -> void:
 		expect_true(Motion.trick_scale(scale) <= scale, "the cap only ever shortens it (%s)" % speed)
 	expect_eq(Motion.trick_scale(1.0), 1.0, "normal speed is untouched")
 
+
+func test_the_deal_animation_fits_before_bidding_opens() -> void:
+	expect_true(GameSession.DEAL_GRACE >= Motion.DEAL_TOTAL, "the grace covers the whole deal")

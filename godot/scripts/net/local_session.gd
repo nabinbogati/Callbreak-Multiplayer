@@ -26,3 +26,8 @@ func _ready() -> void:
 ## Seats 1–3 are Bot 1–3, clockwise from the player.
 func _bot_name(seat: int, _bot_index: int) -> String:
 	return bot_names[(seat - 1) % bot_names.size()]
+
+
+## Scaled like the dealing animation itself.
+func _deal_grace() -> float:
+	return DEAL_GRACE * animation_scale

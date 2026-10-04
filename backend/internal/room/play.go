@@ -132,30 +132,23 @@ func (r *Room) scheduleNextAction() {
 	}
 	s := &r.seats[*turn]
 
-	if s.serverDriven() {
-		r.setAuto(autoServerMove, *turn, time.Now().Add(r.thinkTime()))
-		return
-	}
-	// The turn clock starts the moment the deal view goes out, while the
-	// dealing animation is still on screen. The first bidder of the hand gets
-	// [Pacing.DealGrace] extra so the animation does not eat into their bid
-	// time.
-	timeout := r.turnTimeout()
-	if r.game.Phase == engine.PhaseBidding && r.firstBidDue() {
-		timeout += r.pacing.DealGrace
-	}
-	r.setAuto(autoTurnTimeout, *turn, time.Now().Add(timeout))
-}
-
-// firstBidDue reports whether the very first bid of the hand is still on the
-// clock — the one whose deadline overlaps the dealing animation.
-func (r *Room) firstBidDue() bool {
-	for _, b := range r.game.Bids {
-		if b != nil {
-			return false
+	// Bidding does not open until the dealing animation has had time to finish
+	// on every screen: until then no bot bids and no person's bid clock runs,
+	// whoever is first to bid. Measured from the deal itself, so republishing
+	// (a reconnect, a tap) cannot push it back; once it has passed it no longer
+	// affects anything.
+	from := time.Now()
+	if r.game.Phase == engine.PhaseBidding {
+		if opens := r.dealtAt.Add(r.pacing.DealGrace); opens.After(from) {
+			from = opens
 		}
 	}
-	return true
+
+	if s.serverDriven() {
+		r.setAuto(autoServerMove, *turn, from.Add(r.thinkTime()))
+		return
+	}
+	r.setAuto(autoTurnTimeout, *turn, from.Add(r.turnTimeout()))
 }
 
 // thinkTime is the pause before a server-driven seat acts, so the table reads
@@ -373,6 +366,7 @@ func (r *Room) advanceHand() {
 	r.handAdvanceAt = time.Time{}
 	r.clearReady()
 	r.game.NextHand()
+	r.dealtAt = time.Now()
 	r.publish()
 }
 
