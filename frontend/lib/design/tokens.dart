@@ -36,7 +36,60 @@ class AppColors {
   static const panelSoft = Color(0x80061A14);
   static const hairline = Color(0x1FF2F7F4);
   static const hairlineStrong = Color(0x33F2F7F4);
+
+  // Raised glass surfaces: dialogs, sheets, the bid panel, the scoreboard.
+  // Two stops so a panel catches a little light along its top edge instead of
+  // reading as a flat cut-out.
+  static const surfaceTop = Color(0xF2102A20);
+  static const surfaceBottom = Color(0xF5061510);
+
+  /// Dims the table behind a modal decision.
+  static const scrim = Color(0xA6000000);
+
+  /// The "it's on you" accent: turn rings, the hand's under-glow.
+  static const turnGlow = Color(0xFFFFD66B);
 }
+
+/// Elevation presets, so panels, cards and buttons cast consistent shadows
+/// instead of each widget inventing its own blur.
+class AppShadows {
+  const AppShadows._();
+
+  /// Chips and small plates resting on the felt.
+  static const low = [
+    BoxShadow(color: Color(0x66000000), blurRadius: 10, offset: Offset(0, 3)),
+  ];
+
+  /// Floating panels and dialogs.
+  static const high = [
+    BoxShadow(color: Color(0x99000000), blurRadius: 32, offset: Offset(0, 14)),
+    BoxShadow(color: Color(0x40000000), blurRadius: 6, offset: Offset(0, 2)),
+  ];
+
+  /// A coloured halo — selection, the active turn, the primary action.
+  static List<BoxShadow> glow(Color color, {double strength = 1, double blur = 18}) => [
+    BoxShadow(
+      color: color.withValues(alpha: 0.45 * strength),
+      blurRadius: blur,
+      spreadRadius: 0.5 * strength,
+    ),
+  ];
+}
+
+/// The gradient every raised panel is painted with.
+const surfaceGradient = LinearGradient(
+  begin: Alignment.topCenter,
+  end: Alignment.bottomCenter,
+  colors: [AppColors.surfaceTop, AppColors.surfaceBottom],
+);
+
+/// The gold fill of every primary action.
+const goldButtonGradient = LinearGradient(
+  begin: Alignment.topCenter,
+  end: Alignment.bottomCenter,
+  colors: [Color(0xFFFFE7A3), AppColors.goldMid, AppColors.goldDeep],
+  stops: [0.0, 0.48, 1.0],
+);
 
 /// The four colourways the design ships. Emerald is the default.
 enum TableTheme { emerald, sapphire, amethyst, crimson }

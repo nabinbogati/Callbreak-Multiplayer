@@ -11,6 +11,7 @@ import '../../net/remote_session.dart' show kQuickplayRoom;
 import '../../net/session.dart';
 import '../../state/app_settings.dart';
 import '../widgets/backdrop.dart';
+import '../widgets/buttons.dart';
 import '../widgets/fields.dart';
 import '../widgets/playing_card_view.dart';
 
@@ -388,6 +389,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         SizedBox(height: m.s(14)),
         _SettingRow(
+          label: 'Tap twice to play',
+          children: [
+            _ChoiceChip(
+              label: 'On',
+              selected: settings.tapTwiceToPlay,
+              onTap: () => setState(() => settings.tapTwiceToPlay = true),
+            ),
+            _ChoiceChip(
+              label: 'Off',
+              selected: !settings.tapTwiceToPlay,
+              onTap: () => setState(() => settings.tapTwiceToPlay = false),
+            ),
+          ],
+        ),
+        SizedBox(height: m.s(14)),
+        _SettingRow(
           label: 'Auto throw last card',
           children: [
             _ChoiceChip(
@@ -447,6 +464,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
               label: 'Off',
               selected: !settings.sfxEnabled,
               onTap: () => setState(() => settings.sfxEnabled = false),
+            ),
+          ],
+        ),
+        SizedBox(height: m.s(14)),
+        _SettingRow(
+          label: 'Vibration',
+          children: [
+            _ChoiceChip(
+              label: 'On',
+              selected: settings.hapticsEnabled,
+              onTap: () => setState(() => settings.hapticsEnabled = true),
+            ),
+            _ChoiceChip(
+              label: 'Off',
+              selected: !settings.hapticsEnabled,
+              onTap: () => setState(() => settings.hapticsEnabled = false),
             ),
           ],
         ),
@@ -1249,27 +1282,9 @@ class _PrimaryButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final m = Metrics.of(context);
-
     return SizedBox(
       width: double.infinity,
-      child: PressFeedback(
-        onTap: onTap,
-        child: Container(
-          alignment: Alignment.center,
-          padding: EdgeInsets.symmetric(vertical: m.sc(15, 9)),
-          decoration: BoxDecoration(
-            gradient: const LinearGradient(
-              colors: [AppColors.gold, AppColors.goldDeep],
-            ),
-            borderRadius: BorderRadius.circular(m.sc(14, 10)),
-          ),
-          child: Text(
-            label,
-            style: AppText.bold(m.sc(15, 13), AppColors.onGold),
-          ),
-        ),
-      ),
+      child: GoldButton(label: label, onTap: onTap),
     );
   }
 }

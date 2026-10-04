@@ -4,7 +4,9 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../design/metrics.dart';
+import '../../design/motion.dart';
 import '../../design/tokens.dart';
+import '../../engine/card.dart';
 import '../../engine/rules.dart';
 import '../../net/local_session.dart';
 import '../../net/remote_session.dart';
@@ -12,7 +14,9 @@ import '../../net/session.dart';
 import '../../state/active_game_binding.dart';
 import '../../state/app_settings.dart';
 import '../widgets/backdrop.dart';
+import '../widgets/buttons.dart';
 import '../widgets/playing_card_view.dart';
+import '../widgets/suit_glyph.dart';
 import 'lan_screen.dart';
 import 'profile_screen.dart';
 import 'settings_sheet.dart';
@@ -23,6 +27,7 @@ class PlayModeSpec {
   const PlayModeSpec({
     required this.mode,
     required this.accent,
+    required this.icon,
     required this.letter,
     required this.badge,
     required this.subtitle,
@@ -30,6 +35,7 @@ class PlayModeSpec {
 
   final GameMode mode;
   final Color accent;
+  final IconData icon;
   final String letter;
   final String badge;
   final String subtitle;
@@ -40,6 +46,7 @@ class PlayModeSpec {
 const playModes = <PlayModeSpec>[
   PlayModeSpec(
     mode: GameMode.bots,
+    icon: Icons.smart_toy_rounded,
     accent: Color(0xFF5B9BD5),
     letter: 'v',
     badge: 'Solo',
@@ -47,6 +54,7 @@ const playModes = <PlayModeSpec>[
   ),
   PlayModeSpec(
     mode: GameMode.online,
+    icon: Icons.public_rounded,
     accent: AppColors.danger,
     letter: 'v',
     badge: 'Online',
@@ -54,6 +62,7 @@ const playModes = <PlayModeSpec>[
   ),
   PlayModeSpec(
     mode: GameMode.private,
+    icon: Icons.group_rounded,
     accent: AppColors.goldBorder,
     letter: 'P',
     badge: 'Friends',
@@ -61,6 +70,7 @@ const playModes = <PlayModeSpec>[
   ),
   PlayModeSpec(
     mode: GameMode.lan,
+    icon: Icons.wifi_rounded,
     accent: AppColors.success,
     letter: 'L',
     badge: 'Local',
@@ -143,7 +153,7 @@ class _HomeScreenState extends State<HomeScreen> {
             glow: palette.glow,
             horizontal: !m.isPortrait,
             glowAlignment: m.isPortrait
-                ? const Alignment(-0.85, 0.0)
+                ? const Alignment(0, -0.55)
                 : const Alignment(-0.55, -0.1),
             child: SafeArea(
               child: m.isPortrait
@@ -161,6 +171,10 @@ class _HomeScreenState extends State<HomeScreen> {
 /// app last closed — the process dying mid-game (killed by the OS, a crash,
 /// a swipe-away) never gets a chance to tell the server goodbye, so the seat
 /// may still be there waiting out its grace window.
+/// Asks whether to reclaim a table found still marked active from before the
+/// app last closed — the process dying mid-game never gets a chance to tell
+/// the server goodbye, so the seat may still be there waiting out its grace
+/// window.
 class _RejoinDialog extends StatelessWidget {
   const _RejoinDialog({required this.roomCode});
 
@@ -168,94 +182,12 @@ class _RejoinDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final m = Metrics.of(context);
-
-    return Dialog(
-      backgroundColor: Colors.transparent,
-      elevation: 0,
-      insetPadding: EdgeInsets.symmetric(horizontal: m.s(32)),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(maxWidth: m.s(300)),
-        child: Container(
-          padding: EdgeInsets.all(m.s(20)),
-          decoration: BoxDecoration(
-            color: const Color(0xE604120D),
-            borderRadius: BorderRadius.circular(m.s(18)),
-            border: Border.all(
-              color: AppColors.goldBorder.withValues(alpha: 0.35),
-            ),
-            boxShadow: const [
-              BoxShadow(
-                color: Color(0x99000000),
-                blurRadius: 30,
-                offset: Offset(0, 12),
-              ),
-            ],
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                'Rejoin your game?',
-                textAlign: TextAlign.center,
-                style: AppText.bold(m.s(16), AppColors.textPrimary),
-              ),
-              SizedBox(height: m.s(8)),
-              Text(
-                'You still have a seat held at table $roomCode.',
-                textAlign: TextAlign.center,
-                style: AppText.medium(m.s(13), AppColors.textMuted),
-              ),
-              SizedBox(height: m.s(20)),
-              Row(
-                children: [
-                  Expanded(
-                    child: PressFeedback(
-                      onTap: () => Navigator.of(context).pop(false),
-                      child: Container(
-                        alignment: Alignment.center,
-                        padding: EdgeInsets.symmetric(vertical: m.s(13)),
-                        decoration: BoxDecoration(
-                          color: AppColors.panel,
-                          borderRadius: BorderRadius.circular(m.s(14)),
-                          border: Border.all(color: AppColors.hairlineStrong),
-                        ),
-                        child: Text(
-                          'Discard',
-                          style: AppText.semiBold(
-                            m.s(13),
-                            AppColors.textOnDark,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  SizedBox(width: m.s(12)),
-                  Expanded(
-                    child: PressFeedback(
-                      onTap: () => Navigator.of(context).pop(true),
-                      child: Container(
-                        alignment: Alignment.center,
-                        padding: EdgeInsets.symmetric(vertical: m.s(13)),
-                        decoration: BoxDecoration(
-                          gradient: const LinearGradient(
-                            colors: [AppColors.gold, AppColors.goldDeep],
-                          ),
-                          borderRadius: BorderRadius.circular(m.s(14)),
-                        ),
-                        child: Text(
-                          'Rejoin',
-                          style: AppText.bold(m.s(13), AppColors.onGold),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
+    return ConfirmDialog(
+      title: 'Rejoin your game?',
+      message: 'You still have a seat held at table $roomCode.',
+      confirmLabel: 'Rejoin',
+      cancelLabel: 'Discard',
+      icon: Icons.history_rounded,
     );
   }
 }
@@ -275,32 +207,35 @@ class _PortraitHome extends StatelessWidget {
           padding: EdgeInsets.fromLTRB(m.s(20), m.s(8), m.s(20), 0),
           child: const _TopBar(),
         ),
-        SizedBox(height: m.s(12)),
-        const _Hero(compact: false),
-        SizedBox(height: m.s(16)),
         Expanded(
-          child: ListView(
-            padding: EdgeInsets.fromLTRB(m.s(20), 0, m.s(20), m.s(8)),
-            children: [
-              Text(
-                'Choose how to play',
-                style: AppText.semiBold(m.s(13), AppColors.textMuted),
+          // Centred in whatever height the phone has, scrolling only if it
+          // genuinely runs out.
+          child: LayoutBuilder(
+            builder: (context, constraints) => SingleChildScrollView(
+              padding: EdgeInsets.fromLTRB(m.s(20), m.s(4), m.s(20), m.s(8)),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: constraints.maxHeight - m.s(12),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const _Hero(compact: false),
+                    SizedBox(height: m.s(26)),
+                    const _SectionLabel('Choose how to play'),
+                    SizedBox(height: m.s(12)),
+                    _Staggered(index: 0, child: _FeaturedMode(spec: playModes[0])),
+                    SizedBox(height: m.s(12)),
+                    _ModeTiles(specs: playModes.sublist(1), firstIndex: 1),
+                    SizedBox(height: m.s(16)),
+                  ],
+                ),
               ),
-              SizedBox(height: m.s(12)),
-              for (final spec in playModes) ...[
-                _ModeRow(spec: spec),
-                SizedBox(height: m.s(12)),
-              ],
-            ],
+            ),
           ),
         ),
-        Padding(
-          padding: EdgeInsets.only(bottom: m.s(10)),
-          child: Text(
-            'Spades trump · Best of 5 hands',
-            style: AppText.medium(m.s(11), AppColors.textFaint),
-          ),
-        ),
+        const _Footer(),
       ],
     );
   }
@@ -325,36 +260,26 @@ class _LandscapeHome extends StatelessWidget {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              const Expanded(flex: 40, child: _Hero(compact: true)),
+              const Expanded(flex: 40, child: Center(child: _Hero(compact: true))),
               Expanded(
-                flex: 52,
+                flex: 56,
                 child: Padding(
-                  padding: EdgeInsets.fromLTRB(m.s(8), 0, m.s(28), m.s(8)),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Choose how to play',
-                        style: AppText.semiBold(m.s(12), AppColors.textMuted),
-                      ),
-                      SizedBox(height: m.s(10)),
-                      for (var row = 0; row < 2; row++) ...[
-                        Row(
-                          children: [
-                            for (var col = 0; col < 2; col++) ...[
-                              Expanded(
-                                child: _ModeTile(
-                                  spec: playModes[row * 2 + col],
-                                ),
-                              ),
-                              if (col == 0) SizedBox(width: m.s(10)),
-                            ],
-                          ],
+                  padding: EdgeInsets.fromLTRB(m.s(8), 0, m.s(28), m.s(6)),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const _SectionLabel('Choose how to play'),
+                        SizedBox(height: m.s(8)),
+                        _Staggered(
+                          index: 0,
+                          child: _FeaturedMode(spec: playModes[0], dense: true),
                         ),
-                        if (row == 0) SizedBox(height: m.s(24)),
+                        SizedBox(height: m.s(10)),
+                        _ModeTiles(specs: playModes.sublist(1), firstIndex: 1, dense: true),
                       ],
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -368,6 +293,54 @@ class _LandscapeHome extends StatelessWidget {
 
 // -------------------------------------------------------------- components
 
+class _SectionLabel extends StatelessWidget {
+  const _SectionLabel(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Metrics.of(context);
+    return Row(
+      children: [
+        Container(
+          width: m.s(3),
+          height: m.s(14),
+          decoration: BoxDecoration(
+            gradient: goldButtonGradient,
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
+        SizedBox(width: m.s(8)),
+        Text(text, style: AppText.semiBold(m.s(13), AppColors.textSubtle)),
+      ],
+    );
+  }
+}
+
+class _Footer extends StatelessWidget {
+  const _Footer();
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Metrics.of(context);
+    return Padding(
+      padding: EdgeInsets.only(bottom: m.s(10), top: m.s(4)),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          SuitGlyph(suit: Suit.spades, size: m.s(11), color: AppColors.textFaint),
+          SizedBox(width: m.s(6)),
+          Text(
+            'Spades are trump · 3 or 5 hands',
+            style: AppText.medium(m.s(11), AppColors.textFaint),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _TopBar extends StatelessWidget {
   const _TopBar();
 
@@ -375,35 +348,58 @@ class _TopBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
     final settings = SettingsScope.of(context);
+    final name = settings.playerName.trim();
 
     return Row(
       children: [
         GlassPill(
-          radius: m.s(22),
-          padding: EdgeInsets.symmetric(horizontal: m.s(15), vertical: m.s(10)),
+          radius: m.s(24),
+          padding: EdgeInsets.fromLTRB(m.s(5), m.s(5), m.s(12), m.s(5)),
           border: AppColors.hairlineStrong,
-          // The player's own name is the natural door to their profile — it is
-          // already the one thing on this screen that is about them.
+          // The player's own name is the natural door to their profile.
           onTap: () => Navigator.of(context).push(
             MaterialPageRoute<void>(builder: (_) => const ProfileScreen()),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Container(
-                width: m.s(10),
-                height: m.s(10),
-                decoration: const BoxDecoration(
-                  color: AppColors.success,
-                  shape: BoxShape.circle,
-                ),
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Container(
+                    width: m.s(32),
+                    height: m.s(32),
+                    alignment: Alignment.center,
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: goldButtonGradient,
+                    ),
+                    child: Text(
+                      name.isEmpty ? '?' : name[0].toUpperCase(),
+                      style: AppText.bold(m.s(14), AppColors.onGold),
+                    ),
+                  ),
+                  Positioned(
+                    right: -m.s(1),
+                    bottom: -m.s(1),
+                    child: Container(
+                      width: m.s(10),
+                      height: m.s(10),
+                      decoration: BoxDecoration(
+                        color: AppColors.success,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: const Color(0xFF061A14), width: 2),
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              SizedBox(width: m.s(7)),
+              SizedBox(width: m.s(9)),
               Text(
                 settings.playerName,
                 style: AppText.semiBold(m.s(14), AppColors.textOnDark),
               ),
-              SizedBox(width: m.s(7)),
+              SizedBox(width: m.s(4)),
               Icon(
                 Icons.chevron_right_rounded,
                 size: m.s(18),
@@ -420,7 +416,7 @@ class _TopBar extends StatelessWidget {
           onTap: () => showSettingsSheet(context),
           child: Icon(
             Icons.tune_rounded,
-            size: m.s(22),
+            size: m.s(20),
             color: AppColors.textOnDark,
           ),
         ),
@@ -429,19 +425,48 @@ class _TopBar extends StatelessWidget {
   }
 }
 
-class _Hero extends StatelessWidget {
+/// Three card backs fanned above the wordmark. They spread out of a single
+/// stack when the screen opens, then drift very slowly — transform-only
+/// motion on a cached layer, so it costs next to nothing to keep alive.
+class _Hero extends StatefulWidget {
   const _Hero({required this.compact});
 
   final bool compact;
 
   @override
+  State<_Hero> createState() => _HeroState();
+}
+
+class _HeroState extends State<_Hero> with TickerProviderStateMixin {
+  late final AnimationController _spread = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..forward();
+
+  late final AnimationController _drift = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 4200),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _spread.dispose();
+    _drift.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
     final palette = SettingsScope.of(context).palette;
-    final cardWidth = m.s(compact ? 64 : 72);
-    final fanWidth = m.s(compact ? 168 : 184);
-    final fanHeight = m.s(compact ? 108 : 122);
-    final tilt = compact ? 12.0 : 14.0;
+    final compact = widget.compact;
+    final cardWidth = m.s(compact ? 62 : 78);
+    final cardHeight = cardWidth * CardBackView.aspect;
+    final fanWidth = m.s(compact ? 190 : 230);
+    final fanHeight = cardHeight + m.s(compact ? 26 : 30);
+    final card = RepaintBoundary(
+      child: CardBackView(width: cardWidth, palette: palette, spadeEmblem: true),
+    );
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -449,53 +474,46 @@ class _Hero extends StatelessWidget {
         SizedBox(
           width: fanWidth,
           height: fanHeight,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Positioned(
-                left: 0,
-                top: m.s(18),
-                child: CardBackView(
-                  width: cardWidth,
-                  palette: palette,
-                  rotation: tilt * math.pi / 180,
-                  spadeEmblem: true,
-                ),
-              ),
-              Positioned(
-                left: m.s(compact ? 52 : 56),
-                top: m.s(8),
-                child: CardBackView(
-                  width: cardWidth,
-                  palette: palette,
-                  spadeEmblem: true,
-                ),
-              ),
-              Positioned(
-                left: m.s(compact ? 96 : 104),
-                top: 0,
-                child: CardBackView(
-                  width: cardWidth,
-                  palette: palette,
-                  rotation: -tilt * math.pi / 180,
-                  spadeEmblem: true,
-                ),
-              ),
-            ],
+          child: AnimatedBuilder(
+            animation: Listenable.merge([_spread, _drift]),
+            builder: (context, _) {
+              final s = Curves.easeOutBack.transform(_spread.value);
+              final phase = _drift.value * 2 * math.pi;
+              Widget placed(int i) {
+                final k = i - 1; // -1, 0, 1
+                final bob = math.sin(phase + i * 1.3) * m.s(3);
+                return Positioned(
+                  left: fanWidth / 2 - cardWidth / 2 + k * cardWidth * 0.62 * s,
+                  top: m.s(compact ? 14 : 16) + (k == 0 ? -m.s(8) : 0) * s + bob,
+                  child: Transform.rotate(
+                    angle: k * 0.24 * s + math.sin(phase + i) * 0.015,
+                    alignment: Alignment.bottomCenter,
+                    child: card,
+                  ),
+                );
+              }
+
+              return Stack(
+                clipBehavior: Clip.none,
+                children: [placed(0), placed(2), placed(1)],
+              );
+            },
           ),
         ),
-        SizedBox(height: m.s(10)),
+        SizedBox(height: m.s(8)),
         GoldGradientText(
           'CALL BREAK',
-          style: AppText.wordmark(m.s(compact ? 36 : 42)),
+          style: AppText.wordmark(m.s(compact ? 36 : 46)).copyWith(
+            shadows: const [Shadow(color: Color(0x99000000), blurRadius: 12, offset: Offset(0, 4))],
+          ),
         ),
-        SizedBox(height: m.s(4)),
+        SizedBox(height: m.s(2)),
         Text(
           'Bid. Break. Win.',
           style: AppText.medium(
-            m.s(compact ? 14 : 16),
+            m.s(compact ? 14 : 15),
             AppColors.textSubtle,
-            letterSpacing: m.s(compact ? 0.84 : 1.28),
+            letterSpacing: m.s(compact ? 1.4 : 2),
           ),
         ),
       ],
@@ -503,28 +521,70 @@ class _Hero extends StatelessWidget {
   }
 }
 
-class _ModeRow extends StatelessWidget {
-  const _ModeRow({required this.spec});
+/// A one-shot rise-and-fade, staggered by [index], for the mode cards.
+class _Staggered extends StatelessWidget {
+  const _Staggered({required this.index, required this.child});
+
+  final int index;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: Duration(milliseconds: 420 + index * 90),
+      curve: Motion.enter,
+      child: child,
+      builder: (context, t, child) {
+        // Hold back the later cards for the first part of their run.
+        final local = ((t * (1 + index * 0.25)) - index * 0.25).clamp(0.0, 1.0);
+        return Opacity(
+          opacity: local,
+          child: Transform.translate(offset: Offset(0, 16 * (1 - local)), child: child),
+        );
+      },
+    );
+  }
+}
+
+/// The headline way in — solo against bots, which works with no connection
+/// at all — as a wide card with a play button.
+class _FeaturedMode extends StatelessWidget {
+  const _FeaturedMode({required this.spec, this.dense = false});
 
   final PlayModeSpec spec;
+  final bool dense;
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
+    final radius = BorderRadius.circular(m.s(18));
 
-    return _ModeSurface(
-      spec: spec,
-      child: Padding(
-        padding: EdgeInsets.symmetric(horizontal: m.s(16), vertical: m.s(18)),
+    return PressFeedback(
+      onTap: () => startTable(context, spec.mode),
+      scale: 0.97,
+      child: Container(
+        padding: EdgeInsets.all(m.s(dense ? 14 : 16)),
+        decoration: BoxDecoration(
+          borderRadius: radius,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              spec.accent.withValues(alpha: 0.32),
+              const Color(0xCC061A14),
+            ],
+          ),
+          border: Border.all(color: spec.accent.withValues(alpha: 0.55)),
+          boxShadow: [
+            ...AppShadows.low,
+            ...AppShadows.glow(spec.accent, strength: 0.5, blur: 24),
+          ],
+        ),
         child: Row(
           children: [
-            _ModeIcon(
-              spec: spec,
-              size: m.s(44),
-              fontSize: m.s(18),
-              radius: m.s(12),
-            ),
-            SizedBox(width: m.s(12)),
+            _ModeIcon(spec: spec, size: m.s(dense ? 44 : 52)),
+            SizedBox(width: m.s(14)),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -535,29 +595,39 @@ class _ModeRow extends StatelessWidget {
                       Flexible(
                         child: Text(
                           spec.name,
-                          style: AppText.bold(m.s(15), AppColors.textPrimary),
                           overflow: TextOverflow.ellipsis,
+                          style: AppText.bold(m.s(dense ? 16 : 18), AppColors.textPrimary),
                         ),
                       ),
                       SizedBox(width: m.s(8)),
-                      _ModeBadge(spec: spec, fontSize: m.s(10)),
+                      _ModeBadge(spec: spec),
                     ],
                   ),
                   SizedBox(height: m.s(3)),
                   Text(
                     spec.subtitle,
-                    style: AppText.medium(m.s(12), AppColors.textMuted),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
+                    style: AppText.medium(m.s(12.5), AppColors.textMuted),
                   ),
                 ],
               ),
             ),
-            SizedBox(width: m.s(8)),
-            Icon(
-              Icons.chevron_right_rounded,
-              size: m.s(24),
-              color: AppColors.textMuted,
+            SizedBox(width: m.s(10)),
+            Container(
+              width: m.s(dense ? 40 : 46),
+              height: m.s(dense ? 40 : 46),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: goldButtonGradient,
+                boxShadow: AppShadows.glow(AppColors.goldDeep, strength: 0.9, blur: 14),
+              ),
+              child: Icon(
+                Icons.play_arrow_rounded,
+                size: m.s(dense ? 24 : 28),
+                color: AppColors.onGold,
+              ),
             ),
           ],
         ),
@@ -566,34 +636,86 @@ class _ModeRow extends StatelessWidget {
   }
 }
 
-class _ModeTile extends StatelessWidget {
-  const _ModeTile({required this.spec});
+/// The other three modes, side by side as square tiles.
+class _ModeTiles extends StatelessWidget {
+  const _ModeTiles({required this.specs, required this.firstIndex, this.dense = false});
 
-  final PlayModeSpec spec;
+  final List<PlayModeSpec> specs;
+  final int firstIndex;
+  final bool dense;
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < specs.length; i++) ...[
+            Expanded(
+              child: _Staggered(
+                index: firstIndex + i,
+                child: _ModeTile(spec: specs[i], dense: dense),
+              ),
+            ),
+            if (i < specs.length - 1) SizedBox(width: m.s(10)),
+          ],
+        ],
+      ),
+    );
+  }
+}
 
-    return _ModeSurface(
-      spec: spec,
-      child: Padding(
-        padding: EdgeInsets.all(m.s(16)),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
+class _ModeTile extends StatelessWidget {
+  const _ModeTile({required this.spec, this.dense = false});
+
+  final PlayModeSpec spec;
+  final bool dense;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = Metrics.of(context);
+    final radius = BorderRadius.circular(m.s(16));
+
+    return PressFeedback(
+      onTap: () => startTable(context, spec.mode),
+      scale: 0.95,
+      child: Container(
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          borderRadius: radius,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              spec.accent.withValues(alpha: 0.2),
+              const Color(0xB3061A14),
+            ],
+          ),
+          border: Border.all(color: spec.accent.withValues(alpha: 0.42)),
+          boxShadow: AppShadows.low,
+        ),
+        child: Stack(
           children: [
-            Row(
-              children: [
-                _ModeIcon(
-                  spec: spec,
-                  size: m.s(28),
-                  fontSize: m.s(13),
-                  radius: m.s(8),
-                ),
-                SizedBox(width: m.s(8)),
-                Flexible(
-                  child: FittedBox(
+            // A large faint glyph in the corner gives the tile depth.
+            Positioned(
+              right: -m.s(10),
+              bottom: -m.s(12),
+              child: Icon(
+                spec.icon,
+                size: m.s(dense ? 54 : 64),
+                color: spec.accent.withValues(alpha: 0.1),
+              ),
+            ),
+            Padding(
+              padding: EdgeInsets.all(m.s(dense ? 10 : 12)),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _ModeIcon(spec: spec, size: m.s(dense ? 30 : 36)),
+                  SizedBox(height: m.s(dense ? 8 : 10)),
+                  FittedBox(
                     fit: BoxFit.scaleDown,
                     alignment: Alignment.centerLeft,
                     child: Text(
@@ -601,23 +723,19 @@ class _ModeTile extends StatelessWidget {
                       style: AppText.bold(m.s(14), AppColors.textPrimary),
                     ),
                   ),
-                ),
-                SizedBox(width: m.s(6)),
-                Flexible(
-                  child: FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.centerRight,
-                    child: _ModeBadge(spec: spec, fontSize: m.s(9)),
-                  ),
-                ),
-              ],
-            ),
-            SizedBox(height: m.s(6)),
-            Text(
-              spec.subtitle,
-              style: AppText.medium(m.s(11), AppColors.textMuted),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+                  SizedBox(height: m.s(4)),
+                  _ModeBadge(spec: spec),
+                  if (!dense) ...[
+                    SizedBox(height: m.s(6)),
+                    Text(
+                      spec.subtitle,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppText.medium(m.s(10.5), AppColors.textMuted),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ],
         ),
@@ -626,168 +744,11 @@ class _ModeTile extends StatelessWidget {
   }
 }
 
-class _ModeSurface extends StatelessWidget {
-  const _ModeSurface({required this.spec, required this.child});
-
-  final PlayModeSpec spec;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    final m = Metrics.of(context);
-    final radius = BorderRadius.circular(m.s(14));
-
-    // A soft drop shadow lifts the card off the backdrop so it reads as
-    // pressable — paired with the instant press feedback it makes the whole
-    // surface feel like a button rather than a flat plate. A slow glow travels
-    // the border to keep the card quietly alive.
-    return Container(
-      decoration: BoxDecoration(
-        borderRadius: radius,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.35),
-            blurRadius: m.s(18),
-            offset: Offset(0, m.s(6)),
-          ),
-        ],
-      ),
-      child: _RunningBorderGlow(
-        accent: spec.accent,
-        radius: radius,
-        child: PressFeedback(
-          onTap: () => startTable(context, spec.mode),
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0x80061A14),
-              borderRadius: radius,
-              border: Border.all(color: spec.accent.withValues(alpha: 0.4)),
-            ),
-            child: child,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Draws a slow, soft light that travels around a rounded border, so a card
-/// feels gently alive without any movement of its content.
-class _RunningBorderGlow extends StatefulWidget {
-  const _RunningBorderGlow({
-    required this.accent,
-    required this.radius,
-    required this.child,
-  });
-
-  final Color accent;
-  final BorderRadius radius;
-  final Widget child;
-
-  @override
-  State<_RunningBorderGlow> createState() => _RunningBorderGlowState();
-}
-
-class _RunningBorderGlowState extends State<_RunningBorderGlow>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 1800),
-  )..repeat();
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // The controller drives the painter, but a CustomPainter only repaints
-    // when its widget rebuilds — so without this the light would sit frozen
-    // at one spot. AnimatedBuilder turns every tick into a repaint.
-    return AnimatedBuilder(
-      animation: _controller,
-      child: RepaintBoundary(child: widget.child),
-      builder: (context, child) => CustomPaint(
-        foregroundPainter: _RunningGlowPainter(
-          progress: _controller,
-          accent: widget.accent,
-          radius: widget.radius,
-        ),
-        child: child,
-      ),
-    );
-  }
-}
-
-class _RunningGlowPainter extends CustomPainter {
-  _RunningGlowPainter({
-    required this.progress,
-    required this.accent,
-    required this.radius,
-  });
-
-  final Animation<double> progress;
-  final Color accent;
-  final BorderRadius radius;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final rect = Offset.zero & size;
-    final rrect = RRect.fromRectAndRadius(rect.deflate(0.5), radius.topLeft);
-    final path = Path()..addRRect(rrect);
-    final metric = path.computeMetrics().first;
-    final total = metric.length;
-
-    // A faint static border keeps the edge defined between passes.
-    canvas.drawPath(
-      path,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1
-        ..color = accent.withValues(alpha: 0.22),
-    );
-
-    // A short bright segment that travels the whole perimeter.
-    final segment = total * 0.14;
-    final start = (progress.value * total) % total;
-    final end = start + segment;
-    final glow = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.5
-      ..strokeCap = StrokeCap.round
-      ..color = accent.withValues(alpha: 0.7)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5);
-
-    // Wrap the tail around the corner so the light never blinks out.
-    if (end > total) {
-      canvas.drawPath(metric.extractPath(start, total), glow);
-      canvas.drawPath(metric.extractPath(0, end - total), glow);
-    } else {
-      canvas.drawPath(metric.extractPath(start, end), glow);
-    }
-  }
-
-  @override
-  bool shouldRepaint(_RunningGlowPainter oldDelegate) =>
-      oldDelegate.progress.value != progress.value ||
-      oldDelegate.accent != accent ||
-      oldDelegate.radius != radius;
-}
-
 class _ModeIcon extends StatelessWidget {
-  const _ModeIcon({
-    required this.spec,
-    required this.size,
-    required this.fontSize,
-    required this.radius,
-  });
+  const _ModeIcon({required this.spec, required this.size});
 
   final PlayModeSpec spec;
   final double size;
-  final double fontSize;
-  final double radius;
 
   @override
   Widget build(BuildContext context) {
@@ -796,41 +757,40 @@ class _ModeIcon extends StatelessWidget {
       height: size,
       alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: spec.accent.withValues(alpha: 0.18),
-        border: Border.all(color: spec.accent.withValues(alpha: 0.55)),
-        borderRadius: BorderRadius.circular(radius),
+        shape: BoxShape.circle,
+        gradient: RadialGradient(
+          colors: [
+            spec.accent.withValues(alpha: 0.42),
+            spec.accent.withValues(alpha: 0.16),
+          ],
+        ),
+        border: Border.all(color: spec.accent.withValues(alpha: 0.7)),
       ),
-      child: Text(spec.letter, style: AppText.bold(fontSize, spec.accent)),
+      child: Icon(spec.icon, size: size * 0.52, color: Colors.white),
     );
   }
 }
 
 class _ModeBadge extends StatelessWidget {
-  const _ModeBadge({required this.spec, required this.fontSize});
+  const _ModeBadge({required this.spec});
 
   final PlayModeSpec spec;
-  final double fontSize;
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
 
     return Container(
-      padding: EdgeInsets.symmetric(horizontal: m.s(8), vertical: m.s(3)),
+      padding: EdgeInsets.symmetric(horizontal: m.s(7), vertical: m.s(2)),
       decoration: BoxDecoration(
-        color: spec.accent.withValues(alpha: 0.2),
+        color: spec.accent.withValues(alpha: 0.22),
         borderRadius: BorderRadius.circular(m.s(8)),
       ),
-      child: Text(spec.badge, style: AppText.semiBold(fontSize, spec.accent)),
+      child: Text(spec.badge, style: AppText.semiBold(m.s(9.5), spec.accent)),
     );
   }
 }
 
-// ----------------------------------------------------------------- routing
-
-/// Opens a table for [mode]. Offline modes start as soon as the player has
-/// picked a match length; networked modes first collect the server address and
-/// room code.
 Future<void> startTable(BuildContext context, GameMode mode) async {
   final settings = SettingsScope.of(context);
 

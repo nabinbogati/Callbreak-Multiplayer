@@ -27,12 +27,25 @@ class _QuickSettingsBody extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Text('Settings', style: AppText.bold(m.s(18), AppColors.textPrimary)),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.tune_rounded, size: m.s(18), color: AppColors.gold),
+              SizedBox(width: m.s(8)),
+              Text('Settings', style: AppText.bold(m.s(18), AppColors.textPrimary)),
+            ],
+          ),
           SizedBox(height: m.s(18)),
           _ToggleRow(
             label: 'Drag to play',
             value: settings.dragToPlayEnabled,
             onChanged: (value) => settings.dragToPlayEnabled = value,
+          ),
+          SizedBox(height: m.s(14)),
+          _ToggleRow(
+            label: 'Tap twice to play',
+            value: settings.tapTwiceToPlay,
+            onChanged: (value) => settings.tapTwiceToPlay = value,
           ),
           SizedBox(height: m.s(14)),
           _ToggleRow(
@@ -57,6 +70,12 @@ class _QuickSettingsBody extends StatelessWidget {
             label: 'Sound effects',
             value: settings.sfxEnabled,
             onChanged: (value) => settings.sfxEnabled = value,
+          ),
+          SizedBox(height: m.s(14)),
+          _ToggleRow(
+            label: 'Vibration',
+            value: settings.hapticsEnabled,
+            onChanged: (value) => settings.hapticsEnabled = value,
           ),
         ],
       ),

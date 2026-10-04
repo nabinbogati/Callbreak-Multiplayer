@@ -1,16 +1,66 @@
-import 'package:flutter/foundation.dart' show listEquals;
-import 'package:flutter/gestures.dart' show DragStartBehavior;
+import 'dart:math' as math;
+
+import 'package:flutter/gestures.dart' show VelocityTracker, kTouchSlop;
+import 'package:flutter/physics.dart' show SpringDescription, SpringSimulation;
 import 'package:flutter/widgets.dart';
 
 import '../../design/metrics.dart';
+import '../../design/motion.dart';
+import '../../design/tokens.dart';
 import '../../engine/card.dart';
 import '../../state/app_settings.dart';
+import '../haptics.dart';
 import 'playing_card_view.dart';
 
-/// The player's own hand along the bottom of the table: overlapping cards,
-/// legal ones lifted and tappable (or draggable), illegal ones dimmed and
-/// inert. Pressing and holding a legal card zooms it in above its neighbours
-/// so its rank/suit is unmistakable before it's actually thrown.
+/// Where and how a card left the hand, so the table's throw flight can start
+/// exactly where the card was — position, size and tilt — rather than
+/// snapping it back to a resting slot first.
+class ThrowRelease {
+  const ThrowRelease({required this.center, this.scale = 1, this.angle = 0});
+
+  /// Screen-global centre of the card at the moment it was let go.
+  final Offset center;
+
+  /// Its scale relative to the fan's card width (a previewed card is bigger).
+  final double scale;
+
+  /// Its rotation, in radians.
+  final double angle;
+}
+
+/// A card's resting place in the fan, in screen-global coordinates.
+class FanSlot {
+  const FanSlot(this.center, this.angle);
+
+  final Offset center;
+  final double angle;
+
+  @override
+  bool operator ==(Object other) =>
+      other is FanSlot && other.center == center && other.angle == angle;
+
+  @override
+  int get hashCode => Object.hash(center, angle);
+}
+
+/// The player's own hand along the bottom of the table, held in a gentle arc.
+///
+/// One gesture surface drives the whole fan, not one detector per card, which
+/// is what makes a tightly overlapped thirteen-card hand comfortable:
+///
+/// * **Press** a card and it rises and grows, its neighbours parting so the
+///   whole face shows.
+/// * **Slide sideways** and the preview follows your finger from card to card,
+///   with a tick under the thumb at each one. Letting go after a slide never
+///   plays anything — it is for reading the hand.
+/// * **Drag up** and the card follows your finger, tilting with its motion; it
+///   is thrown once it passes the threshold or is flicked upward, and springs
+///   back home otherwise.
+/// * **Tap** a playable card to play it (or, with "tap twice to play" on, to
+///   raise it; a second tap plays).
+///
+/// A card that cannot be played shakes, buzzes and reports itself through
+/// [onIllegal], so the table can say why.
 class HandFan extends StatefulWidget {
   const HandFan({
     super.key,
@@ -19,450 +69,784 @@ class HandFan extends StatefulWidget {
     required this.interactive,
     required this.cardWidth,
     this.revealedCount,
+    this.hiddenIds = const {},
+    this.gesturesEnabled = true,
     this.onPlay,
+    this.onIllegal,
+    this.onNotYourTurn,
     this.onSlotsMeasured,
   });
 
   final List<PlayingCard> cards;
   final Set<String> legalIds;
 
-  /// Whether tapping/dragging a legal card should call [onPlay] — false while
-  /// it is not this player's turn, so cards still render but do not respond.
+  /// Whether a legal card can be played right now — false while it is not
+  /// this player's turn, so cards still preview but never leave the hand.
   final bool interactive;
   final double cardWidth;
 
-  /// How many of [cards] are currently revealed/visible. When fewer than
-  /// [cards].length, layout still runs for the full hand (so the fan never
-  /// shifts or jumps as it fills in) but only the first [revealedCount] cards
-  /// are painted. Null means show all of [cards]. Used while a hand is being
-  /// dealt, so the player's cards appear one at a time in real time.
+  /// How many of [cards] are revealed so far. Layout always runs for the full
+  /// hand (so nothing shifts as it fills in); only revealed cards paint.
+  /// Null shows them all. Used while a hand is being dealt.
   final int? revealedCount;
 
-  /// Called when a card is thrown, with the screen (global) position of the
-  /// gesture that released it — the point the finger last touched, whether
-  /// that was a tap or the end of a drag — so the caller can start the card's
-  /// throw animation from there instead of the seat avatar. Null only if
-  /// somehow no gesture position was ever recorded.
-  final void Function(PlayingCard card, Offset? releasePosition)? onPlay;
+  /// Cards already thrown but not yet gone from [cards] — a networked table
+  /// only removes a card once the server confirms the play. They are left out
+  /// of the fan straight away so the card is never both in flight and in hand.
+  final Set<String> hiddenIds;
 
-  /// Reports the global screen centre of every card's resting slot in the fan,
-  /// one per [cards] entry. Fired after the fan is laid out, whenever the
-  /// positions change (a size change, an orientation flip, a hand that fills
-  /// differently). The dealing flourish uses this to land each flying card
-  /// exactly where the real card will sit rather than on the seat avatar.
-  final ValueChanged<List<Offset>>? onSlotsMeasured;
+  /// False while the deal is running: the cards are not the player's to
+  /// handle until they are all down.
+  final bool gesturesEnabled;
+
+  /// A card left the hand.
+  final void Function(PlayingCard card, ThrowRelease release)? onPlay;
+
+  /// The player tried to play a card the rules do not allow right now.
+  final ValueChanged<PlayingCard>? onIllegal;
+
+  /// The player tried to throw a card while it is somebody else's turn.
+  final VoidCallback? onNotYourTurn;
+
+  /// Reports every card's resting slot (by card id), after layout and only
+  /// when it changes. The dealing flourish lands each card on its slot.
+  final ValueChanged<Map<String, FanSlot>>? onSlotsMeasured;
 
   @override
   State<HandFan> createState() => _HandFanState();
 }
 
-class _HandFanState extends State<HandFan> {
-  // Tracked by card id, not list index — a card's index shifts as others are
-  // played out of the hand, but its id doesn't, so this stays correct across
-  // rebuilds even if the pressed card happens to move position.
-  String? _pressedCardId;
+enum _Mode { idle, pressing, scrubbing, dragging }
 
-  /// Last-reported slot centres, so a fan that hasn't moved does not spam the
-  /// listener every rebuild.
-  List<Offset>? _lastSlots;
+/// Where every card sits at rest, for one layout pass.
+class _Layout {
+  _Layout({
+    required this.cards,
+    required this.lefts,
+    required this.tops,
+    required this.angles,
+    required this.cardWidth,
+    required this.cardHeight,
+  });
 
-  void _setPressed(String? cardId) {
-    if (_pressedCardId == cardId) return;
-    setState(() => _pressedCardId = cardId);
+  final List<PlayingCard> cards;
+  final List<double> lefts;
+  final List<double> tops;
+  final List<double> angles;
+  final double cardWidth;
+  final double cardHeight;
+
+  int indexOf(String id) => cards.indexWhere((c) => c.id == id);
+
+  Offset centerOf(int i) =>
+      Offset(lefts[i] + cardWidth / 2, tops[i] + cardHeight / 2);
+
+  /// The topmost revealed card under [x] (later cards overlap earlier ones).
+  int? hit(double x, int revealed) {
+    for (var i = math.min(cards.length, revealed) - 1; i >= 0; i--) {
+      if (x >= lefts[i] && x <= lefts[i] + cardWidth) return i;
+    }
+    return null;
+  }
+}
+
+class _HandFanState extends State<HandFan> with TickerProviderStateMixin {
+  int? _pointer;
+  Offset _down = Offset.zero;
+  Offset _dragAnchor = Offset.zero;
+  _Mode _mode = _Mode.idle;
+  String? _selectedId;
+  VelocityTracker? _velocity;
+  bool _refusedThisGesture = false;
+
+  /// The card being dragged and how far it has been carried.
+  Offset _drag = Offset.zero;
+  double _tilt = 0;
+
+  /// "Tap twice to play": the card raised by the first tap.
+  String? _armedId;
+
+  /// The card springing home after a drag that did not throw.
+  String? _returningId;
+  Offset _returnFrom = Offset.zero;
+  double _returnTilt = 0;
+  late final AnimationController _spring = AnimationController.unbounded(
+    vsync: this,
+  )..addListener(() => setState(() {}));
+
+  /// The card shaking its head.
+  String? _shakeId;
+  late final AnimationController _shake = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 420),
+  )..addListener(() => setState(() {}));
+
+  _Layout? _layout;
+  Map<String, FanSlot>? _lastSlots;
+
+  @override
+  void didUpdateWidget(HandFan old) {
+    super.didUpdateWidget(old);
+    // The turn moved on (or the card left): nothing stays raised or held.
+    if (!widget.interactive && _armedId != null) _armedId = null;
+    final ids = {for (final c in widget.cards) c.id}
+      ..removeAll(widget.hiddenIds);
+    if (_selectedId != null && !ids.contains(_selectedId)) _clearGesture();
+    if (_armedId != null && !ids.contains(_armedId)) _armedId = null;
+    if (!widget.gesturesEnabled && _pointer != null) _clearGesture();
   }
 
-  /// Pushes the laid-out card slot centres (global coordinates) to
-  /// [HandFan.onSlotsMeasured] once the current frame has actually laid the
-  /// fan out, and only when they changed.
-  void _reportSlots(List<Offset> localCenters) {
+  /// Drops the gesture in progress without scheduling a rebuild — for use
+  /// from [didUpdateWidget], which is already followed by one.
+  void _clearGesture() {
+    _pointer = null;
+    _mode = _Mode.idle;
+    _selectedId = null;
+    _drag = Offset.zero;
+    _tilt = 0;
+  }
+
+  @override
+  void dispose() {
+    _spring.dispose();
+    _shake.dispose();
+    super.dispose();
+  }
+
+  // ------------------------------------------------------------- layout
+
+  _Layout _computeLayout(BoxConstraints constraints, Metrics m) {
+    final cards = [
+      for (final c in widget.cards)
+        if (!widget.hiddenIds.contains(c.id)) c,
+    ];
+    final n = cards.length;
+    final w = widget.cardWidth;
+    final h = w * PlayingCardView.aspect;
+    final maxWidth = constraints.maxWidth;
+    final fill = n <= 1 ? 0.0 : math.max(0.0, (maxWidth - w) / (n - 1));
+    // Portrait overlaps the classic way; landscape has width to spare and
+    // spreads out, but always keeps at least a quarter of each card covered.
+    final spacing = n <= 1
+        ? 0.0
+        : m.isPortrait
+        ? math.min(w * 0.58, fill)
+        : math.min(fill, w * 0.74);
+    final fanWidth = w + spacing * (n - 1);
+    final start = (maxWidth - fanWidth) / 2;
+
+    final maxSpread = m.isPortrait ? 0.34 : 0.24;
+    final step = n <= 1 ? 0.0 : math.min(0.04, maxSpread / (n - 1));
+    final depth = h * (m.isPortrait ? 0.08 : 0.06);
+    final mid = (n - 1) / 2;
+    final top = _liftSpace(m);
+
+    return _Layout(
+      cards: cards,
+      cardWidth: w,
+      cardHeight: h,
+      lefts: [for (var i = 0; i < n; i++) start + spacing * i],
+      tops: [
+        for (var i = 0; i < n; i++)
+          top + (mid == 0 ? 0.0 : depth * math.pow((i - mid) / mid, 2)),
+      ],
+      angles: [for (var i = 0; i < n; i++) (i - mid) * step],
+    );
+  }
+
+  double _liftSpace(Metrics m) => m.s(16);
+
+  void _reportSlots(_Layout layout) {
+    if (widget.onSlotsMeasured == null) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final box = context.findRenderObject();
       if (box is! RenderBox || !box.attached || !box.hasSize) return;
-      final centers = [for (final c in localCenters) box.localToGlobal(c)];
-      if (listEquals(centers, _lastSlots)) return;
-      _lastSlots = centers;
-      widget.onSlotsMeasured?.call(centers);
+      final slots = <String, FanSlot>{
+        for (var i = 0; i < layout.cards.length; i++)
+          layout.cards[i].id: FanSlot(
+            box.localToGlobal(layout.centerOf(i)),
+            layout.angles[i],
+          ),
+      };
+      if (_sameSlots(slots, _lastSlots)) return;
+      _lastSlots = slots;
+      widget.onSlotsMeasured?.call(slots);
     });
+  }
+
+  static bool _sameSlots(Map<String, FanSlot> a, Map<String, FanSlot>? b) {
+    if (b == null || a.length != b.length) return false;
+    for (final e in a.entries) {
+      if (b[e.key] != e.value) return false;
+    }
+    return true;
+  }
+
+  // ------------------------------------------------------------ gestures
+
+  int get _revealed => widget.revealedCount ?? widget.cards.length;
+
+  bool _isLegal(PlayingCard c) => widget.legalIds.contains(c.id);
+
+  bool _canDrag(PlayingCard c) =>
+      widget.interactive &&
+      _isLegal(c) &&
+      SettingsScope.read(context).dragToPlayEnabled;
+
+  PlayingCard? _card(String? id) {
+    if (id == null) return null;
+    for (final c in widget.cards) {
+      if (c.id == id) return c;
+    }
+    return null;
+  }
+
+  double get _dragThreshold => widget.cardWidth * PlayingCardView.aspect * 0.42;
+
+  void _onDown(PointerDownEvent e) {
+    if (_pointer != null || !widget.gesturesEnabled) return;
+    final layout = _layout;
+    if (layout == null) return;
+    final i = layout.hit(e.localPosition.dx, _revealedLaidOut(layout));
+    _pointer = e.pointer;
+    _down = e.localPosition;
+    _refusedThisGesture = false;
+    _velocity = VelocityTracker.withKind(e.kind)
+      ..addPosition(e.timeStamp, e.position);
+    if (i == null) return;
+    _spring.stop();
+    setState(() {
+      _returningId = null;
+      _selectedId = layout.cards[i].id;
+      _mode = _Mode.pressing;
+    });
+    Haptics.tick(context);
+  }
+
+  /// The number of laid-out cards that are revealed (hidden cards never occur
+  /// mid-deal, so the full-hand reveal count maps straight across).
+  int _revealedLaidOut(_Layout layout) =>
+      math.min(layout.cards.length, _revealed);
+
+  void _onMove(PointerMoveEvent e) {
+    if (e.pointer != _pointer) return;
+    _velocity?.addPosition(e.timeStamp, e.position);
+    final selected = _card(_selectedId);
+    if (selected == null) return;
+    final delta = e.localPosition - _down;
+
+    switch (_mode) {
+      case _Mode.pressing:
+        if (delta.distance < kTouchSlop) return;
+        final upward = -delta.dy > delta.dx.abs() * 0.9;
+        if (upward && _canDrag(selected)) {
+          _beginDrag(Offset(_down.dx, _down.dy));
+          _updateDrag(e.localPosition, e.delta);
+        } else {
+          setState(() => _mode = _Mode.scrubbing);
+          _scrub(e.localPosition);
+        }
+      case _Mode.scrubbing:
+        // Rising well above the fan from a scrub picks the card up.
+        final rise = _down.dy - e.localPosition.dy;
+        if (rise > widget.cardWidth * 0.5 && _canDrag(selected)) {
+          _beginDrag(Offset(e.localPosition.dx, _down.dy));
+          _updateDrag(e.localPosition, e.delta);
+          return;
+        }
+        if (rise > _dragThreshold) _refuse(selected);
+        _scrub(e.localPosition);
+      case _Mode.dragging:
+        _updateDrag(e.localPosition, e.delta);
+      case _Mode.idle:
+        break;
+    }
+  }
+
+  void _beginDrag(Offset anchor) {
+    _dragAnchor = anchor;
+    _armedId = null;
+    setState(() => _mode = _Mode.dragging);
+  }
+
+  void _updateDrag(Offset position, Offset delta) {
+    final selected = _card(_selectedId);
+    if (selected == null) return;
+    setState(() {
+      _drag = position - _dragAnchor;
+      _tilt = (_tilt * 0.6 + (delta.dx * 0.03).clamp(-0.32, 0.32) * 0.4);
+    });
+    if (-_drag.dy >= _dragThreshold) _throw(selected);
+  }
+
+  void _scrub(Offset position) {
+    final layout = _layout;
+    if (layout == null) return;
+    final i = layout.hit(position.dx, _revealedLaidOut(layout));
+    if (i == null) return;
+    final id = layout.cards[i].id;
+    if (id == _selectedId) return;
+    setState(() => _selectedId = id);
+    Haptics.tick(context);
+  }
+
+  void _onUp(PointerUpEvent e) {
+    if (e.pointer != _pointer) return;
+    final selected = _card(_selectedId);
+    final mode = _mode;
+    final velocity = _velocity?.getVelocity().pixelsPerSecond ?? Offset.zero;
+    _pointer = null;
+    if (selected == null) return _reset();
+
+    switch (mode) {
+      case _Mode.pressing:
+        _tap(selected);
+      case _Mode.dragging:
+        final flung = -velocity.dy > 850 && -_drag.dy > _dragThreshold * 0.3;
+        if (flung) {
+          _throw(selected);
+        } else {
+          _springHome(selected.id);
+        }
+      case _Mode.scrubbing:
+      case _Mode.idle:
+        _reset();
+    }
+  }
+
+  void _onCancel(PointerCancelEvent e) {
+    if (e.pointer != _pointer) return;
+    _pointer = null;
+    if (_mode == _Mode.dragging && _selectedId != null) {
+      _springHome(_selectedId!);
+    } else {
+      _reset();
+    }
+  }
+
+  void _tap(PlayingCard card) {
+    if (!widget.interactive) return _reset();
+    if (!_isLegal(card)) {
+      _refuse(card);
+      return _reset();
+    }
+    if (SettingsScope.read(context).tapTwiceToPlay && _armedId != card.id) {
+      setState(() => _armedId = card.id);
+      Haptics.tick(context);
+      return _reset();
+    }
+    _throw(card);
+  }
+
+  void _throw(PlayingCard card) {
+    final layout = _layout;
+    final box = context.findRenderObject();
+    final i = layout?.indexOf(card.id) ?? -1;
+    if (layout == null || i < 0 || box is! RenderBox || !box.attached) {
+      return _reset();
+    }
+    final visual = _visualFor(layout, i);
+    final center = box.localToGlobal(visual.center + _drag);
+    _pointer = null;
+    Haptics.tap(context);
+    widget.onPlay?.call(
+      card,
+      ThrowRelease(
+        center: center,
+        scale: visual.scale,
+        angle: visual.angle + _tilt,
+      ),
+    );
+    _armedId = null;
+    _reset();
+  }
+
+  void _refuse(PlayingCard card) {
+    if (_refusedThisGesture) return;
+    _refusedThisGesture = true;
+    setState(() => _shakeId = card.id);
+    _shake.forward(from: 0);
+    Haptics.nope(context);
+    if (widget.interactive) {
+      widget.onIllegal?.call(card);
+    } else {
+      widget.onNotYourTurn?.call();
+    }
+  }
+
+  void _springHome(String id) {
+    _returningId = id;
+    _returnFrom = _drag;
+    _returnTilt = _tilt;
+    _reset();
+    _spring.value = 1;
+    _spring.animateWith(
+      SpringSimulation(
+        const SpringDescription(mass: 1, stiffness: 380, damping: 24),
+        1,
+        0,
+        0,
+      ),
+    );
+  }
+
+  void _reset() {
+    if (!mounted) return;
+    setState(() {
+      _mode = _Mode.idle;
+      _selectedId = null;
+      _drag = Offset.zero;
+      _tilt = 0;
+    });
+  }
+
+  // ------------------------------------------------------------- visuals
+
+  /// The pose card [i] should be in right now, before any drag offset.
+  ({
+    Offset center,
+    double top,
+    double left,
+    double angle,
+    double scale,
+    double elevation,
+  })
+  _visualFor(_Layout layout, int i) {
+    final m = Metrics.of(context);
+    final card = layout.cards[i];
+    final legal = _isLegal(card);
+    final selectedIndex = _selectedId == null
+        ? -1
+        : layout.indexOf(_selectedId!);
+    final selected = i == selectedIndex;
+    final armed = card.id == _armedId;
+    final h = layout.cardHeight;
+
+    var left = layout.lefts[i];
+    var top = layout.tops[i];
+    var angle = layout.angles[i];
+    var scale = 1.0;
+    var elevation = 0.0;
+
+    if (widget.interactive && legal) top -= m.s(14);
+    if (widget.interactive && !legal && widget.legalIds.isNotEmpty) {
+      top += m.s(4);
+    }
+    if (armed && !selected) {
+      top -= h * 0.14;
+      elevation = 0.5;
+    }
+
+    if (selectedIndex >= 0 && !selected) {
+      // Neighbours part around the previewed card, falling off with distance.
+      final d = i - selectedIndex;
+      final push = layout.cardWidth * 0.3;
+      final falloff = switch (d.abs()) {
+        1 => 1.0,
+        2 => 0.45,
+        3 => 0.15,
+        _ => 0.0,
+      };
+      left += d.sign * push * falloff;
+    }
+    if (selected) {
+      final dragging = _mode == _Mode.dragging;
+      top -= dragging ? 0 : h * 0.2;
+      scale = dragging ? 1.12 : 1.18;
+      angle = 0;
+      elevation = 1;
+    }
+    final center = Offset(left + layout.cardWidth / 2, top + h / 2);
+    return (
+      center: center,
+      top: top,
+      left: left,
+      angle: angle,
+      scale: scale,
+      elevation: elevation,
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
-    final cardHeight = widget.cardWidth * PlayingCardView.aspect;
-    final lift = m.s(14);
-    // Relative to the card's own height rather than a fixed pixel count, so
-    // the "how far is far enough to throw" feel stays consistent across
-    // card sizes (portrait vs landscape, different screen densities): drag
-    // it up by more than 30% of its height and it's released.
-    final dragThreshold = cardHeight * 0.3;
-    final settings = SettingsScope.of(context);
-    final dragToPlayEnabled = settings.dragToPlayEnabled;
-    final durationScale = settings.animationSpeed.durationScale;
-    final liftDuration = Duration(milliseconds: (180 * durationScale).round());
-    final returnDuration = Duration(
-      milliseconds: (220 * durationScale).round(),
-    );
-    final zoomDuration = Duration(milliseconds: (140 * durationScale).round());
+    final scale = SettingsScope.of(context).animationSpeed.durationScale;
+    final slotDuration = Motion.scaled(Motion.slotMs, scale);
+    final previewDuration = Motion.scaled(Motion.previewMs, scale);
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        final n = widget.cards.length;
-        final maxWidth = constraints.maxWidth;
-        final fillSpacing = n <= 1
-            ? 0.0
-            : ((maxWidth - widget.cardWidth) / (n - 1)).clamp(
-                0.0,
-                double.infinity,
-              );
-        // Portrait keeps the traditional overlapping fan (there's rarely
-        // enough width for 13 cards edge-to-edge). Landscape has width to
-        // spare, so the fan stretches toward the far edges as spacing grows
-        // — but capped at 70% of cardWidth, so at least 30% of each card
-        // always stays overlapped by its neighbour instead of merely
-        // touching.
-        final spacing = n <= 1
-            ? 0.0
-            : m.isPortrait
-            ? (widget.cardWidth * 0.55).clamp(0.0, fillSpacing)
-            : fillSpacing.clamp(0.0, widget.cardWidth * 0.7);
-        final fanWidth = widget.cardWidth + spacing * (n - 1);
-
-        // The resting slot of every card in the fan, for the dealing flourish
-        // to target: each card's centre in this fan's local coordinates.
-        final slotCenters = [
-          for (var i = 0; i < n; i++)
-            Offset(
-              (maxWidth - fanWidth) / 2 + spacing * i + widget.cardWidth / 2,
-              lift + cardHeight / 2,
-            ),
-        ];
-        if (widget.onSlotsMeasured != null) {
-          _reportSlots(slotCenters);
-        }
-
-        // Paint order follows this list — putting the pressed card's index
-        // last brings it to the front, above its neighbours, while it's
-        // zoomed in for preview. Position (left/top) is still computed from
-        // each card's real index below, only paint order changes.
-        final visible = widget.revealedCount ?? n;
-        final order = List<int>.generate(
-          n,
-          (i) => i,
-        ).where((i) => i < visible).toList();
-        final pressedIndex = _pressedCardId == null
+        final layout = _computeLayout(constraints, m);
+        _layout = layout;
+        _reportSlots(layout);
+        final n = layout.cards.length;
+        final revealed = _revealedLaidOut(layout);
+        final selectedIndex = _selectedId == null
             ? -1
-            : widget.cards.indexWhere((c) => c.id == _pressedCardId);
-        if (pressedIndex >= 0) {
-          order
-            ..remove(pressedIndex)
-            ..add(pressedIndex);
+            : layout.indexOf(_selectedId!);
+
+        // Paint order: the held/raised/returning card on top of its neighbours.
+        final order = [for (var i = 0; i < revealed; i++) i];
+        for (final id in [_armedId, _returningId, _selectedId]) {
+          final i = id == null ? -1 : layout.indexOf(id);
+          if (i >= 0 && i < revealed) {
+            order
+              ..remove(i)
+              ..add(i);
+          }
         }
 
-        return SizedBox(
-          width: maxWidth,
-          height: cardHeight + lift,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              for (final i in order)
-                Builder(
-                  key: ValueKey(widget.cards[i].id),
-                  builder: (context) {
-                    final card = widget.cards[i];
-                    final legal = widget.legalIds.contains(card.id);
-                    // Layout runs for the full hand (n) so cards never shift
-                    // as they appear; only the revealed ones paint.
-                    final left = (maxWidth - fanWidth) / 2 + spacing * i;
+        final height =
+            layout.cardHeight + _liftSpace(m) + layout.cardHeight * 0.08;
 
-                    return AnimatedPositioned(
-                      duration: liftDuration,
-                      curve: Curves.easeOut,
-                      left: left,
-                      top: legal && widget.interactive ? 0 : lift,
-                      child: _DealReveal(
-                        child: _FanCard(
-                          card: card,
-                          legal: legal,
-                          interactive: widget.interactive,
-                          dimmed:
-                              widget.interactive &&
-                              widget.legalIds.isNotEmpty &&
-                              !legal,
-                          dragEnabled: dragToPlayEnabled,
-                          dragThreshold: dragThreshold,
-                          cardWidth: widget.cardWidth,
-                          returnDuration: returnDuration,
-                          zoomDuration: zoomDuration,
-                          onPlay: widget.onPlay,
-                          onPressChanged: (pressed) =>
-                              _setPressed(pressed ? card.id : null),
-                        ),
-                      ),
-                    );
-                  },
+        return Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: _onDown,
+          onPointerMove: _onMove,
+          onPointerUp: _onUp,
+          onPointerCancel: _onCancel,
+          child: SizedBox(
+            width: constraints.maxWidth,
+            height: height,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Positioned(
+                  left: -constraints.maxWidth * 0.05,
+                  right: -constraints.maxWidth * 0.05,
+                  top: -height * 0.6,
+                  bottom: -height * 0.1,
+                  child: _TurnGlow(active: widget.interactive && n > 0),
                 ),
-            ],
+                for (final i in order)
+                  _cardAt(
+                    layout,
+                    i,
+                    selectedIndex,
+                    slotDuration,
+                    previewDuration,
+                  ),
+              ],
+            ),
           ),
         );
       },
     );
   }
+
+  Widget _cardAt(
+    _Layout layout,
+    int i,
+    int selectedIndex,
+    Duration slotDuration,
+    Duration previewDuration,
+  ) {
+    final card = layout.cards[i];
+    final pose = _visualFor(layout, i);
+    final legal = _isLegal(card);
+    final interacting = selectedIndex >= 0 || _armedId != null;
+
+    var extra = Offset.zero;
+    var tilt = 0.0;
+    if (i == selectedIndex && _mode == _Mode.dragging) {
+      extra = _drag;
+      tilt = _tilt;
+    } else if (card.id == _returningId) {
+      extra = _returnFrom * _spring.value;
+      tilt = _returnTilt * _spring.value;
+    }
+    if (card.id == _shakeId && _shake.isAnimating) {
+      final t = _shake.value;
+      extra += Offset(
+        math.sin(t * math.pi * 6) * (1 - t) * layout.cardWidth * 0.12,
+        0,
+      );
+    }
+
+    return _SlotCard(
+      key: ValueKey(card.id),
+      duration: interacting ? previewDuration : slotDuration,
+      curve: Motion.emphasized,
+      left: pose.left,
+      top: pose.top,
+      angle: pose.angle,
+      scale: pose.scale,
+      offset: extra,
+      tilt: tilt,
+      child: _FlipIn(
+        child: RepaintBoundary(
+          child: PlayingCardView(
+            card: card,
+            width: layout.cardWidth,
+            dimmed: widget.interactive && widget.legalIds.isNotEmpty && !legal,
+            highlighted: widget.interactive && legal,
+            elevation: pose.elevation,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
-/// A card in the fan that reveals itself with a short fade-and-pop the moment
-/// it becomes visible. While a hand is being dealt, [HandFan] mounts each card
-/// exactly as it lands (only revealed cards are in the paint list), so every
-/// newly dealt card pops into its resting slot in the fan rather than snapping
-/// to existence.
-class _DealReveal extends StatelessWidget {
-  const _DealReveal({required this.child});
+/// A card's slot in the fan, gliding to new targets (slots closing up after a
+/// throw, a card rising for preview) instead of jumping. [offset] and [tilt]
+/// are applied immediately on top — the finger's own motion must never lag.
+class _SlotCard extends ImplicitlyAnimatedWidget {
+  const _SlotCard({
+    super.key,
+    required this.left,
+    required this.top,
+    required this.angle,
+    required this.scale,
+    required this.offset,
+    required this.tilt,
+    required this.child,
+    required super.duration,
+    super.curve,
+  });
+
+  final double left;
+  final double top;
+  final double angle;
+  final double scale;
+  final Offset offset;
+  final double tilt;
+  final Widget child;
+
+  @override
+  ImplicitlyAnimatedWidgetState<_SlotCard> createState() => _SlotCardState();
+}
+
+class _SlotCardState extends AnimatedWidgetBaseState<_SlotCard> {
+  Tween<double>? _left;
+  Tween<double>? _top;
+  Tween<double>? _angle;
+  Tween<double>? _scale;
+
+  @override
+  void forEachTween(TweenVisitor<dynamic> visitor) {
+    _left =
+        visitor(_left, widget.left, (v) => Tween<double>(begin: v as double))
+            as Tween<double>?;
+    _top =
+        visitor(_top, widget.top, (v) => Tween<double>(begin: v as double))
+            as Tween<double>?;
+    _angle =
+        visitor(_angle, widget.angle, (v) => Tween<double>(begin: v as double))
+            as Tween<double>?;
+    _scale =
+        visitor(_scale, widget.scale, (v) => Tween<double>(begin: v as double))
+            as Tween<double>?;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final a = animation;
+    return Positioned(
+      left: _left!.evaluate(a) + widget.offset.dx,
+      top: _top!.evaluate(a) + widget.offset.dy,
+      child: Transform.rotate(
+        angle: _angle!.evaluate(a) + widget.tilt,
+        child: Transform.scale(scale: _scale!.evaluate(a), child: widget.child),
+      ),
+    );
+  }
+}
+
+/// A card turning face up as it arrives in the hand: it swings in from
+/// edge-on, finishing the flip the dealt card started in the air.
+class _FlipIn extends StatelessWidget {
+  const _FlipIn({required this.child});
 
   final Widget child;
 
   @override
   Widget build(BuildContext context) {
+    final scale = SettingsScope.of(context).animationSpeed.durationScale;
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 160),
-      curve: Curves.easeOut,
+      duration: Motion.scaled(Motion.revealMs, scale),
+      curve: Curves.easeOutCubic,
+      child: child,
       builder: (context, t, child) {
-        return Opacity(
-          opacity: t,
-          child: Transform.scale(scale: 0.85 + 0.15 * t, child: child),
+        if (t >= 1) return child!;
+        return Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.identity()
+            ..setEntry(3, 2, 0.0015)
+            ..rotateY((1 - t) * math.pi / 2),
+          child: child,
         );
       },
-      child: child,
     );
   }
 }
 
-/// A single card in the fan: tappable when legal-and-interactive, and also
-/// draggable (upward, toward the table) past [dragThreshold] as an
-/// alternative to tapping. Releasing short of the threshold springs the card
-/// back to its resting position. While held — whether about to tap or mid
-/// drag — the card zooms in and rises above its neighbours so it's clearly
-/// legible before the player commits to throwing it.
-class _FanCard extends StatefulWidget {
-  const _FanCard({
-    required this.card,
-    required this.legal,
-    required this.interactive,
-    required this.dimmed,
-    required this.dragEnabled,
-    required this.dragThreshold,
-    required this.cardWidth,
-    required this.returnDuration,
-    required this.zoomDuration,
-    required this.onPlay,
-    required this.onPressChanged,
-  });
+/// A warm glow rising behind the hand when it is the player's turn. It swells
+/// a few times as the turn arrives, then settles to a steady low light.
+class _TurnGlow extends StatefulWidget {
+  const _TurnGlow({required this.active});
 
-  final PlayingCard card;
-  final bool legal;
-  final bool interactive;
-  final bool dimmed;
-  final bool dragEnabled;
-  final double dragThreshold;
-  final double cardWidth;
-
-  /// Duration of the drag-release snap-back animation, pre-scaled by the
-  /// user's animation speed setting.
-  final Duration returnDuration;
-
-  /// Duration of the press-to-zoom preview transition, same scaling.
-  final Duration zoomDuration;
-  final void Function(PlayingCard card, Offset? releasePosition)? onPlay;
-
-  /// Notifies the parent fan when this card becomes (or stops being) the
-  /// pressed one, so the fan can bring it to the front of paint order.
-  final ValueChanged<bool> onPressChanged;
+  final bool active;
 
   @override
-  State<_FanCard> createState() => _FanCardState();
+  State<_TurnGlow> createState() => _TurnGlowState();
 }
 
-class _FanCardState extends State<_FanCard>
+class _TurnGlowState extends State<_TurnGlow>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _returnController;
-
-  Animation<Offset>? _returnAnimation;
-  Offset _dragOffset = Offset.zero;
-  bool _dragging = false;
-  bool _pressed = false;
-
-  /// Set the instant a drag crosses [_FanCard.dragThreshold], so the card is
-  /// thrown right then instead of waiting for the finger to actually lift —
-  /// and so any further drag updates/the eventual drag-end are ignored
-  /// rather than acting on a card that's already on its way out.
-  bool _thrown = false;
-
-  bool get _canDrag => widget.legal && widget.interactive && widget.dragEnabled;
-  bool get _canPress => widget.legal && widget.interactive;
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 2100),
+  );
 
   @override
   void initState() {
     super.initState();
-    // Built eagerly here (not as a lazy `late final` field) so it's always
-    // constructed while the widget is still mounted — a card that's never
-    // dragged would otherwise trigger `vsync: this` for the first time from
-    // inside dispose(), which crashes because the element is deactivating.
-    _returnController =
-        AnimationController(vsync: this, duration: widget.returnDuration)
-          ..addListener(() {
-            setState(() => _dragOffset = _returnAnimation!.value);
-          });
+    if (widget.active) _pulse.forward();
   }
 
   @override
-  void didUpdateWidget(covariant _FanCard oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.returnDuration != oldWidget.returnDuration) {
-      _returnController.duration = widget.returnDuration;
-    }
-    // A card that stops being legal/interactive mid-press (e.g. the turn
-    // moves on) shouldn't stay zoomed in with no way to release it.
-    if (!_canPress && _pressed) {
-      _setPressed(false);
-    }
+  void didUpdateWidget(_TurnGlow old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) _pulse.forward(from: 0);
   }
 
   @override
   void dispose() {
-    _returnController.dispose();
+    _pulse.dispose();
     super.dispose();
-  }
-
-  void _setPressed(bool pressed) {
-    if (_pressed == pressed) return;
-    setState(() => _pressed = pressed);
-    widget.onPressChanged(pressed);
-  }
-
-  void _onTapDown(TapDownDetails _) {
-    _setPressed(true);
-  }
-
-  void _onTapUp(TapUpDetails _) {
-    _setPressed(false);
-  }
-
-  void _onTapCancel() {
-    // If this cancel is because the gesture just turned into a drag,
-    // onVerticalDragStart already has (or is about to) set _pressed true
-    // again via _dragging — either way both fire synchronously within the
-    // same gesture resolution, so no visible flicker either order.
-    if (!_dragging) _setPressed(false);
-  }
-
-  void _onVerticalDragStart(DragStartDetails _) {
-    if (!_canDrag) return;
-    _returnController.stop();
-    _dragging = true;
-    _thrown = false;
-    _setPressed(true);
-  }
-
-  void _onVerticalDragUpdate(DragUpdateDetails details) {
-    if (!_canDrag || !_dragging || _thrown) return;
-    setState(() {
-      _dragOffset += details.delta;
-    });
-    // Release as soon as the card has moved far enough, without waiting for
-    // the finger to actually lift — a decisive enough flick should commit
-    // right away rather than requiring the user to also let go.
-    if (-_dragOffset.dy >= widget.dragThreshold) {
-      _throwCard();
-    }
-  }
-
-  void _onVerticalDragEnd(DragEndDetails details) {
-    if (!_canDrag || _thrown) return;
-    _dragging = false;
-    _setPressed(false);
-    _returnAnimation = Tween<Offset>(begin: _dragOffset, end: Offset.zero)
-        .animate(
-          CurvedAnimation(
-            parent: _returnController,
-            curve: Curves.easeOutCubic,
-          ),
-        );
-    _returnController.forward(from: 0);
-  }
-
-  void _throwCard() {
-    _thrown = true;
-    _dragging = false;
-    // Deliberately not touching _pressed or _dragOffset here: the parent's
-    // state update (from onPlay, below) removes this card from the hand in
-    // the very same frame, so this widget is about to be unmounted outright.
-    // Resetting the zoom/lift/drag transforms first — as this used to do —
-    // meant they'd animate back toward the resting slot for a frame or two
-    // before disappearing, reading as the card snapping back into place
-    // before vanishing. Leaving everything as it was at release means it
-    // just cleanly throws, exactly like the tap path (which never touches
-    // these transforms at all).
-    // The flight starts where the card actually is right now (resting slot
-    // plus however far the drag carried it), not the original touch-down
-    // point, so a flick that crossed the threshold keeps flying from the
-    // spot it was thrown rather than jumping back down into the fan first.
-    widget.onPlay?.call(widget.card, _currentGlobalCenter);
-  }
-
-  /// The card's current centre in screen-global coordinates: its resting slot
-  /// plus the in-progress drag offset. Used as the throw's flight start so the
-  /// flight lines up with the card the finger is still holding.
-  Offset? get _currentGlobalCenter {
-    final box = context.findRenderObject();
-    if (box is! RenderBox || !box.attached || !box.hasSize) return null;
-    return box.localToGlobal(box.size.center(Offset.zero)) + _dragOffset;
   }
 
   @override
   Widget build(BuildContext context) {
-    final legal = widget.legal;
-    final interactive = widget.interactive;
-    final zoomed = _pressed;
-
-    return Listener(
-      behavior: HitTestBehavior.opaque,
-      // onTapDown below only fires once the tap recognizer wins the gesture
-      // arena — with a competing vertical drag that is the moment the finger
-      // lifts, so a quick tap would never zoom. The raw Listener presses the
-      // card the instant the pointer lands, so the preview is always there.
-      onPointerDown: _canPress ? (_) => _setPressed(true) : null,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        // Dragging reports the pointer-down position rather than wherever the
-        // pointer had already moved once the drag recognizer won the arena, so
-        // the throw's origin is the actual touch-down point (see
-        // [_currentGlobalCenter]).
-        dragStartBehavior: DragStartBehavior.down,
-        onTapDown: _canPress ? _onTapDown : null,
-        onTapUp: _canPress ? _onTapUp : null,
-        onTapCancel: _canPress ? _onTapCancel : null,
-        onTap: legal && interactive
-            ? () => widget.onPlay?.call(widget.card, _currentGlobalCenter)
-            : null,
-        onVerticalDragStart: _canDrag ? _onVerticalDragStart : null,
-        onVerticalDragUpdate: _canDrag ? _onVerticalDragUpdate : null,
-        onVerticalDragEnd: _canDrag ? _onVerticalDragEnd : null,
-        child: Transform.translate(
-          offset: _dragOffset,
-          child: AnimatedScale(
-            // Grows in place around the card's own centre — no lift/slide —
-            // so a press just enlarges it for a clearer look rather than
-            // popping it out of its spot in the fan.
-            scale: zoomed ? 1.25 : 1.0,
-            duration: widget.zoomDuration,
-            curve: Curves.easeOut,
-            alignment: Alignment.center,
-            child: PlayingCardView(
-              card: widget.card,
-              width: widget.cardWidth,
-              dimmed: widget.dimmed,
-              highlighted: legal && interactive,
-            ),
+    return IgnorePointer(
+      child: AnimatedOpacity(
+        opacity: widget.active ? 1 : 0,
+        duration: const Duration(milliseconds: 300),
+        child: RepaintBoundary(
+          child: AnimatedBuilder(
+            animation: _pulse,
+            builder: (context, _) {
+              final t = _pulse.value;
+              // Three swells that fade into a steady 0.55.
+              final swell = _pulse.isAnimating
+                  ? 0.55 + 0.45 * math.sin(t * math.pi * 6).abs() * (1 - t)
+                  : 0.55;
+              return DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: RadialGradient(
+                    center: const Alignment(0, 0.45),
+                    radius: 0.7,
+                    colors: [
+                      AppColors.turnGlow.withValues(alpha: 0.3 * swell),
+                      AppColors.turnGlow.withValues(alpha: 0.0),
+                    ],
+                  ),
+                ),
+              );
+            },
           ),
         ),
       ),

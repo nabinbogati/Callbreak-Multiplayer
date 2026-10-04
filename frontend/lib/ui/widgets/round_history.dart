@@ -1,9 +1,11 @@
+import 'package:flutter/material.dart' show Icons;
 import 'package:flutter/widgets.dart';
 
 import '../../design/metrics.dart';
 import '../../design/tokens.dart';
 import '../../engine/game.dart';
 import 'backdrop.dart';
+import 'buttons.dart';
 
 /// Full round-by-round scorecard, opened by tapping the HUD's round pill.
 ///
@@ -25,7 +27,7 @@ class RoundHistoryOverlay extends StatelessWidget {
         onTap: onClose,
         behavior: HitTestBehavior.opaque,
         child: Container(
-          color: const Color(0x99000000),
+          color: AppColors.scrim,
           alignment: Alignment.center,
           child: GestureDetector(
             // Absorb taps on the card itself so they don't fall through to
@@ -36,7 +38,7 @@ class RoundHistoryOverlay extends StatelessWidget {
               constraints: BoxConstraints(maxWidth: m.s(420), maxHeight: m.s(520)),
               child: Padding(
                 padding: EdgeInsets.all(m.s(20)),
-                child: _Card(view: view, onClose: onClose),
+                child: PopIn(child: _Card(view: view, onClose: onClose)),
               ),
             ),
           ),
@@ -56,22 +58,16 @@ class _Card extends StatelessWidget {
   Widget build(BuildContext context) {
     final m = Metrics.of(context);
 
-    return Container(
+    return GlassPanel(
       padding: EdgeInsets.fromLTRB(m.s(20), m.s(18), m.s(20), m.s(18)),
-      decoration: BoxDecoration(
-        color: const Color(0xE604120D),
-        borderRadius: BorderRadius.circular(m.s(18)),
-        border: Border.all(color: AppColors.goldBorder.withValues(alpha: 0.35)),
-        boxShadow: const [
-          BoxShadow(color: Color(0x99000000), blurRadius: 30, offset: Offset(0, 12)),
-        ],
-      ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             children: [
+              Icon(Icons.leaderboard_rounded, size: m.s(18), color: AppColors.gold),
+              SizedBox(width: m.s(8)),
               Expanded(
                 child: Text(
                   'Round history',
@@ -81,9 +77,14 @@ class _Card extends StatelessWidget {
               PressFeedback(
                 onTap: onClose,
                 scale: 0.9,
-                child: Padding(
-                  padding: EdgeInsets.all(m.s(4)),
-                  child: Text('✕', style: AppText.semiBold(m.s(15), AppColors.textMuted)),
+                child: Container(
+                  padding: EdgeInsets.all(m.s(6)),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0x14FFFFFF),
+                    border: Border.all(color: AppColors.hairlineStrong),
+                  ),
+                  child: Icon(Icons.close_rounded, size: m.s(16), color: AppColors.textMuted),
                 ),
               ),
             ],
