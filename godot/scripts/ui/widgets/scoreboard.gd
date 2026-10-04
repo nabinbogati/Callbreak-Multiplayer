@@ -11,8 +11,11 @@ signal continue_pressed
 const PLACE := {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
 
 
-func _init(view: GameView, deadline_ms := 0) -> void:
-	add_theme_stylebox_override("panel", UI.glass_box(Vector4(UI.sc(18, 14), UI.sc(18, 12), UI.sc(18, 14), UI.sc(16, 10))))
+## [param max_height] is the most of the screen the panel may take; past it the
+## content scrolls.
+func _init(view: GameView, deadline_ms := 0, max_height := INF) -> void:
+	var pad := Vector4(UI.sc(18, 14), UI.sc(18, 12), UI.sc(18, 14), UI.sc(16, 10))
+	add_theme_stylebox_override("panel", UI.glass_box(pad))
 	var final := view.phase == GameView.GAME_OVER
 	var col := UI.vbox(0)
 	col.add_child(UI.gold_text("Game over" if final else "Round %d of %d" % [view.hand_number(), view.hands_per_game],
@@ -48,7 +51,7 @@ func _init(view: GameView, deadline_ms := 0) -> void:
 	if not final and deadline_ms > 0:
 		col.add_child(UI.gap(UI.sc(6, 4)))
 		col.add_child(DeadlineBar.new("Next round", deadline_ms))
-	add_child(col if UI.portrait else UI.scroll(col))
+	add_child(UI.fit_scroll(col, max_height - pad.y - pad.w))
 
 
 func _header(text: String, align := HORIZONTAL_ALIGNMENT_CENTER) -> Label:

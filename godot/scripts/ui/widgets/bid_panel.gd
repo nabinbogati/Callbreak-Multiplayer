@@ -23,10 +23,13 @@ var _suggest_style: StyleBoxFlat
 var deadline_bar: DeadlineBar
 
 
-func _init(hand: Array, deadline_ms := 0) -> void:
+## [param max_height] is the most of the screen the panel may take; past it the
+## content scrolls.
+func _init(hand: Array, deadline_ms := 0, max_height := INF) -> void:
 	_suggested = Rules.suggest_bid(hand)
 	_value = _suggested
-	add_theme_stylebox_override("panel", UI.glass_box(Vector4(18, UI.sc(16, 12), 18, UI.sc(18, 12))))
+	var pad := Vector4(18, UI.sc(16, 12), 18, UI.sc(18, 12))
+	add_theme_stylebox_override("panel", UI.glass_box(pad))
 	var col := UI.vbox(0)
 
 	var titles := UI.vbox(0, [UI.label("Your bid", UI.sc(17, 15), Tokens.TEXT_PRIMARY, "bold"),
@@ -69,8 +72,9 @@ func _init(hand: Array, deadline_ms := 0) -> void:
 	var bar_wrap := UI.vbox(0, [UI.gap(UI.sc(12, 8)), deadline_bar])
 	bar_wrap.visible = deadline_ms > 0
 	col.add_child(bar_wrap)
-	# Scrollable defensively: a small landscape screen leaves little height.
-	add_child(col if UI.portrait else UI.scroll(col))
+	# Scrollable defensively: a short screen, a phone on its side most of all,
+	# leaves little height.
+	add_child(UI.fit_scroll(col, max_height - pad.y - pad.w))
 	_refresh()
 
 

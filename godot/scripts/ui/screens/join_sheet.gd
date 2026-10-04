@@ -39,7 +39,7 @@ func _init(mode_in: String) -> void:
 			_build())
 	_room.text_submitted.connect(func(_t): _submit())
 	_body = UI.vbox(0)
-	add_child(UI.scroll(_body) if not UI.portrait else _body)
+	add_child(_body)
 	_build()
 
 

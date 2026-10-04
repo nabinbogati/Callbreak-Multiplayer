@@ -188,6 +188,23 @@ static func scroll(child: Control) -> ScrollContainer:
 	return s
 
 
+## A [method scroll] as tall as [param child] up to [param max_height], so the
+## panel around it fits its content where there is room and scrolls where
+## there is not. A bare ScrollContainer claims no height at all, so a panel
+## sized to its content would collapse round it.
+static func fit_scroll(child: Control, max_height: float) -> ScrollContainer:
+	var s := scroll(child)
+	var fit := func():
+		var h := child.get_combined_minimum_size().y
+		s.custom_minimum_size.y = clampf(h, 0.0, maxf(max_height, 0.0))
+		# Clipped only while it scrolls, so a button's glow can still spill
+		# into the panel's padding.
+		s.clip_contents = h > max_height
+	child.minimum_size_changed.connect(fit)
+	fit.call()
+	return s
+
+
 ## Wraps content in a [Pressable] and connects [param on_press].
 static func pressable(content: Control, on_press := Callable(), press_scale := 0.94) -> Pressable:
 	var p := Pressable.new()

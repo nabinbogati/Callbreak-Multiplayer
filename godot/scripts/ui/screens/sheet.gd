@@ -27,7 +27,11 @@ func _init(content_in: Control) -> void:
 	add_child(_scrim)
 	_panel = PanelContainer.new()
 	_panel.mouse_filter = Control.MOUSE_FILTER_STOP
-	_panel.add_child(content)
+	# Scrolls once the content outgrows the screen: a short landscape window,
+	# or the keyboard taking the bottom half.
+	var scroller := UI.scroll(content)
+	scroller.follow_focus = true
+	_panel.add_child(scroller)
 	add_child(_panel)
 	if content.has_signal("finished"):
 		content.connect("finished", close)
@@ -77,7 +81,7 @@ func _layout() -> void:
 		_panel.custom_minimum_size = Vector2(view.x, 0)
 		_panel.size = Vector2(view.x, 0)
 		_panel.reset_size()
-		var h := minf(_panel.get_combined_minimum_size().y, max_h)
+		var h := minf(_natural_height(), max_h)
 		_panel.size = Vector2(view.x, h)
 		_panel.position = Vector2(0, view.y - h - kb)
 	else:
@@ -86,9 +90,15 @@ func _layout() -> void:
 		var max_h := (view.y - kb) * 0.92
 		_panel.custom_minimum_size = Vector2(w, 0)
 		_panel.reset_size()
-		var h := minf(_panel.get_combined_minimum_size().y, max_h)
+		var h := minf(_natural_height(), max_h)
 		_panel.size = Vector2(w, h)
 		_panel.position = Vector2((view.x - w) / 2.0, (view.y - kb - h) / 2.0)
+
+
+## The panel's height with all of its content showing. The scroller inside
+## claims none of the content's height, so it is added back here.
+func _natural_height() -> float:
+	return _panel.get_combined_minimum_size().y + content.get_combined_minimum_size().y
 
 
 func close(result = null) -> void:

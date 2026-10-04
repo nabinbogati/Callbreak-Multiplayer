@@ -289,7 +289,9 @@ func _aim_deal() -> void:
 ## The table's size and its top edge within the felt box: (width, height,
 ## top). Portrait stands the oval on end (long axis from the top seat down to
 ## the player's own); landscape lays it on its side and runs it past the bottom
-## of its box, so its rim tucks behind the hand.
+## of its box, so its rim tucks behind the hand. Lying down it is never rounder
+## than standing: a wide window stretches it sideways (up to [code]MAX_WIDTH[/code]
+## of the box), and a box too narrow for that shrinks it about the same centre.
 func _felt_geometry(box: Vector2) -> Vector3:
 	const ASPECT := 1.62
 	if UI.portrait:
@@ -297,7 +299,15 @@ func _felt_geometry(box: Vector2) -> Vector3:
 		return Vector3(h / ASPECT, h, (box.y - h) / 2.0)
 	const TOP_INSET := 0.04
 	const OVERHANG := 0.12
-	return Vector3(box.x * 0.6, box.y * (1.0 + OVERHANG - TOP_INSET - TOP_INSET * (1.0 - 0.33)), box.y * TOP_INSET)
+	const MIN_WIDTH := 0.6
+	const MAX_WIDTH := 0.8
+	var top := box.y * TOP_INSET
+	var h := box.y * (1.0 + OVERHANG - TOP_INSET - TOP_INSET * (1.0 - 0.33))
+	var w := clampf(h * ASPECT, box.x * MIN_WIDTH, box.x * MAX_WIDTH)
+	if w < h * ASPECT:
+		top += (h - w / ASPECT) / 2.0
+		h = w / ASPECT
+	return Vector3(w, h, top)
 
 
 ## The width cards on the felt are drawn at.
@@ -755,7 +765,7 @@ func _rebuild_overlay(force: bool) -> void:
 	if v == null:
 		return
 	if v.phase == GameView.BIDDING and v.is_my_turn() and not v.i_have_bid() and not _dealing:
-		_bid_panel = BidPanel.new(v.hand, session.turn_deadline_ms)
+		_bid_panel = BidPanel.new(v.hand, session.turn_deadline_ms, _modal_max_height())
 		_bid_panel.bid_chosen.connect(func(b): session.place_bid(b))
 		_bid_panel.custom_minimum_size.x = minf(320, size.x) - 32
 		var c := CenterContainer.new()
@@ -765,7 +775,7 @@ func _rebuild_overlay(force: bool) -> void:
 		_overlay.add_child(c)
 		UI.pop_in(_bid_panel)
 	if v.phase == GameView.HAND_OVER:
-		var board := Scoreboard.new(v, session.hand_advance_deadline_ms)
+		var board := Scoreboard.new(v, session.hand_advance_deadline_ms, _modal_max_height())
 		board.continue_pressed.connect(func(): session.continue_to_next_hand())
 		_overlay.add_child(_modal(board, 360))
 	if v.phase == GameView.GAME_OVER:
@@ -804,6 +814,12 @@ func _modal(content: Control, max_width: float) -> Control:
 	scrim.add_child(center)
 	UI.pop_in(content)
 	return scrim
+
+
+## The tallest a panel centred over the table can be and still keep clear of
+## the screen's edges.
+func _modal_max_height() -> float:
+	return size.y - UI.safe.y - UI.safe.w - UI.sc(20, 12) * 2.0
 
 
 ## "Play again": on quickplay that means fresh opponents from matchmaking — a

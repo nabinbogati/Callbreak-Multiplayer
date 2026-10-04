@@ -98,6 +98,80 @@ func test_sheets_open_and_close() -> void:
 	app.queue_free()
 
 
+## Window shapes in design pixels: a phone either way up (a 16:9 one too),
+## then a desktop window tiled tall, widened just past square, and full screen.
+const SHAPES := [Vector2i(390, 844), Vector2i(844, 390), Vector2i(693, 390), Vector2i(673, 754), Vector2i(897, 754),
+		Vector2i(1371, 771)]
+
+
+func test_layout_holds_at_every_window_shape() -> void:
+	var root := get_tree().root
+	var headless_size := [root.size, root.content_scale_size]
+	await _start_app()
+	for shape in SHAPES:
+		await _resize(shape)
+		for content in [JoinSheet.new("bots"), JoinSheet.new("private"), LanSheet.new(), QuickSettings.new()]:
+			var sheet := app.sheet(content)
+			await _frames(3)
+			# Each has a title, a choice and a button at the least: a scroller
+			# inside one could otherwise hide its height from the measure.
+			_expect_fits(sheet._panel, maxf(content.get_combined_minimum_size().y, 120.0),
+					"%s sheet at %s" % [content.get_script().get_global_name(), shape])
+			sheet.dismiss()
+			await _frames(1)
+
+	await _resize(SHAPES[0])
+	var session := LocalSession.new("Tester", "normal", 3, 0.02, 11)
+	var table := TableScreen.new(session)
+	app.push(table)
+	expect_true(await wait_until(func(): return table._bid_panel != null, 10.0), "the bid panel opens")
+	for shape in SHAPES:
+		await _resize(shape)
+		var col: Control = table._bid_panel.get_child(0).get_child(0)
+		_expect_fits(table._bid_panel, col.get_combined_minimum_size().y, "bid panel at %s" % shape)
+		var felt := table._felt.size
+		if shape.y >= shape.x:
+			expect_near(felt.y / felt.x, 1.62, 0.01, "an upright oval at %s" % shape)
+		else:
+			expect_true(felt.x / felt.y >= 1.6, "an oval on its side at %s, got %s" % [shape, felt])
+
+	# Play the hand out and hold on its scoreboard.
+	session.changed.connect(func():
+		if session.view.phase != GameView.HAND_OVER:
+			_autopilot.call_deferred(session))
+	_autopilot(session)
+	var boards := func(): return table._overlay.find_children("*", "Scoreboard", true, false)
+	expect_true(await wait_until(func(): return boards.call().size() == 1, 60.0), "the scoreboard opens")
+	for shape in SHAPES:
+		await _resize(shape)
+		var board: Scoreboard = boards.call()[0]
+		var col: Control = board.get_child(0).get_child(0)
+		_expect_fits(board, col.get_combined_minimum_size().y, "scoreboard at %s" % shape)
+	root.size = headless_size[0]
+	root.content_scale_size = headless_size[1]
+	app.queue_free()
+
+
+## Gives the viewport [param shape]. The window has to take the shape too: on
+## its own the scale size only sets the short side.
+func _resize(shape: Vector2i) -> void:
+	get_tree().root.size = shape
+	get_tree().root.content_scale_size = shape
+	await _frames(3)
+	# The table's panels pop in from a little smaller.
+	await get_tree().create_timer(0.35).timeout
+
+
+## [param panel] is as tall as its content, or as much of it as the screen
+## allows, and lies wholly on screen.
+func _expect_fits(panel: Control, content_h: float, what: String) -> void:
+	var view := app.get_viewport_rect()
+	var rect := panel.get_global_rect()
+	expect_true(rect.size.y >= minf(content_h, view.size.y * 0.8) - 1.0,
+			"%s is %.0f tall for %.0f of content" % [what, rect.size.y, content_h])
+	expect_true(view.grow(1.0).encloses(rect), "%s lies on screen: %s in %s" % [what, rect, view.size])
+
+
 func test_full_game_through_the_table_screen() -> void:
 	await _start_app()
 	var session := LocalSession.new("Tester", "hard", 3, 0.02, 7)
