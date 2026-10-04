@@ -56,8 +56,7 @@ func _deal_new_game() -> void:
 	var bot_index := 0
 	for seat in 4:
 		if _seats[seat] == null:
-			_seats[seat] = GameView.make_player(seat, bot_names[bot_index % bot_names.size()],
-					"bot", difficulty)
+			_seats[seat] = GameView.make_player(seat, _bot_name(seat, bot_index), "bot", difficulty)
 		bot_index += 1
 	_game = CallBreakGame.new(_seats, seed_value, hands_per_game)
 	seed_value = -1
@@ -70,6 +69,12 @@ func _deal_new_game() -> void:
 	_game.start()
 	turn_deadline_ms = 0
 	hand_advance_deadline_ms = 0
+
+
+## The name for a bot filling [param seat], the [param bot_index]th seat
+## filled (humans included) — the LAN host's numbering.
+func _bot_name(_seat: int, bot_index: int) -> String:
+	return bot_names[bot_index % bot_names.size()]
 
 
 # ------------------------------------------------------------ UI intents

@@ -21,3 +21,8 @@ func _init(name_in := "You", difficulty_in := "normal", hands := Rules.HANDS_PER
 func _ready() -> void:
 	_deal_new_game()
 	_publish()
+
+
+## Seats 1–3 are Bot 1–3, clockwise from the player.
+func _bot_name(seat: int, _bot_index: int) -> String:
+	return bot_names[(seat - 1) % bot_names.size()]
