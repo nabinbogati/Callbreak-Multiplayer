@@ -1,0 +1,49 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[application]
+
+config/name="Call Break"
+config/description="Call Break — multiplayer trick-taking card game with bot opponents."
+config/version="1.0.0"
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("4.5", "GL Compatibility")
+config/icon="res://assets/images/spade.png"
+boot_splash/bg_color=Color(0.0156863, 0.0784314, 0.0588235, 1)
+boot_splash/show_image=false
+config/quit_on_go_back=false
+
+[autoload]
+
+Settings="*res://scripts/state/app_settings.gd"
+Audio="*res://scripts/audio/audio_controller.gd"
+Uploader="*res://scripts/net/game_uploader.gd"
+
+[display]
+
+window/size/viewport_width=390
+window/size/viewport_height=844
+window/size/window_width_override=468
+window/size/window_height_override=1012
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/handheld/orientation=6
+window/energy_saving/keep_screen_on=true
+
+[gui]
+
+common/drop_mouse_on_gui_input_disabled=true
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/vram_compression/import_etc2_astc=true
+environment/defaults/default_clear_color=Color(0.0156863, 0.0784314, 0.0588235, 1)

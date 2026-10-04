@@ -51,8 +51,8 @@ type Config struct {
 	// never sets it is not silently exposed.
 	AdminToken string
 
-	// Table pacing. Defaults mirror TablePacing in the Flutter client
-	// (frontend/lib/net/local_session.dart) so a networked table feels the same
+	// Table pacing. Defaults mirror the pacing constants in the Godot client
+	// (godot/scripts/net/game_session.gd) so a networked table feels the same
 	// as the offline one.
 	BotThinkMin    time.Duration
 	BotThinkExtra  time.Duration
@@ -196,7 +196,7 @@ func (c Config) validate() error {
 		return fmt.Errorf("config: DATABASE_REQUIRED is set but DATABASE_URL is empty")
 	}
 	if c.IsProduction() && len(c.AllowedOrigins) == 0 {
-		// Browsers are not a target today (the client is a Flutter app, which
+		// Browsers are not a target today (the client is a Godot app, which
 		// sends no Origin), but leaving this open in production would let any
 		// web page drive a socket on a user's behalf.
 		return fmt.Errorf("config: ALLOWED_ORIGINS is required in production")

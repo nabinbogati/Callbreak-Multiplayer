@@ -326,7 +326,7 @@ never blocks on it.
 
 ---
 
-## 6. Client (Flutter)
+## 6. Client (Godot)
 
 `ProfileScreen` with three tabs, reached from the avatar in the home screen top
 bar:
@@ -339,9 +339,9 @@ bar:
   behind a "Coming soon" state, with copy explaining that linking preserves the
   existing history.
 
-The device id is generated once and persisted with `shared_preferences`; so is
-the session token. Both survive an app restart, which is the thing today's
-in-memory `guestToken` does not.
+The device id is generated once and persisted in `user://identity.cfg`
+(`godot/scripts/state/identity_store.gd`); so are the session token, the socket
+guest token and the active-table record. All survive an app restart.
 
 ---
 

@@ -1,5 +1,12 @@
 # Build Call Break From Scratch — Step-by-Step Roadmap
 
+> **Note — the app is now a Godot client.** The client in this repository was
+> rewritten in Godot 4.5 and lives in `godot/` (see `godot/README.md`). This
+> material teaches the *original* Flutter client, which is no longer in the
+> working tree. Its code — the answer key the phases below point at — is still in
+> git history: `git worktree add ../callbreak-flutter f5940e7` checks it out with
+> `frontend/` intact. The Go backend sections still match the current code.
+
 > **Prefer hands-on?** The same curriculum exists as an interactive, step-by-step
 > web course — quizzes, write-it-yourself code checks, tracked progress, and
 > in-app markdown docs. Open `docs/course/index.html` in any browser (no install

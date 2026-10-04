@@ -3,7 +3,7 @@
 #
 #   docker compose -f deploy/docker-compose.yml up --build
 #
-# Then point the Flutter app's debug server URL at ws://<your-lan-ip>:8080/ws.
+# Then point the app's debug server URL (Settings → Debug) at ws://<your-lan-ip>:8080/ws.
 # Use the LAN address rather than localhost, or a phone or emulator will be
 # looking for the server on itself.
 

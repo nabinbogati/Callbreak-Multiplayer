@@ -1,6 +1,6 @@
 # Call Break game server
 
-The authoritative backend for the Flutter client in `../frontend`. One binary
+The authoritative backend for the Godot client in `../godot`. One binary
 serves both networked modes:
 
 - **Private tables** — invite-only rooms addressed by a 4-character code, empty
@@ -29,7 +29,7 @@ make up           # server + Redis + Postgres via docker compose
 nothing installed. `make test-db` starts a container, runs them, and throws it
 away.
 
-Point the Flutter app at it through the debug server field in Settings:
+Point a debug build of the app at it through Settings → Debug → Game server:
 `ws://<your-lan-ip>:8080/ws`. Use the LAN address, not `localhost`, or a phone
 or emulator will look for the server on itself.
 
@@ -37,8 +37,8 @@ or emulator will look for the server on itself.
 
 ```
 cmd/server            wiring: config → dependencies → HTTP → graceful drain
-internal/engine       the rules, ported from frontend/lib/engine/
-internal/bot          the opponent, ported from frontend/lib/bots/bot.dart
+internal/engine       the rules, mirrored by godot/scripts/engine/
+internal/bot          the opponent, mirrored by godot/scripts/bots/bot_brain.gd
 internal/room         one goroutine per table, owning all of its state
 internal/match        quickplay seating: open tables players join as they arrive
 internal/ws           websocket edge: upgrade, auth, validate, route
@@ -56,9 +56,9 @@ hot path entirely. A room is a few kilobytes resident, so the ceiling on tables
 per node is websocket fan-out, not the game logic.
 
 **The engine is a pure state machine.** No timers, no I/O, no goroutines. It is
-a faithful port of the Dart engine the client already runs offline, which is
+a faithful twin of the GDScript engine the client runs offline, which is
 what lets one implementation of the rules back both. `internal/engine`'s tests
-are ported case-for-case from `frontend/test/engine_test.dart`; if they ever
+match the client's `godot/tests/test_engine.gd` case for case; if they ever
 disagree, the client and server disagree about the rules, and that is the one
 bug class this port cannot afford.
 
@@ -113,8 +113,8 @@ below — and the server correctly refused the second table's start.)
   million combinations. That is small enough that a determined stranger could
   find an open private room by guessing, and small enough that two rooms created
   at random will occasionally collide (~2% across 200 tables). Lengthening the
-  code means changing `RoomCodeLength` here and `_newCode` in
-  `frontend/lib/ui/screens/settings_sheet.dart` together.
+  code means changing `RoomCodeLength` here and `new_code` in
+  `godot/scripts/ui/screens/join_sheet.gd` together.
 - **Persistence is optional and degrades rather than fails.** With no
   `DATABASE_URL` the server runs exactly as it always has — tables work, nothing
   is recorded, and the `/v1` REST routes answer `503 persistence_disabled`. Set
@@ -166,8 +166,8 @@ environment. `JWT_SECRET` and `ALLOWED_ORIGINS` become mandatory when
 | `ADMIN_TOKEN` | — | unlocks `/admin` and the `/v1/admin/*` API; empty disables the dashboard entirely |
 | `ENABLE_PPROF` | `false` | mounts `/debug/pprof` — never expose publicly |
 
-The pacing defaults deliberately match `TablePacing` in
-`frontend/lib/net/local_session.dart`, so a networked table feels the same as
+The pacing defaults deliberately match the pacing constants in
+`godot/scripts/net/game_session.gd`, so a networked table feels the same as
 the offline one.
 
 ## Operating it

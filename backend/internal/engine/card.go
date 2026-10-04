@@ -1,9 +1,9 @@
 // Package engine is the authoritative Call Break state machine.
 //
-// It is a faithful port of the Dart engine in frontend/lib/engine/ — card.dart,
-// rules.dart and game.dart. The client runs the same logic locally for its
+// It is a faithful port of the client engine in godot/scripts/engine/ — cards.gd,
+// rules.gd and call_break_game.gd. The client runs the same logic locally for its
 // offline mode, so any divergence here shows up as a desynced table. Every
-// exported symbol below has a named counterpart in the Dart source; when you
+// exported symbol below has a named counterpart in the GDScript source; when you
 // change one, change both.
 //
 // The package is pure: no timers, no I/O, no goroutines. A room actor drives it.
@@ -17,7 +17,7 @@ import (
 	"strings"
 )
 
-// Suit values are ordered exactly as the Dart enum, because the display sort
+// Suit values are ordered exactly as the client's Cards.Suit enum, because the display sort
 // and the JSON wire format both depend on the ordinal.
 type Suit int
 
@@ -62,7 +62,7 @@ func (s Suit) String() string {
 
 func (s Suit) IsTrump() bool { return s == TrumpSuit }
 
-// AllSuits is iteration order for suit-wise scans, matching Dart's Suit.values.
+// AllSuits is iteration order for suit-wise scans, matching the client's Cards.Suit order.
 var AllSuits = [4]Suit{Spades, Hearts, Diamonds, Clubs}
 
 // SuitFromCode parses the letter form. Returns an error rather than panicking,
@@ -130,7 +130,7 @@ type Card struct {
 
 func (c Card) IsTrump() bool { return c.Suit == TrumpSuit }
 
-// ID is the stable wire id, e.g. "AS", "10H". Matches PlayingCard.id in Dart.
+// ID is the stable wire id, e.g. "AS", "10H". Matches card ids in the client's cards.gd.
 func (c Card) ID() string { return RankLabel(c.Rank) + c.Suit.Code() }
 
 func (c Card) String() string { return c.ID() }
@@ -252,7 +252,7 @@ func DealHands(rng *rand.Rand) [4][]Card {
 // the distribution are independent: any shuffle can be paired with any deal
 // style.
 //
-// Unlike the Dart version there is no reproducible seed contract: the server is
+// Unlike the client version there is no reproducible seed contract: the server is
 // the only dealer, so the shuffle only has to be fair. rng is seeded from
 // crypto/rand per room by the caller.
 func DealHandsWith(cfg DealConfig, rng *rand.Rand) [4][]Card {
@@ -468,8 +468,8 @@ func OfSuit(cards []Card, suit Suit) []Card {
 	return out
 }
 
-// Lowest returns the lowest-ranked card. Panics on an empty slice, like Dart's
-// reduce — callers always check first.
+// Lowest returns the lowest-ranked card. Panics on an empty slice, like the client's
+// Cards.lowest — callers always check first.
 func Lowest(cards []Card) Card {
 	best := cards[0]
 	for _, c := range cards[1:] {

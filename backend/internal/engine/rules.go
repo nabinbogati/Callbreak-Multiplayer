@@ -2,7 +2,7 @@ package engine
 
 import "math"
 
-// Game shape constants. Mirrors frontend/lib/engine/rules.dart.
+// Game shape constants. Mirrors godot/scripts/engine/rules.gd.
 const (
 	HandsPerGame  = 5
 	TricksPerHand = 13
@@ -240,7 +240,7 @@ func WouldWin(trick []TrickPlay, card Card) bool {
 // ScoreHand: make your bid and you score it, plus 0.1 per overtrick. Fall short
 // and you lose the bid outright.
 //
-// The rounding must match Dart's `(raw * 10).round() / 10`, whose .round() ties
+// The rounding must match the client's `Rules.round_tenth`, which rounds ties
 // away from zero — which is exactly math.Round's behaviour.
 func ScoreHand(bid, tricksWon int) float64 {
 	var raw float64
@@ -252,7 +252,7 @@ func ScoreHand(bid, tricksWon int) float64 {
 	return Round1(raw)
 }
 
-// Round1 snaps a score to one decimal place the same way the Dart client does.
+// Round1 snaps a score to one decimal place the same way the Godot client does.
 // Applied after every addition so totals never drift into float dust.
 func Round1(v float64) float64 { return math.Round(v*10) / 10 }
 
@@ -267,6 +267,6 @@ func ClampBid(bid int) int {
 	return bid
 }
 
-// roundHalfAway matches Dart's num.round(), which rounds halves away from zero
+// roundHalfAway matches the client's Rules.round_half_away, which rounds halves away from zero
 // (Go's default int conversion truncates, and math.Round is the right primitive).
 func roundHalfAway(v float64) int { return int(math.Round(v)) }

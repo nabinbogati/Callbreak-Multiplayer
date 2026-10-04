@@ -1,5 +1,5 @@
 // Package bot is the heuristic Call Break opponent, ported from
-// frontend/lib/bots/bot.dart.
+// godot/scripts/bots/bot_brain.gd.
 //
 // It has two jobs: guess how many tricks a hand is worth at bidding time, and
 // pick a card during play. Both run off the same idea — count the tricks you
@@ -63,7 +63,7 @@ func (b *Brain) ChooseBid(hand []engine.Card) int {
 	if n != 0 {
 		jitter = (b.rng.Float64()*2 - 1) * n
 	}
-	// math.Round ties away from zero, matching Dart's num.round().
+	// math.Round ties away from zero, matching the client's Rules.round_half_away.
 	return engine.ClampBid(int(math.Round(estimate + jitter)))
 }
 

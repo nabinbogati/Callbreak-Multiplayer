@@ -462,7 +462,7 @@ func containsAll(have, want []string) bool {
 }
 
 // sameKeys asserts an object carries exactly the fields docs/API.md documents —
-// no more, no fewer. Missing one breaks the Flutter decoder; an extra one is a
+// no more, no fewer. Missing one breaks the client decoder; an extra one is a
 // field somebody added without writing it down.
 func sameKeys(t *testing.T, what string, got map[string]any, want []string) {
 	t.Helper()
@@ -1294,7 +1294,7 @@ func TestPanicIsContainedAndReportedAsInternal(t *testing.T) {
 
 // -------------------------------------------------- docs/API.md conformance
 //
-// The field lists below are transcribed from docs/API.md. A Flutter client is
+// The field lists below are transcribed from docs/API.md. The Godot client is
 // decoding exactly these names, so a rename on either side has to fail a test
 // here before it can reach two codebases at once.
 

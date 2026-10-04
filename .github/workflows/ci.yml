@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: 4.5.1
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - run: go vet ./...
+      - run: go test ./...
+
+  client:
+    name: Client (Godot) + end-to-end
+    runs-on: ubuntu-latest
+    # A runner script that fails to compile leaves Godot idling instead of
+    # exiting, so cap the job rather than wait out the default six hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Build and start the game server
+        working-directory: backend
+        run: |
+          go build -o "$RUNNER_TEMP/cbserver" ./cmd/server
+          ADDR=127.0.0.1:18080 "$RUNNER_TEMP/cbserver" > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:18080/healthz >/dev/null && exit 0
+            sleep 1
+          done
+          echo "server did not become healthy"; cat "$RUNNER_TEMP/server.log"; exit 1
+
+      - name: Cache Godot
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}-linux
+
+      - name: Download Godot
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/godot
+          curl -sSfL -o /tmp/godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q /tmp/godot.zip -d ~/godot
+          mv ~/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
+
+      - name: Import assets
+        run: ~/godot/godot --headless --path godot --import
+
+      - name: Run tests
+        env:
+          E2E_SERVER_URL: ws://127.0.0.1:18080/ws
+        run: ~/godot/godot --headless --path godot -s res://tests/test_runner.gd
+
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/server.log" || true

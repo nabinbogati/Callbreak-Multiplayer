@@ -1,7 +1,7 @@
 # REST API v1 — normative wire format
 
 Companion to `docs/PERSISTENCE.md`, which explains *why*. This file is the
-*what*: the exact JSON the Go server emits and the Flutter client decodes. Both
+*what*: the exact JSON the Go server emits and the Godot client decodes. Both
 sides are written against this document, so a field renamed here is a breaking
 change on two codebases at once.
 
@@ -10,7 +10,7 @@ Conventions, matching the existing socket protocol:
 - `lowerCamelCase` keys.
 - Timestamps are RFC 3339 UTC strings (`2026-08-10T09:41:22Z`).
 - Scores are JSON numbers with at most two decimals (`13.20`, `-4`).
-- **Adding a field is safe**; Dart decoders ignore unknown keys. Renaming or
+- **Adding a field is safe**; the client's decoders ignore unknown keys. Renaming or
   removing one is a breaking change.
 - Every response is an object, never a bare array — arrays are always under a
   named key so the envelope can grow.

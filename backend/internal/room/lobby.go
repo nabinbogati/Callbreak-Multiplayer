@@ -189,8 +189,8 @@ func (r *Room) connectedHumans() int {
 // MinHumansToStart is how many connected humans a private table needs before
 // the host may deal. One human against three bots is what the offline game is
 // for; a private table is for people who actually invited each other, so it
-// waits for a real player the same way a LAN table does (Dart
-// LanHostSession.canStart).
+// waits for a real player the same way a LAN table does (Godot
+// LanHostSession.can_start).
 const MinHumansToStart = 2
 
 // applyHands updates the table's match length from the lobby. Any seated
@@ -340,7 +340,7 @@ func (r *Room) applyStart(seat int) {
 }
 
 // beginGame fills the empty seats with bots and deals. This mirrors
-// LanHostSession.startGame in the Flutter client.
+// LanHostSession.start_game in the Godot client.
 func (r *Room) beginGame() {
 	if r.started {
 		return
@@ -398,7 +398,7 @@ func (r *Room) tableDifficulty() engine.Difficulty {
 
 // newGame builds a fresh engine and matching brains from the current seats, and
 // deals. Used by both the initial start and by restart — the engine has no
-// in-place reset, the same as the Dart original.
+// in-place reset, the same as the client original.
 func (r *Room) newGame() {
 	// A restart on a table that never reached GameOver abandons a game that was
 	// really dealt and really played, so it gets its §2.3 row before the state
