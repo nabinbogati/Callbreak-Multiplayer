@@ -11,7 +11,7 @@ import (
 //
 // Every struct here mirrors a block of that document, in the order it appears
 // there, and nothing else in the package writes a response body by hand. The
-// Flutter client decodes exactly these shapes, so a renamed tag is a breaking
+// Godot client decodes exactly these shapes, so a renamed tag is a breaking
 // change on two codebases at once — which is precisely why they are collected
 // here rather than spread across the handlers.
 //

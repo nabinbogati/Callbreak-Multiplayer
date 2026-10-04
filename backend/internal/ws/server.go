@@ -73,7 +73,7 @@ func NewServer(cfg config.Config, hub *room.Hub, matcher *match.Broker, signer *
 	return s
 }
 
-// checkOrigin gates browser clients. The Flutter app sends no Origin header, so
+// checkOrigin gates browser clients. The Godot app sends no Origin header, so
 // native clients always pass; a browser is only allowed when its origin has
 // been configured explicitly.
 func (s *Server) checkOrigin(r *http.Request) bool {

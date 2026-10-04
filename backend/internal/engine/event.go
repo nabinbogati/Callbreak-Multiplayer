@@ -1,7 +1,7 @@
 package engine
 
 // Event is a discrete thing that happened at the table, for the client to
-// animate and announce. The set matches Dart's sealed GameEvent hierarchy;
+// animate and announce. The set matches the client's event names (CallBreakGame.take_events);
 // Wire() produces the `event` frame body the client already decodes.
 type Event interface {
 	// Wire returns the JSON body of the event, without the outer "type" key.

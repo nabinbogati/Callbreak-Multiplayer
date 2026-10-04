@@ -171,9 +171,13 @@ func test_view_redaction_and_round_trip() -> void:
 
 
 func test_decodes_server_golden_view() -> void:
-	# A real frame from backend/testdata, so the client is pinned to what the
-	# Go server actually sends.
-	var f := FileAccess.open("res://tests/fixtures/view_frames.json", FileAccess.READ)
+	# Real frames written by the Go server's golden test, read straight from
+	# backend/testdata so a regenerated file is checked here too. The copy in
+	# tests/fixtures only stands in when the project is opened on its own.
+	var path := ProjectSettings.globalize_path("res://").path_join("../backend/testdata/view_frames.json").simplify_path()
+	if not FileAccess.file_exists(path):
+		path = "res://tests/fixtures/view_frames.json"
+	var f := FileAccess.open(path, FileAccess.READ)
 	expect_true(f != null, "fixture present")
 	if f == null:
 		return

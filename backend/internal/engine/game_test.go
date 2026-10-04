@@ -151,7 +151,7 @@ func TestBiddingOrderStartsLeftOfDealer(t *testing.T) {
 	g := newTestGame(1)
 	g.Start()
 	// Dealer starts at 3 and advances before the first deal, so seat 0 deals and
-	// seat 1 bids first — the same convention as the Dart engine.
+	// seat 1 bids first — the same convention as the client engine.
 	if g.Dealer != 0 {
 		t.Fatalf("first dealer = %d, want 0", g.Dealer)
 	}
@@ -307,7 +307,7 @@ func TestViewJSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestViewJSONShape pins the exact keys the Dart client's GameView.fromJson
+// TestViewJSONShape pins the exact keys the Godot client's GameView.from_dict
 // reads. Renaming or dropping one of these breaks every connected client.
 func TestViewJSONShape(t *testing.T) {
 	g := newTestGame(4)
@@ -328,7 +328,7 @@ func TestViewJSONShape(t *testing.T) {
 	}
 	for _, key := range required {
 		if _, ok := raw[key]; !ok {
-			t.Errorf("view JSON is missing %q, which the Dart client requires", key)
+			t.Errorf("view JSON is missing %q, which the Godot client requires", key)
 		}
 	}
 	// Nullable fields must serialise as null, not be omitted: fromJson reads
@@ -340,7 +340,7 @@ func TestViewJSONShape(t *testing.T) {
 		t.Errorf("bids = %s, want four nulls before bidding", raw["bids"])
 	}
 	if string(raw["phase"]) != `"bidding"` {
-		t.Errorf("phase = %s, want the Dart enum name", raw["phase"])
+		t.Errorf("phase = %s, want the client's phase name (GameView.PLAYING etc.)", raw["phase"])
 	}
 }
 

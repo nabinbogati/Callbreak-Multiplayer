@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// These cases are ported one-for-one from frontend/test/engine_test.dart. If a
-// case here diverges from the Dart suite, the client and server disagree about
+// These cases are ported one-for-one from godot/tests/test_engine.gd. If a
+// case here diverges from the client suite, the client and server disagree about
 // the rules, which is the one bug class this port cannot afford.
 
 func cards(ids ...string) []Card {

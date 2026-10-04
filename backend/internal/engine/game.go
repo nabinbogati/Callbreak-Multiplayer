@@ -4,7 +4,7 @@ import (
 	"math/rand/v2"
 )
 
-// Phase mirrors Dart's GamePhase. The string forms are the wire values.
+// Phase mirrors the client's GameView phases. The string forms are the wire values.
 type Phase string
 
 const (
@@ -43,7 +43,7 @@ func ParseDifficulty(s string) Difficulty {
 	return Normal
 }
 
-// PlayerInfo is the public description of a seat. Mirrors Dart's PlayerInfo,
+// PlayerInfo is the public description of a seat. Mirrors the client's player dictionaries,
 // including the `connected` flag the client renders as a dimmed avatar.
 type PlayerInfo struct {
 	Seat       int        `json:"seat"`
@@ -388,7 +388,7 @@ func (g *Game) ViewFor(seat int) *View {
 }
 
 // View is what one seat is allowed to see. The JSON encoding is byte-compatible
-// with Dart's GameView.fromJson — see json.go.
+// with the client's GameView.from_dict — see json.go.
 type View struct {
 	Phase        Phase
 	HandIndex    int

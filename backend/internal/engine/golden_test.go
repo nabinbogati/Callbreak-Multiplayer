@@ -9,15 +9,16 @@ import (
 	"testing"
 )
 
-// The Dart client decodes these frames with GameView.fromJson, which reads its
-// keys unconditionally and throws on anything it does not recognise the shape
-// of. A Go change that alters the encoding therefore breaks every connected
-// client — and would do it at runtime, on a phone, not here.
+// The Godot client decodes these frames with GameView.from_dict. It tolerates
+// missing keys by falling back to zero values, so a renamed or reshaped field
+// does not crash it — it silently renders the wrong table instead, at runtime,
+// on a phone, not here.
 //
-// So this test writes real server output to testdata/, and a matching Dart test
-// (frontend/test/wire_contract_test.dart) decodes those exact bytes. Run
-// `go test ./internal/engine -update` after any deliberate encoding change, and
-// the Dart test will tell you whether the client can still read it.
+// So this test writes real server output to testdata/, and a matching client
+// test (test_decodes_server_golden_view in godot/tests/test_engine.gd) decodes
+// those exact bytes. Run `UPDATE_GOLDEN=1 go test ./internal/engine` after any
+// deliberate encoding change, and the client test will tell you whether the
+// client can still read it.
 
 var update = os.Getenv("UPDATE_GOLDEN") != ""
 
@@ -89,7 +90,7 @@ func TestGoldenViewFrames(t *testing.T) {
 	views := goldenViews(t)
 
 	// Wrap each view exactly as the server sends it, type key and all, so the
-	// Dart side is decoding a genuine frame rather than a bare view.
+	// client side is decoding a genuine frame rather than a bare view.
 	frames := make(map[string]json.RawMessage, len(views))
 	for name, view := range views {
 		data, err := json.Marshal(view)
@@ -126,8 +127,8 @@ func TestGoldenViewFrames(t *testing.T) {
 		t.Fatalf("the view encoding changed.\n\n"+
 			"If that was deliberate, regenerate with:\n"+
 			"    UPDATE_GOLDEN=1 go test ./internal/engine\n"+
-			"then run the Flutter suite — frontend/test/wire_contract_test.dart "+
-			"decodes these exact bytes and will tell you whether the client can "+
-			"still read them.\n\ngolden file: %s", path)
+			"then run the Godot suite — godot/tests/test_engine.gd "+
+			"(test_decodes_server_golden_view) decodes these exact bytes and will "+
+			"tell you whether the client can still read them.\n\ngolden file: %s", path)
 	}
 }

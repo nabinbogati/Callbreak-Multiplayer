@@ -108,7 +108,7 @@ func NewRedirect(endpoint string) Error {
 
 // EncodeView wraps a redacted view in a `view` frame. The view's own keys are
 // hoisted to the top level, which is the shape RemoteSession._onMessage reads:
-// it passes the whole message straight to GameView.fromJson.
+// it passes the whole message straight to GameView.from_dict.
 func EncodeView(v *engine.View) ([]byte, error) {
 	body, err := json.Marshal(v)
 	if err != nil {

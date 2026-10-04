@@ -6,8 +6,8 @@
 // order. That is what makes turn ordering trivially correct and removes every
 // lock from the hot path.
 //
-// The behaviour mirrors LanHostSession in the Flutter client
-// (frontend/lib/net/lan_host_session.dart), which is the reference host: a
+// The behaviour mirrors LanHostSession in the Godot client
+// (godot/scripts/net/lan_host_session.gd), which is the reference host: a
 // lobby that fills with guests, a host who starts the game, bots on the empty
 // seats, and a publish-then-schedule loop that paces the table. The server adds
 // what an untrusted, unreliable network needs — turn clocks, bot takeover for
@@ -79,7 +79,7 @@ func FlatPlayTimeouts(d time.Duration) [4]time.Duration {
 	return [4]time.Duration{d, d, d, d}
 }
 
-// DefaultPacing matches TablePacing in frontend/lib/net/local_session.dart.
+// DefaultPacing matches the pacing constants in godot/scripts/net/game_session.gd.
 func DefaultPacing() Pacing {
 	return Pacing{
 		BotThinkMin:     550 * time.Millisecond,

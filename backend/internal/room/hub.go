@@ -13,8 +13,8 @@ import (
 	"github.com/nabin31bogati/callbreak/backend/internal/protocol"
 )
 
-// RoomCodeAlphabet matches the one the Flutter join sheet generates from
-// (frontend/lib/ui/screens/settings_sheet.dart): no I, O, 0 or 1, because they
+// RoomCodeAlphabet matches the one the Godot join sheet generates from
+// (godot/scripts/ui/screens/join_sheet.gd): no I, O, 0 or 1, because they
 // are the characters people misread when a code is spoken aloud.
 const RoomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 

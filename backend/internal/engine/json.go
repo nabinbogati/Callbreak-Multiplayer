@@ -5,11 +5,11 @@ import (
 	"fmt"
 )
 
-// The encodings here are a contract with frontend/lib/engine/game.dart. The key
+// The encodings here are a contract with godot/scripts/engine/game_view.gd. The key
 // names, the nullability and the list shapes all have to match what
-// GameView.fromJson expects, or the client throws while decoding a frame.
+// GameView.from_dict expects, or the client throws while decoding a frame.
 //
-// Additive fields are safe: Dart's fromJson only reads the keys it knows.
+// Additive fields are safe: the client's decoder only reads the keys it knows.
 
 // MarshalJSON encodes a card as its wire id, e.g. "AS".
 func (c Card) MarshalJSON() ([]byte, error) { return json.Marshal(c.ID()) }
@@ -28,7 +28,7 @@ func (c *Card) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// viewJSON is the exact shape Dart's GameView.fromJson reads.
+// viewJSON is the exact shape the client's GameView.from_dict reads.
 type viewJSON struct {
 	Phase        Phase           `json:"phase"`
 	HandIndex    int             `json:"handIndex"`
@@ -106,7 +106,7 @@ func (v *View) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON exists so tests can round-trip a view and so snapshots taken
-// from the Dart client can be replayed against the Go engine.
+// from the Godot client can be replayed against the Go engine.
 func (v *View) UnmarshalJSON(data []byte) error {
 	var in viewJSON
 	if err := json.Unmarshal(data, &in); err != nil {

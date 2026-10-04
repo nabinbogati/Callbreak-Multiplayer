@@ -1,5 +1,12 @@
 # Backend → Flutter/Dart Concept Map
 
+> **Note — the app is now a Godot client.** The client in this repository was
+> rewritten in Godot 4.5 and lives in `godot/` (see `godot/README.md`). This
+> material teaches the *original* Flutter client, which is no longer in the
+> working tree. Its code — the answer key the phases below point at — is still in
+> git history: `git worktree add ../callbreak-flutter f5940e7` checks it out with
+> `frontend/` intact. The Go backend sections still match the current code.
+
 A translation dictionary for a backend developer learning Flutter by rebuilding
 the Call Break project. Every concept you already know has a Flutter-shaped twin.
 When you get lost, come back here.

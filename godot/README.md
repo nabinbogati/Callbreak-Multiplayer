@@ -1,6 +1,7 @@
 # Call Break — Godot 4 client
 
-A complete rewrite of the Flutter client in `frontend/` for **Godot 4.5**
+A complete rewrite of the original Flutter client (removed from the tree; still
+in git history at `f5940e7`) for **Godot 4.5**
 (GDScript only, no plugins). Same game, same Go server in `backend/`, same wire
 protocol, same design: solo against bots, online quickplay, private rooms
 with a code, and LAN play where one phone hosts.
@@ -31,7 +32,7 @@ test also fails that test. `TEST_FILTER=lan` runs only the matching tests.
 
 | Suite | Covers |
 |---|---|
-| `test_engine.gd` | Port of `engine_test.dart`: 40 simulated games, scoring, legal moves, bid suggestion, view redaction, and decoding the Go server's own golden `view` frames. |
+| `test_engine.gd` | Port of the Flutter `engine_test.dart`: 40 simulated games, scoring, legal moves, bid suggestion, view redaction, and decoding the Go server's own golden `view` frames (read from `backend/testdata/`, with a copy in `tests/fixtures/` for standalone use). |
 | `test_sessions.gd` | A whole solo game through the real timers. A LAN host and guest playing a full game over a loopback socket. Timeout to autoplay and back. LAN discovery over UDP. Identity and uuid. |
 | `test_server_e2e.gd` | Against the real Go server: create a private room, join, deal, play, drop the connection and reclaim the same seat, and check that server error messages reach the player. Skipped unless `E2E_SERVER_URL` is set. |
 | `test_ui.gd` | Drives every screen of the real app shell. Plays a full game through the table screen, taps and drags cards, opens every sheet, and covers the rejoin prompt and the failure states. |

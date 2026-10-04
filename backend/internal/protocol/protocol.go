@@ -1,10 +1,10 @@
 // Package protocol defines the JSON wire format shared by the game server and
-// the Flutter client.
+// the Godot client.
 //
 // The normative description lives in PROTOCOL.md; this file is the
 // implementation of it. Two rules govern every change here:
 //
-//  1. Adding a field is safe. Dart's fromJson decoders read the keys they know
+//  1. Adding a field is safe. the client's decoders read the keys they know
 //     and ignore the rest, so new server fields reach old clients harmlessly.
 //  2. Renaming or removing a field is a breaking change and needs a version
 //     bump, because the client will throw while decoding the frame.
@@ -63,7 +63,7 @@ const (
 
 // QuickplayRoom is the sentinel the client sends as a room code when it wants
 // matchmaking. The join sheet uppercases whatever the user typed, so the value
-// arrives in this form (see frontend/lib/ui/screens/settings_sheet.dart).
+// arrives in this form (see godot/scripts/ui/screens/join_sheet.gd).
 const QuickplayRoom = "QUICKPLAY"
 
 // Error codes. Clients switch on these; the message is for humans only.
