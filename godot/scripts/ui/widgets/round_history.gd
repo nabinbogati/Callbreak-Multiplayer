@@ -14,7 +14,7 @@ static func table(view: GameView) -> Control:
 		return UI.margin(UI.paragraph("No rounds completed yet — check back after round 1.", 13, Tokens.TEXT_FAINT,
 				"medium", HORIZONTAL_ALIGNMENT_CENTER), Vector4(0, 28, 0, 28))
 
-	var col := UI.vbox(0)
+	var col := UI.vbox(0, [UI.gap(10)])
 	var header := ["Rnd"]
 	for seat in 4:
 		header.append(view.player(seat).get("name", ""))
@@ -37,8 +37,13 @@ static func table(view: GameView) -> Control:
 	if live:
 		body.add_child(UI.gap(8))
 		body.add_child(_live_row(view))
+	# The rows take only the height they need, so the totals follow straight
+	# after them; a caller short of room caps the scroller and they scroll.
 	var scroller := UI.scroll(body)
-	scroller.custom_minimum_size.y = 40
+	scroller.size_flags_vertical = Control.SIZE_FILL
+	var natural := func(): scroller.custom_minimum_size.y = body.get_combined_minimum_size().y
+	body.minimum_size_changed.connect(natural)
+	natural.call()
 	col.add_child(scroller)
 
 	col.add_child(UI.gap(8))
@@ -68,7 +73,7 @@ static func _dot() -> Control:
 	var d := Control.new()
 	d.custom_minimum_size = Vector2(6, 6)
 	d.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	d.draw.connect(func(): d.draw_circle(Vector2(3, 3), 3, Tokens.GOLD, true, -1.0, true))
+	d.draw.connect(func(): Draw.disc(d, Vector2(3, 3), 3, Tokens.GOLD))
 	return d
 
 
@@ -117,27 +122,48 @@ static func _with_you_column(content: Control, you: int) -> Control:
 	return holder
 
 
-## The in-game overlay: a dismissable scrim over a scorecard card. It never
-## blocks the game — tap the scrim or ✕ and play continues.
+## The in-game overlay: a dismissable scrim over a scorecard card that is as
+## tall as its rows need (up to 520). It never blocks the game — tap the scrim
+## or the close button and play continues.
 static func overlay(view: GameView, on_close: Callable) -> Control:
 	var scrim := ColorRect.new()
-	scrim.color = Tokens.SCRIM
+	scrim.color = Tokens.MODAL_SCRIM
 	scrim.set_anchors_preset(Control.PRESET_FULL_RECT)
 	scrim.gui_input.connect(func(e):
 		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			on_close.call())
-	var close := UI.pressable(UI.margin(UI.label("✕", 15, Tokens.TEXT_MUTED, "semibold"), UI.pad_all(4)), on_close, 0.9)
+	var x := Control.new()
+	x.custom_minimum_size = Vector2(30, 30)
+	x.draw.connect(func():
+		Draw.disc(x, Vector2(15, 15), 15, Color("#FFFFFF14"))
+		Draw.circle_border(x, Vector2(15, 15), 15, Tokens.HAIRLINE_STRONG, 1)
+		Draw.icon(x, "close", Rect2(7, 7, 16, 16), Tokens.TEXT_MUTED))
+	var close := UI.pressable(x, on_close, 0.9)
+	close.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var chart := UI.icon("leaderboard_rounded", 18, Tokens.GOLD)
+	chart.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	var title := UI.label("Round history", 17, Tokens.TEXT_PRIMARY, "bold")
-	var head := UI.hbox(0, [UI.expand(title), close])
-	var col := UI.vbox(4, [head, UI.expand_v(table(view))])
-	var card := UI.panel(UI.with_shadow(UI.flat(Tokens.DIALOG, 18, Color(Tokens.GOLD_BORDER, 0.35), 1,
-			Vector4(20, 18, 20, 18)), Color(0, 0, 0, 0.6), 30, Vector2(0, 12)), col)
+	title.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var head := UI.hbox(0, [chart, UI.gap(0, 8), UI.expand(title), close])
+	var tbl := table(view)
+	var col := UI.vbox(4, [head, UI.expand_v(tbl)])
+	var card := UI.glass_panel(col, Vector4(20, 18, 20, 18))
 	card.mouse_filter = Control.MOUSE_FILTER_STOP
-	var frame := UI.margin(card, UI.pad_all(20))
-	scrim.add_child(frame)
-	scrim.resized.connect(func():
-		var w := minf(420.0, scrim.size.x)
-		var h := minf(520.0, scrim.size.y)
-		frame.size = Vector2(w, h)
-		frame.position = (scrim.size - frame.size) / 2.0)
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	center.add_child(UI.margin(card, UI.pad_all(20)))
+	scrim.add_child(center)
+	var scrollers := tbl.find_children("*", "ScrollContainer", true, false)
+	var fit := func():
+		card.custom_minimum_size.x = minf(420.0, scrim.size.x) - 40.0
+		if scrollers.is_empty():
+			return
+		var sc: ScrollContainer = scrollers[0]
+		var natural: float = sc.get_child(0).get_combined_minimum_size().y if sc.get_child_count() > 0 else 0.0
+		sc.custom_minimum_size.y = 0
+		var chrome := card.get_combined_minimum_size().y
+		sc.custom_minimum_size.y = clampf(natural, 0.0, maxf(minf(520.0, scrim.size.y) - 40.0 - chrome, 40.0))
+	scrim.resized.connect(fit)
+	UI.pop_in(card)
 	return scrim

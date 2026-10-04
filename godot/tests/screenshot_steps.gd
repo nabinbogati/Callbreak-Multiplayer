@@ -34,6 +34,8 @@ func _run() -> void:
 	settings.player_name = "Nabin"
 	var app: App = load("res://scenes/main.tscn").instantiate()
 	get_tree().root.add_child(app)
+	# Let the hero fan finish spreading.
+	await _wait(1.5)
 	await _shot("01_home")
 
 	app.sheet(JoinSheet.new("private"))
@@ -48,8 +50,12 @@ func _run() -> void:
 	await _wait(3.5)
 	await _shot("04_bidding")
 	var v := session.view
-	if v.phase == GameView.BIDDING and v.is_my_turn():
-		session.place_bid(Rules.suggest_bid(v.hand))
+	while not (v.phase == GameView.BIDDING and v.is_my_turn() and not v.i_have_bid()):
+		await get_tree().process_frame
+		v = session.view
+	await _wait(0.6)
+	await _shot("04b_bid_panel")
+	session.place_bid(Rules.suggest_bid(v.hand))
 	# Let the bots bid, then play until a trick is on the felt.
 	var guard := 0
 	while guard < 400:
@@ -63,14 +69,19 @@ func _run() -> void:
 	await _wait(0.8)
 	await _shot("05_playing")
 	table._toggle_history()
+	await _wait(0.5)
 	await _shot("06_history")
 	table._toggle_history()
 
 	app.pop_to_root()
 	await _wait(0.3)
 
-	app.push(SettingsScreen.new())
+	var settings_screen := SettingsScreen.new()
+	app.push(settings_screen)
 	await _shot("09_settings")
+	settings_screen._select_tab("gameplay")
+	await _wait(0.4)
+	await _shot("09b_settings_gameplay")
 	app.pop()
 
 	var host := LanHostSession.new("Nabin", "K7QM", "normal", 3, 1.0)
@@ -81,6 +92,7 @@ func _run() -> void:
 
 	var finished := LocalSession.new("Nabin", "hard", 3, 0.01, 5)
 	var t2 := TableScreen.new(finished)
+	var scored := [false]
 	finished.changed.connect(func():
 		var fv := finished.view
 		if fv == null:
@@ -89,11 +101,17 @@ func _run() -> void:
 			finished.place_bid.call_deferred(Rules.suggest_bid(fv.hand))
 		elif fv.phase == GameView.PLAYING and fv.is_my_turn() and not fv.legal_move_ids.is_empty():
 			finished.play.call_deferred(fv.legal_move_ids[0])
-		elif fv.phase == GameView.HAND_OVER:
+		elif fv.phase == GameView.HAND_OVER and scored[0]:
 			finished.continue_to_next_hand.call_deferred())
 	app.push(t2)
+	while finished.view == null or finished.view.phase != GameView.HAND_OVER or t2._dealing:
+		await get_tree().process_frame
+	await _wait(0.8)
+	await _shot("07_scoreboard")
+	scored[0] = true
+	finished.continue_to_next_hand()
 	while finished.view == null or finished.view.phase != GameView.GAME_OVER:
 		await get_tree().process_frame
-	await _wait(1.0)
+	await _wait(2.5)
 	await _shot("11_winner")
 	get_tree().quit()

@@ -149,10 +149,12 @@ func _card_preview() -> Control:
 func _gameplay_pane() -> void:
 	_row("Bot difficulty", [["Easy", "easy"], ["Normal", "normal"], ["Hard", "hard"]], "difficulty")
 	_row("Drag to play", [["On", true], ["Off", false]], "drag_to_play")
+	_row("Tap twice to play", [["On", true], ["Off", false]], "tap_twice_to_play")
 	_row("Auto throw last card", [["On", true], ["Off", false]], "auto_throw_last_card")
 	_row("Auto throw last suit card", [["On", true], ["Off", false]], "auto_throw_last_suit_card")
 	_row("Background music", [["On", true], ["Off", false]], "music_enabled")
 	_row("Sound effects", [["On", true], ["Off", false]], "sfx_enabled")
+	_row("Vibration", [["On", true], ["Off", false]], "haptics_enabled")
 	_row("Animation speed", [["Slow", "slow"], ["Normal", "normal"], ["Fast", "fast"]], "animation_speed")
 
 

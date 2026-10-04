@@ -47,7 +47,8 @@ func _init(lobby: Dictionary, countdown: int) -> void:
 	if countdown > 0:
 		col.add_child(UI.label("Starting in %d…" % countdown, 15, Tokens.GOLD, "bold", HORIZONTAL_ALIGNMENT_CENTER))
 	elif lobby.get("canStart", false) and is_host:
-		var start := UI.button("Start game", true, func(): start_pressed.emit(), 13, UI.pad_hv(28, 12))
+		var start := UI.gold_button("Start game", func(): start_pressed.emit(), "play_arrow_rounded")
+		start.custom_minimum_size.x = 180
 		start.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 		col.add_child(start)
 	else:
@@ -55,8 +56,8 @@ func _init(lobby: Dictionary, countdown: int) -> void:
 				("Waiting for at least one more player — you need 2 to start." if is_host else "Waiting for the host to start…")
 		col.add_child(UI.paragraph(hint, 12, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_CENTER))
 	col.add_child(UI.gap(14))
-	var leave := UI.pressable(UI.panel(UI.flat(Color.TRANSPARENT, 12, Color(Tokens.TEXT_MUTED, 0.4), 1, UI.pad_hv(28, 12)),
-			UI.label("Leave", 13, Tokens.TEXT_MUTED, "bold", HORIZONTAL_ALIGNMENT_CENTER)), func(): leave_pressed.emit())
+	var leave := UI.ghost_button("Leave", func(): leave_pressed.emit(), "", true)
+	leave.custom_minimum_size.x = 180
 	leave.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	col.add_child(leave)
 

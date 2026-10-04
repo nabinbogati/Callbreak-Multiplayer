@@ -98,7 +98,7 @@ func _build() -> void:
 		"private": label = "Create room" if _creating else "Join room"
 		"bots": label = "Start game"
 		"online": label = "Find match"
-	_body.add_child(UI.button(label, true, _submit, UI.sc(15, 13), UI.pad_hv(0, UI.sc(15, 11))))
+	_body.add_child(UI.gold_button(label, _submit))
 
 
 func _field_label(text: String) -> Label:

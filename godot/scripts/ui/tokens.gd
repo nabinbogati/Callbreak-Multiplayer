@@ -32,6 +32,35 @@ const HAIRLINE := Color(0.949, 0.969, 0.957, 0.12)
 const HAIRLINE_STRONG := Color(0.949, 0.969, 0.957, 0.2)
 const SCRIM := Color(0, 0, 0, 0.6)
 
+# Raised glass surfaces: dialogs, sheets, the bid panel, the scoreboard. Two
+# stops so a panel catches a little light along its top edge instead of
+# reading as a flat cut-out.
+const SURFACE_TOP := Color("#102A20F2")
+const SURFACE_BOTTOM := Color("#061510F5")
+## The gradient every raised panel is painted with, top to bottom.
+const SURFACE := [SURFACE_TOP, SURFACE_BOTTOM]
+## Dims the table behind a modal decision.
+const MODAL_SCRIM := Color("#000000A6")
+## The "it's on you" accent: turn rings, the hand's under-glow.
+const TURN_GLOW := Color("#FFD66B")
+## The gold fill of every primary action, top to bottom, at [constant GOLD_BUTTON_STOPS].
+const GOLD_BUTTON := [Color("#FFE7A3"), GOLD_MID, GOLD_DEEP]
+const GOLD_BUTTON_STOPS := [0.0, 0.48, 1.0]
+## The gold the wordmark (and every gold number) is painted with.
+const GOLD_TEXT := [GOLD_LIGHT, GOLD_MID, GOLD_DEEP]
+
+# Elevation presets, so panels, cards and buttons cast consistent shadows
+# instead of each widget inventing its own blur. Each is [colour, blur, offset].
+## Chips and small plates resting on the felt.
+const SHADOW_LOW := [[Color("#00000066"), 10.0, Vector2(0, 3)]]
+## Floating panels and dialogs.
+const SHADOW_HIGH := [[Color("#00000099"), 32.0, Vector2(0, 14)], [Color("#00000040"), 6.0, Vector2(0, 2)]]
+
+
+## A coloured halo — selection, the active turn, the primary action.
+static func glow(color: Color, strength := 1.0, blur := 18.0) -> Array:
+	return [[Color(color, 0.45 * strength), blur, Vector2.ZERO, 0.5 * strength]]
+
 const THEMES := ["emerald", "sapphire", "amethyst", "crimson"]
 
 ## The four colourways the design ships. Emerald is the default.
@@ -96,11 +125,17 @@ const CARD_FACES := {
 
 # ------------------------------------------------------------------ fonts
 
+## Where the baseline sits in a one-em-tall line (Flutter's `height: 1.0`),
+## as a fraction of the font size: ascent / (ascent + descent) from each
+## face's own metrics.
+const SANS_BASELINE := 1.038 / 1.26
+const DISPLAY_BASELINE := 0.976 / 1.348
+
 static var _fonts := {}
 
 
 ## `weight` is one of "medium", "semibold", "bold", "display" (Cinzel, the
-## wordmark face).
+## wordmark face) or "icons" (the Material icon glyphs [Draw.icon] uses).
 static func font(weight := "medium") -> Font:
 	if _fonts.has(weight):
 		return _fonts[weight]
@@ -109,6 +144,7 @@ static func font(weight := "medium") -> Font:
 		"semibold": "res://assets/fonts/PlusJakartaSans-SemiBold.ttf",
 		"bold": "res://assets/fonts/PlusJakartaSans-Bold.ttf",
 		"display": "res://assets/fonts/Cinzel-Bold.ttf",
+		"icons": "res://assets/fonts/MaterialIcons-Subset.otf",
 	}.get(weight, "res://assets/fonts/PlusJakartaSans-Medium.ttf")
 	var f: Font = load(path)
 	if f == null:

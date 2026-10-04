@@ -9,7 +9,10 @@ extends Control
 ## Layout is computed by hand (see [method _layout]) rather than with
 ## containers, because the animations need exact positions: a thrown card
 ## starts where the finger let go, dealt cards land on the slot the real card
-## will occupy, and a won trick sweeps toward the winner's avatar.
+## will occupy, and a won trick sweeps toward the winner's seat.
+
+## How long a line of help above the hand stays up.
+const HINT_TIME := 2.2
 
 var session: GameSession
 
@@ -18,10 +21,13 @@ var _backdrop := Backdrop.new("table")
 var _body := Control.new()
 var _hud: Control
 var _round_label: Label
+var _progress_label: Label
+var _round_pill: Control
 var _felt_area := Control.new()
 var _felt := FeltSurface.new()
 var _seats := {}
 var _hand := HandFan.new()
+var _hint := HintLine.new()
 var _trick := TrickCluster.new()
 var _fx := Control.new()
 var _overlay := Control.new()
@@ -33,20 +39,22 @@ var _offline_pill: Control
 
 var _deal: DealOverlay
 var _dealing := false
-var _hand_revealed := 13
 var _deal_counts: Array = []
 var _last_dealt_hand := -1
 ## Opened to reclaim a seat in a game already under way: the first deal seen
 ## (if already in progress) is not replayed.
 var _rejoined := false
 
+## Where plays of the viewer's own seat that arrive with no gesture (autoplay)
+## start from: card id → `{"pos", "scale", "angle"}`.
 var _throw_origins := {}
 var _auto_play_key := ""
-var _auto_play_timer: SceneTreeTimer
 var _last_wake_ms := -10000
 var _show_history := false
 var _overlay_state := ""
 var _bid_panel: BidPanel
+var _hint_serial := 0
+var _built_portrait := -1
 
 
 func _init(session_in: GameSession) -> void:
@@ -58,24 +66,28 @@ func _init(session_in: GameSession) -> void:
 
 func _ready() -> void:
 	add_child(_backdrop)
-	_backdrop.glow_alignment_portrait = Vector2(0, -0.6)
-	_backdrop.glow_alignment_landscape = Vector2(0, -0.6)
-	_backdrop.glow_scale = 1.4
+	_backdrop.glow_alignment_portrait = Vector2(0, -0.2)
+	_backdrop.glow_alignment_landscape = Vector2(0, -0.2)
+	_backdrop.glow_scale = 1.5
 	_body.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_body)
 
 	_felt_area.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_felt_area.add_child(_felt)
 	_body.add_child(_felt_area)
-	for slot in [SeatView.Slot.LEFT, SeatView.Slot.TOP, SeatView.Slot.RIGHT, SeatView.Slot.BOTTOM]:
+	for slot in [SeatView.Slot.LEFT, SeatView.Slot.TOP, SeatView.Slot.RIGHT]:
 		var seat := SeatView.new(slot)
 		seat.visible = false
 		_seats[slot] = seat
 		_body.add_child(seat)
 	_hand.card_thrown.connect(_on_card_thrown)
+	_hand.illegal.connect(_on_illegal)
+	_hand.not_your_turn.connect(func(): _show_hint(HintLine.waiting()))
 	_body.add_child(_hand)
-	_body.move_child(_seats[SeatView.Slot.BOTTOM], -1)
+	_make_plate()
+	_body.add_child(_hint)
 	_trick.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_trick.throw_refused.connect(func(_card): _refresh())
 	_body.add_child(_trick)
 	_fx.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_fx.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -97,6 +109,19 @@ func _ready() -> void:
 	add_child(session)
 	_on_layout_changed()
 	_on_session_changed()
+
+
+## The player's own plate: across in portrait, between the table and the
+## hand; stacked in landscape, standing at the left edge level with the hand.
+func _make_plate() -> void:
+	_built_portrait = int(UI.portrait)
+	if _seats.has(SeatView.Slot.BOTTOM):
+		_seats[SeatView.Slot.BOTTOM].queue_free()
+	var plate := SeatView.new(SeatView.Slot.BOTTOM, 0 if UI.portrait else 1)
+	plate.visible = false
+	_seats[SeatView.Slot.BOTTOM] = plate
+	_body.add_child(plate)
+	_body.move_child(plate, _hand.get_index() + 1)
 
 
 func _exit_tree() -> void:
@@ -131,7 +156,8 @@ func handle_back() -> void:
 	if not session.is_ready() and not session.is_resuming():
 		_leave()
 		return
-	var quit := await App.instance.confirm("Quit game?", "Your progress in this round will be lost.", "Cancel", "Quit")
+	var quit := await App.instance.confirm("Quit game?", "Your progress in this round will be lost.", "Cancel", "Quit",
+			"logout_rounded")
 	if quit:
 		_leave()
 
@@ -156,14 +182,22 @@ func _on_layout_changed() -> void:
 	_body.offset_top = UI.safe.y
 	_body.offset_right = -UI.safe.z - UI.sc(0, 8)
 	_body.offset_bottom = -UI.safe.w
-	_banners.position = Vector2(0, UI.safe.y + 8)
+	# Announcements ride above the table rather than inside it, so they never
+	# disturb the felt's measured geometry.
+	_banners.position = Vector2(0, UI.safe.y + 52)
 	_banners.size.x = size.x
+	if int(UI.portrait) != _built_portrait:
+		_make_plate()
+		_hud.queue_free()
+		_hud = _build_hud()
+		_body.add_child(_hud)
+		_refresh()
 	_layout.call_deferred()
 	_rebuild_overlay(true)
 
 
 func _hand_card_width() -> float:
-	return UI.sc(54, 61)
+	return UI.sc(58, 62)
 
 
 ## Positions the felt, seats, hand and trick for the current size.
@@ -171,30 +205,57 @@ func _layout() -> void:
 	var area := _body.size
 	if area.x <= 0 or area.y <= 0:
 		return
-	var pad := Vector4(UI.sc(14, 7), UI.sc(8, 4), UI.sc(14, 7), UI.sc(10, 4))
-	_hud.position = Vector2(pad.x, pad.y) if UI.portrait else Vector2(14, 12)
-	_hud.size = Vector2(area.x - (pad.x + pad.z if UI.portrait else 28), 36)
-	var top := pad.y + (36.0 + UI.sc(8, 4) if UI.portrait else 34.0)
+	var pad := Vector4(UI.sc(12, 7), UI.sc(8, 4), UI.sc(12, 7), UI.sc(14, 4))
+	_hud.reset_size()
+	var hud_h := _hud.get_combined_minimum_size().y
+	var top := pad.y
+	if UI.portrait:
+		_hud.position = Vector2(pad.x, pad.y)
+		_hud.size = Vector2(area.x - pad.x - pad.z, hud_h)
+		top += hud_h + UI.sc(6, 4)
+	else:
+		# In landscape the HUD floats over the felt so the table can run to the
+		# top edge.
+		_hud.position = Vector2(14, 10)
+		_hud.size = Vector2(area.x - 28, hud_h)
+		top += 34
 
+	var width := area.x - pad.x - pad.z
 	_hand.card_width = _hand_card_width()
-	var fan_h := HandFan.LIFT + _hand.card_height()
-	var hand_area_h := fan_h + 30.0
+	var fan_h := _hand.fan_height()
+	var plate: SeatView = _seats[SeatView.Slot.BOTTOM]
+	plate.reset_size()
+	var ps := plate.get_combined_minimum_size()
+	var hand_area_h := ps.y + 2.0 + fan_h if UI.portrait else fan_h
 	var hand_top := area.y - pad.w - hand_area_h
-	_hand.position = Vector2(pad.x, hand_top)
-	_hand.size = Vector2(area.x - pad.x - pad.z, fan_h)
+	if UI.portrait:
+		# The player's own plate sits between the table and the hand, never on
+		# top of the cards.
+		plate.position = Vector2((area.x - ps.x) / 2.0, hand_top)
+		_hand.position = Vector2(pad.x, hand_top + ps.y + 2.0)
+		_hand.size = Vector2(width, fan_h)
+		_hint.anchor_center = Vector2(area.x / 2.0, hand_top - 40)
+	else:
+		const SIDE := 104.0
+		plate.position = Vector2(pad.x, area.y - pad.w - 2.0 - ps.y)
+		_hand.position = Vector2(pad.x + SIDE, hand_top)
+		_hand.size = Vector2(width - SIDE * 2.0, fan_h)
+		_hint.anchor_center = Vector2(area.x / 2.0, hand_top - 30)
+	plate.size = ps
+	_hint.reposition()
 
-	var felt_top := top
-	var felt_bottom := hand_top - UI.sc(10, 0)
-	var box := Vector2(area.x - pad.x - pad.z, maxf(felt_bottom - felt_top, 40))
-	_felt_area.position = Vector2(pad.x, felt_top)
+	var box := Vector2(width, maxf(hand_top - UI.sc(4, 0) - top, 40))
+	_felt_area.position = Vector2(pad.x, top)
 	_felt_area.size = box
 	var geo := _felt_geometry(box)
 	_felt.position = Vector2((box.x - geo.x) / 2.0, geo.z)
 	_felt.size = Vector2(geo.x, geo.y)
 
+	# Side seats are measured in from the box edge so they track the table's
+	# rim; the top seat straddles it.
 	var felt_inset := maxf(0.0, (box.x - geo.x) / 2.0)
-	var seat_inset := clampf(felt_inset - UI.sc(14, 10), 0.0, felt_inset)
-	for slot in _seats:
+	var seat_inset := clampf(felt_inset - UI.sc(16, 12), 0.0, felt_inset)
+	for slot in [SeatView.Slot.LEFT, SeatView.Slot.TOP, SeatView.Slot.RIGHT]:
 		var seat: SeatView = _seats[slot]
 		seat.reset_size()
 		var s := seat.get_combined_minimum_size()
@@ -205,8 +266,6 @@ func _layout() -> void:
 				seat.position = _felt_area.position + Vector2(seat_inset, (box.y - s.y) / 2.0)
 			SeatView.Slot.RIGHT:
 				seat.position = _felt_area.position + Vector2(box.x - seat_inset - s.x, (box.y - s.y) / 2.0)
-			SeatView.Slot.BOTTOM:
-				seat.position = Vector2((area.x - s.x) / 2.0, area.y - pad.w - s.y)
 		seat.size = s
 	_sync_trick()
 	if _deal != null:
@@ -218,27 +277,33 @@ func _layout() -> void:
 func _aim_deal() -> void:
 	_deal.start = _felt_center()
 	_deal.seat_targets = _anchors()
+	_deal.hand_width = _hand_card_width()
+	_deal.fan_width = UI.sc(24, 20)
 	var targets: Array = []
-	for g in _hand.slot_centers_global():
-		targets.append(_to_body(g))
+	var centers := _hand.slot_centers_global()
+	for i in centers.size():
+		targets.append([_to_body(centers[i]), _hand.slot_angle(_hand._laid[i])])
 	_deal.hand_targets = targets
 
 
-## Felt size and top within the felt box: (width, height, top). Portrait is a
-## tall rounded oval; landscape is wide and runs under the hand.
+## The table's size and its top edge within the felt box: (width, height,
+## top). Portrait stands the oval on end (long axis from the top seat down to
+## the player's own); landscape lays it on its side and runs it past the bottom
+## of its box, so its rim tucks behind the hand.
 func _felt_geometry(box: Vector2) -> Vector3:
-	const ASPECT := 1.66
+	const ASPECT := 1.62
 	if UI.portrait:
-		var h := minf(box.y * 0.79, box.x * 0.94 * ASPECT)
+		var h := minf(box.y * 0.86, box.x * 0.86 * ASPECT)
 		return Vector3(h / ASPECT, h, (box.y - h) / 2.0)
-	var top_inset := 0.03
-	var bottom_inset := top_inset * (1.0 - 0.33)
-	return Vector3(box.x * 0.575, box.y * (1.0 + 0.14 - top_inset - bottom_inset), box.y * top_inset)
+	const TOP_INSET := 0.04
+	const OVERHANG := 0.12
+	return Vector3(box.x * 0.6, box.y * (1.0 + OVERHANG - TOP_INSET - TOP_INSET * (1.0 - 0.33)), box.y * TOP_INSET)
 
 
+## The width cards on the felt are drawn at.
 func _trick_card_width() -> float:
 	var box := _felt_area.size
-	return minf(44.0, minf(box.x * 0.16, box.y * 0.3))
+	return clampf(58.0, 0.0, minf(box.x * 0.19, box.y * 0.27))
 
 
 ## The felt's visual centre in body coordinates — the trick's resting centre.
@@ -246,33 +311,65 @@ func _felt_center() -> Vector2:
 	return _felt_area.position + _felt.position + _felt.size / 2.0
 
 
-## Where each seat's avatar is, in body coordinates.
+## Where each seat sits (the centre of its whole plate), in body coordinates.
 func _anchors() -> Dictionary:
 	var out := {}
 	for slot in _seats:
 		var seat: SeatView = _seats[slot]
 		if seat.visible:
-			out[slot] = seat.position + seat.avatar.position + seat.avatar.size / 2.0
+			out[slot] = seat.position + seat.size / 2.0
 	return out
 
 
 func _to_body(global: Vector2) -> Vector2:
-	return global - _body.get_global_rect().position
+	return _body.get_global_transform().affine_inverse() * global
 
 
 # --------------------------------------------------------------------- HUD
 
 func _build_hud() -> Control:
-	var pill_pad := UI.pad_all(UI.sc(8, 9))
-	var back := UI.glass_pill(UI.icon("back", UI.sc(16, 19), Tokens.TEXT_ON_DARK), handle_back, UI.sc(16, 15), pill_pad)
-	var tune := UI.glass_pill(UI.icon("tune", UI.sc(16, 19), Tokens.TEXT_ON_DARK), _open_quick_settings,
-			UI.sc(16, 15), pill_pad)
-	_round_label = UI.label("Round 1 / 5", UI.sc(12, 13), Tokens.GOLD, "semibold")
-	var round_pill := UI.glass_pill(_round_label, _toggle_history, UI.sc(16, 15),
-			UI.pad_hv(UI.sc(14, 16), UI.sc(8, 9)), Color(Tokens.GOLD_BORDER, 0.35))
-	var row := UI.hbox(8, [back, tune, UI.spacer(), round_pill])
+	var back := _hud_button("back", handle_back)
+	var tune := _hud_button("tune", _open_quick_settings)
+	# Spades are always trump — said once, quietly, where it can be checked at
+	# a glance.
+	var trump := UI.glass_pill(UI.hbox(5, [UI.suit_glyph(Cards.Suit.SPADES, 14, Tokens.GOLD),
+			UI.label("Trump", 11, Tokens.GOLD, "semibold")]), Callable(), 14, Vector4(10, 7, 10, 7),
+			Color(Tokens.GOLD_BORDER, 0.3))
+	trump.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	trump.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_round_label = UI.label("Round 1 / 5", 12, Tokens.GOLD, "bold", HORIZONTAL_ALIGNMENT_RIGHT)
+	_progress_label = UI.label("", 10, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_RIGHT)
+	var lines := UI.vbox(0, [_round_label, _progress_label])
+	lines.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var chart := UI.icon("leaderboard_rounded", 15, Color(Tokens.GOLD, 0.8))
+	chart.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_round_pill = UI.glass_pill(UI.hbox(4, [lines, chart]), _toggle_history, 14, Vector4(UI.sc(12, 14), 5, UI.sc(12, 14), 5),
+			Color(Tokens.GOLD_BORDER, 0.45))
+	_round_pill.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var row := UI.hbox(8, [back, tune, UI.spacer(), trump, _round_pill])
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	return row
+
+
+func _hud_button(icon: String, on_press: Callable) -> Control:
+	var b := UI.glass_pill(UI.icon(icon, 18, Tokens.TEXT_ON_DARK), on_press, 14, UI.pad_all(9))
+	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	return b
+
+
+## "Bidding" or "Trick n of 13" under the round, padded so the pill keeps its
+## height when there is no second line.
+func _update_hud(v: GameView) -> void:
+	_round_label.text = "Round %d / %d" % [v.hand_number(), v.hands_per_game]
+	var progress := ""
+	match v.phase:
+		GameView.BIDDING: progress = "Bidding"
+		GameView.PLAYING: progress = "Trick %d of 13" % mini(v.trick_number + 1, 13)
+	_progress_label.text = progress
+	_progress_label.visible = not progress.is_empty()
+	var box := (_round_pill.get_child(0) as PanelContainer).get_theme_stylebox("panel")
+	box.content_margin_top = 9 if progress.is_empty() else 5
+	box.content_margin_bottom = box.content_margin_top
 
 
 func _toggle_history() -> void:
@@ -303,7 +400,11 @@ func _refresh() -> void:
 	var show_table := session.is_ready() or (session.is_resuming() and v != null)
 	_body.visible = show_table
 	if show_table and v != null:
-		_round_label.text = "Round %d / %d" % [v.hand_number(), v.hands_per_game]
+		_update_hud(v)
+		# Nothing about the bidding shows until this screen's deal is down: a
+		# table whose clock this app does not run (or a deal slowed by the
+		# animation-speed setting) can bid while cards are still in the air
+		# here. Bids made meanwhile pop up the moment the deal ends.
 		var deadline := 0 if _dealing else session.turn_deadline_ms
 		for seat_index in 4:
 			var slot := SeatView.slot_for(seat_index, v.you)
@@ -313,11 +414,20 @@ func _refresh() -> void:
 				continue
 			var count: int = _deal_counts[seat_index] if _dealing and seat_index < _deal_counts.size() \
 					else v.hand_counts[seat_index]
-			seat.update(v.player(seat_index), v.bids[seat_index], v.tricks_won[seat_index], v.turn == seat_index,
-					v.dealer == seat_index, v.host_seat == seat_index,
+			seat.update(v.player(seat_index), -1 if _dealing else v.bids[seat_index], v.tricks_won[seat_index],
+					not _dealing and v.turn == seat_index, v.dealer == seat_index, v.host_seat == seat_index,
 					deadline if v.turn == seat_index and v.is_my_turn() else 0, count)
-		var shown := _hand_revealed if _dealing else v.hand.size()
-		_hand.set_hand(v.hand, v.legal_move_ids, not _dealing and v.phase == GameView.PLAYING and v.is_my_turn(), shown)
+		var interactive := not _dealing and v.phase == GameView.PLAYING and v.is_my_turn()
+		var shown: int = (_deal_counts[v.you] if v.you >= 0 and v.you < _deal_counts.size() else 0) if _dealing \
+				else v.hand.size()
+		_hand.gestures_enabled = not _dealing
+		_hand.set_hand(v.hand, v.legal_move_ids, interactive, shown, _trick.pending_ids())
+		_hint.your_turn = interactive
+		var waiting := not _dealing and v.turn >= 0 and not v.awaiting_trick_clear \
+				and (v.phase == GameView.BIDDING or v.phase == GameView.PLAYING)
+		_felt.spotlight = SeatView.slot_for(v.turn, v.you) if waiting else -1
+		_felt.lead_suit = Cards.suit(v.trick[0]["card"]) if not v.awaiting_trick_clear and not v.trick.is_empty() \
+				else -1
 		_layout()
 	_refresh_banners()
 	_rebuild_overlay(false)
@@ -331,7 +441,7 @@ func _sync_trick() -> void:
 	_trick.sync(v.visible_trick(), v.you, winner, _anchors(), _throw_origins, _felt_center(), _trick_card_width())
 
 
-## Turns discrete happenings into sounds and notices.
+## Turns discrete happenings into sounds, touch feedback and notices.
 func _on_game_event(event: Dictionary) -> void:
 	match event.get("event"):
 		"play":
@@ -340,6 +450,8 @@ func _on_game_event(event: Dictionary) -> void:
 				Audio.play_trump()
 		"trickWon":
 			Audio.play_collect()
+			if session.view != null and int(event.get("seat", -1)) == session.view.you:
+				Haptics.thud()
 		"seatChanged":
 			var online: bool = event.get("connected", true)
 			var bot: bool = event.get("kind") == "bot"
@@ -375,6 +487,10 @@ func _is_trump_into_side_suit(card: String) -> bool:
 func _maybe_start_deal(v: GameView) -> void:
 	if v.phase != GameView.BIDDING and v.phase != GameView.PLAYING:
 		return
+	# Only the real tables deal; a test stand-in presents a playable view on
+	# purpose.
+	if not (session is HostedSession or session is RemoteSession):
+		return
 	if _last_dealt_hand == v.hand_index:
 		return
 	_last_dealt_hand = v.hand_index
@@ -382,34 +498,30 @@ func _maybe_start_deal(v: GameView) -> void:
 		_rejoined = false
 		if v.phase == GameView.PLAYING or v.bids.any(func(b): return b >= 0):
 			return
-	_hand_revealed = 0
 	_deal_counts = [0, 0, 0, 0]
 	_dealing = true
 	_trick.sync([], v.you, -1, {}, {}, _felt_center(), _trick_card_width())
-	_layout()
 	if _deal != null:
 		_deal.queue_free()
 	_deal = DealOverlay.new()
 	_fx.add_child(_deal)
 	# Lay the fan out for the new hand (nothing shown yet) so the player's own
 	# cards can land on their real slots.
+	_hand.gestures_enabled = false
 	_hand.set_hand(v.hand, [], false, 0)
-	_aim_deal()
+	_layout()
 	_deal.progress.connect(_on_deal_progress)
 	_deal.finished.connect(_on_deal_finished)
 	_deal.begin(v.dealer, v.you)
 
 
 func _on_deal_progress(counts: Array) -> void:
-	var v := session.view
 	_deal_counts = counts
-	_hand_revealed = counts[v.you] if v != null and v.you >= 0 else 0
 	_refresh()
 
 
 func _on_deal_finished() -> void:
 	_dealing = false
-	_hand_revealed = 13
 	if _deal != null:
 		_deal.queue_free()
 		_deal = null
@@ -420,9 +532,16 @@ func _on_deal_finished() -> void:
 
 # -------------------------------------------------------------- throwing
 
-func _on_card_thrown(card: String, global_pos: Vector2) -> void:
-	_throw_origins[card] = _to_body(global_pos)
+## A card left the hand: its flight starts from exactly where it was, and the
+## play goes to the table.
+func _on_card_thrown(card: String, global_center: Vector2, scale: float, angle: float) -> void:
+	_throw(card, _to_body(global_center), scale, angle)
+
+
+func _throw(card: String, origin: Vector2, scale: float, angle: float) -> void:
+	_trick.throw_card(card, origin, scale * _hand_card_width() / _trick_card_width(), angle)
 	session.play(card)
+	_refresh()
 
 
 ## Plays of the viewer's own seat that arrive with no gesture — the server or a
@@ -435,7 +554,8 @@ func _maybe_autoplay_flights(v: GameView) -> void:
 			continue
 		var from = _hand.slot_center_global(p["card"])
 		if from != null:
-			_throw_origins[p["card"]] = _to_body(from)
+			_throw_origins[p["card"]] = {"pos": _to_body(from), "scale": _hand_card_width() / _trick_card_width(),
+					"angle": _hand.slot_angle(p["card"])}
 
 
 ## Forgets origins for cards no longer on the table, so a card id that turns up
@@ -485,10 +605,29 @@ func _maybe_auto_play() -> void:
 		var now := session.view
 		if now == null or now.turn != turn or not now.hand.has(card) or not now.legal_move_ids.has(card):
 			return
+		if _trick.pending_ids().has(card):
+			return
 		var from = _hand.slot_center_global(card)
-		if from != null:
-			_throw_origins[card] = _to_body(from)
-		session.play(card))
+		var origin: Vector2 = _to_body(from) if from != null else _anchors().get(SeatView.Slot.BOTTOM, _felt_center())
+		_throw(card, origin, 1.0, _hand.slot_angle(card)))
+
+
+# ----------------------------------------------------------------- hints
+
+func _on_illegal(card: String) -> void:
+	var v := session.view
+	if v != null:
+		_show_hint(HintLine.illegal(v, card))
+
+
+## Shows a line of help above the hand for a moment.
+func _show_hint(hint: Dictionary) -> void:
+	_hint_serial += 1
+	var serial := _hint_serial
+	_hint.hint = hint
+	get_tree().create_timer(HINT_TIME).timeout.connect(func():
+		if serial == _hint_serial and is_instance_valid(_hint):
+			_hint.hint = {})
 
 
 # ---------------------------------------------------------------- banners
@@ -498,12 +637,22 @@ func _refresh_banners() -> void:
 	var game_over := v != null and v.phase == GameView.GAME_OVER
 	var autoplay: bool = v != null and v.you >= 0 and v.my_player().get("autoplay", false) and not game_over
 	if autoplay and _autoplay_banner == null:
-		_autoplay_banner = _banner_box(UI.hbox(9, [UI.icon("robot", 15, Tokens.GOLD_MID), UI.vbox(0, [
-			UI.label("Autoplay is on", 12, Tokens.GOLD_MID, "bold"),
+		var box := UI.glass_box(UI.pad_hv(14, 10), Tokens.GOLD_MID, 14)
+		box.border_color = Color(Tokens.GOLD_MID, 0.8)
+		box.shadows = Tokens.SHADOW_HIGH + Tokens.glow(Tokens.GOLD_DEEP, 0.6)
+		var icon := UI.icon("robot", 18, Tokens.GOLD_MID)
+		icon.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		_autoplay_banner = UI.panel(box, UI.hbox(10, [icon, UI.vbox(0, [
+			UI.label("Autoplay is on", 13, Tokens.GOLD_MID, "bold"),
 			UI.label("Tap anywhere to take your seat back.", 11, Tokens.TEXT_MUTED),
-		])]), Color(Tokens.GOLD_MID, 0.75), Color(0.039, 0.071, 0.027, 0.94))
+		])]))
+		_autoplay_banner.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		for c in _autoplay_banner.find_children("*", "Control", true, false):
+			c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_autoplay_banner.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		_banners.add_child(_autoplay_banner)
 		_banners.move_child(_autoplay_banner, 0)
+		_slide_in(_autoplay_banner)
 	elif not autoplay and _autoplay_banner != null:
 		_autoplay_banner.queue_free()
 		_autoplay_banner = null
@@ -537,6 +686,15 @@ func _announce(text: String, online: bool, icon: String, seat: int) -> void:
 			t.tween_callback(banner.queue_free)
 			if _presence_banner == banner:
 				_presence_banner = null)
+
+
+## Fades a banner in as it drops into place from slightly above.
+func _slide_in(node: Control) -> void:
+	var run := func(t: float) -> void:
+		node.modulate.a = t
+		node.position.y = node.size.y * -0.3 * (1.0 - t)
+	run.call(0.0)
+	node.create_tween().tween_method(run, 0.0, 1.0, 0.26)
 
 
 func _banner_box(content: Control, border: Color, bg: Color) -> Control:
@@ -599,16 +757,17 @@ func _rebuild_overlay(force: bool) -> void:
 	if v.phase == GameView.BIDDING and v.is_my_turn() and not v.i_have_bid() and not _dealing:
 		_bid_panel = BidPanel.new(v.hand, session.turn_deadline_ms)
 		_bid_panel.bid_chosen.connect(func(b): session.place_bid(b))
-		_bid_panel.custom_minimum_size.x = minf(300, size.x - 40)
+		_bid_panel.custom_minimum_size.x = minf(320, size.x) - 32
 		var c := CenterContainer.new()
 		c.set_anchors_preset(Control.PRESET_FULL_RECT)
 		c.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		c.add_child(_bid_panel)
 		_overlay.add_child(c)
+		UI.pop_in(_bid_panel)
 	if v.phase == GameView.HAND_OVER:
 		var board := Scoreboard.new(v, session.hand_advance_deadline_ms)
 		board.continue_pressed.connect(func(): session.continue_to_next_hand())
-		_overlay.add_child(_modal(board, 340))
+		_overlay.add_child(_modal(board, 360))
 	if v.phase == GameView.GAME_OVER:
 		var winner := WinnerScreen.new(v)
 		winner.play_again.connect(_play_again)
@@ -632,15 +791,18 @@ func _overlay_key(v: GameView) -> String:
 			session.hand_advance_deadline_ms, session.is_resuming() and not session.is_ready()]
 
 
+## Dims the table behind a decision and pops [param content] in over it.
 func _modal(content: Control, max_width: float) -> Control:
 	var scrim := ColorRect.new()
-	scrim.color = Color(0, 0, 0, 0.6)
+	scrim.color = Tokens.MODAL_SCRIM
 	scrim.set_anchors_preset(Control.PRESET_FULL_RECT)
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	content.custom_minimum_size.x = minf(max_width - 40, size.x - 40)
+	var pad := UI.sc(20, 12)
+	content.custom_minimum_size.x = minf(max_width, size.x) - pad * 2.0
 	center.add_child(content)
 	scrim.add_child(center)
+	UI.pop_in(content)
 	return scrim
 
 
@@ -711,9 +873,8 @@ func _reconnect_notice(resuming: bool) -> Control:
 ## A mid-game reconnect keeps the last deal on screen behind a small card,
 ## rather than swapping the table for a blank page.
 func _reconnect_overlay() -> Control:
-	var card := UI.panel(UI.with_shadow(UI.flat(Tokens.PANEL, 18, Tokens.HAIRLINE, 1, UI.pad_all(20)), Color(0, 0, 0, 0.6),
-			30, Vector2(0, 12)), _reconnect_notice(true))
-	card.custom_minimum_size.x = 260
+	var card := UI.glass_panel(_reconnect_notice(true))
+	card.custom_minimum_size.x = minf(300, size.x - 48)
 	var c := _full_center(card)
 	c.mouse_filter = Control.MOUSE_FILTER_STOP
 	return c
@@ -728,9 +889,9 @@ func _connect_failure() -> Control:
 	pulse.draw.connect(func():
 		var t := (sin(Time.get_ticks_msec() / 1500.0 * PI) + 1.0) / 2.0
 		var c := Vector2(36, 36)
-		pulse.draw_circle(c, 27 + 5 * t, Color(Tokens.DANGER, 0.08 + 0.05 * t), true, -1.0, true)
-		pulse.draw_arc(c, 27 + 5 * t, 0, TAU, 48, Color(Tokens.DANGER, 0.3 + 0.15 * t), 1.5, true)
-		pulse.draw_circle(c, 26, Color(Tokens.DANGER, 0.14), true, -1.0, true)
+		Draw.disc(pulse, c, 27 + 5 * t, Color(Tokens.DANGER, 0.08 + 0.05 * t))
+		Draw.circle_border(pulse, c, 27 + 5 * t + 0.75, Color(Tokens.DANGER, 0.3 + 0.15 * t), 1.5)
+		Draw.disc(pulse, c, 26, Color(Tokens.DANGER, 0.14))
 		Draw.icon(pulse, "wifi_off", Rect2(c - Vector2(13, 13), Vector2(26, 26)), Tokens.DANGER))
 	var timer := Timer.new()
 	timer.wait_time = 1.0 / 30.0
@@ -741,8 +902,8 @@ func _connect_failure() -> Control:
 	# Only a brand-new connect can simply try again; a seat that was given up
 	# cannot be retried into existence.
 	if session.is_network() and session.view == null:
-		buttons.add_child(UI.expand(UI.button("Try again", true, func(): session.retry_connect(), 13, UI.pad_hv(0, 13))))
-	buttons.add_child(UI.expand(UI.button("Back", false, _leave, 13, UI.pad_hv(0, 13))))
+		buttons.add_child(UI.expand(UI.gold_button("Try again", func(): session.retry_connect(), "refresh_rounded", true)))
+	buttons.add_child(UI.expand(UI.ghost_button("Back", _leave, "", true)))
 	var col := UI.vbox(0, [pulse, UI.gap(14),
 		UI.label("Can't connect", 18, Tokens.TEXT_PRIMARY, "bold", HORIZONTAL_ALIGNMENT_CENTER), UI.gap(6),
 		UI.paragraph(message, 13, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_CENTER), UI.gap(22), buttons])

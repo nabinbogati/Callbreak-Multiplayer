@@ -42,6 +42,8 @@ func _make_theme() -> Theme:
 	t.default_font = Tokens.font("medium")
 	t.default_font_size = 14
 	t.set_color("font_color", "Label", Tokens.TEXT_PRIMARY)
+	# Lines sit flush, as in the design; Godot's default adds 3px between them.
+	t.set_constant("line_spacing", "Label", 0)
 	var empty := StyleBoxEmpty.new()
 	t.set_stylebox("panel", "PanelContainer", empty)
 	t.set_stylebox("panel", "ScrollContainer", empty)
@@ -96,25 +98,32 @@ func _safe_insets(view: Vector2) -> Vector4:
 
 # ---------------------------------------------------------------- screens
 
+## One transition everywhere: the next screen fades up out of a slight zoom,
+## which reads as moving *into* the table rather than sliding sideways past it.
+const TRANSITION := 0.3
+
+
 func push(screen: Control) -> void:
-	if not _screens.is_empty():
-		_screens.back().visible = false
-		if _screens.back().has_method("on_hidden"):
-			_screens.back().on_hidden()
+	var below: Control = _screens.back() if not _screens.is_empty() else null
 	screen.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_screens.append(screen)
 	_screen_layer.add_child(screen)
+	if below == null:
+		return
+	_animate(screen, true, func():
+		# Hidden once covered, so it stops drawing (and taking touches).
+		if is_instance_valid(below) and _screens.has(below) and _screens.back() != below:
+			below.visible = false
+			if below.has_method("on_hidden"):
+				below.on_hidden())
 
 
 func pop() -> void:
 	if _screens.size() <= 1:
 		return
 	var top: Control = _screens.pop_back()
-	top.queue_free()
-	var below: Control = _screens.back()
-	below.visible = true
-	if below.has_method("on_shown"):
-		below.on_shown()
+	_reveal(_screens.back())
+	_animate(top, false, top.queue_free)
 
 
 func replace(screen: Control) -> void:
@@ -122,18 +131,40 @@ func replace(screen: Control) -> void:
 		push(screen)
 		return
 	var top: Control = _screens.pop_back()
-	top.queue_free()
 	push(screen)
+	# The outgoing screen stays under the incoming one until it is covered.
+	get_tree().create_timer(TRANSITION).timeout.connect(top.queue_free)
 
 
 func pop_to_root() -> void:
 	close_overlays()
+	if _screens.size() <= 1:
+		return
+	var top: Control = _screens.pop_back()
 	while _screens.size() > 1:
-		var top: Control = _screens.pop_back()
-		top.queue_free()
-	_screens[0].visible = true
-	if _screens[0].has_method("on_shown"):
-		_screens[0].on_shown()
+		_screens.pop_back().queue_free()
+	_reveal(_screens[0])
+	_animate(top, false, top.queue_free)
+
+
+func _reveal(screen: Control) -> void:
+	screen.visible = true
+	if screen.has_method("on_shown"):
+		screen.on_shown()
+
+
+## Fades [param screen] in from a 0.96 zoom (or back out to it), then calls
+## [param done].
+func _animate(screen: Control, entering: bool, done: Callable) -> void:
+	var step := func(t: float) -> void:
+		var e := Motion.emphasized(t) if entering else Motion.ease_in_cubic(t)
+		screen.modulate.a = e
+		screen.pivot_offset = screen.size / 2.0
+		screen.scale = Vector2.ONE * (0.96 + 0.04 * e)
+	step.call(0.0 if entering else 1.0)
+	var tween := screen.create_tween()
+	tween.tween_method(step, 0.0 if entering else 1.0, 1.0 if entering else 0.0, TRANSITION)
+	tween.tween_callback(done)
 
 
 func top_screen() -> Control:
@@ -153,8 +184,9 @@ func sheet(content: Control) -> Sheet:
 
 
 ## A two-button confirmation; resolves true for the primary choice.
-func confirm(title: String, message: String, cancel_label: String, ok_label: String) -> bool:
-	var d := ConfirmDialog.new(title, message, cancel_label, ok_label)
+func confirm(title: String, message: String, cancel_label: String, ok_label: String, icon := "",
+		scrim := Color("#0000008C")) -> bool:
+	var d := ConfirmDialog.new(title, message, cancel_label, ok_label, icon, scrim)
 	_add_overlay(d)
 	var result: bool = await d.closed
 	_remove_overlay(d)

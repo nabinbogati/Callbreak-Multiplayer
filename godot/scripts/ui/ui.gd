@@ -60,6 +60,8 @@ static func flat(bg: Color, radius: float, border := Color.TRANSPARENT, border_w
 	s.set_corner_radius_all(int(round(radius)))
 	s.corner_detail = 6
 	s.anti_aliasing = true
+	# Feathered by one device pixel, not one design pixel (see Draw.device_px).
+	s.anti_aliasing_size = Draw.device_px()
 	if border.a > 0.0 and border_width > 0.0:
 		s.border_color = border
 		s.set_border_width_all(int(ceil(border_width)))
@@ -201,6 +203,95 @@ static func button(text: String, primary := true, on_press := Callable(), font_s
 	var l := label(text, font_size, Tokens.ON_GOLD if primary else Tokens.TEXT_ON_DARK, "bold",
 			HORIZONTAL_ALIGNMENT_CENTER)
 	return pressable(panel(style, l), on_press)
+
+
+## The primary action: a lit gold slab with a soft halo. One look for every
+## "do the main thing" button — confirm a bid, start a game, play again.
+static func gold_button(text: String, on_press := Callable(), icon_name := "", dense := false) -> Pressable:
+	var box := GradientBox.new(Tokens.GOLD_BUTTON, sc(14, 12), true)
+	box.offsets = Tokens.GOLD_BUTTON_STOPS
+	box.border_color = Color("#FFF6D866")
+	box.border_width = 1
+	box.shadows = Tokens.glow(Tokens.GOLD_DEEP, 0.9, 16)
+	_pad(box, pad_hv(18, sc(11, 8) if dense else sc(15, 11)))
+	var l := label(text, sc(13, 12) if dense else sc(15, 13), Tokens.ON_GOLD, "bold", HORIZONTAL_ALIGNMENT_CENTER)
+	return pressable(panel(box, _icon_row(icon_name, sc(18, 16), 8, Tokens.ON_GOLD, l)), on_press, 0.96)
+
+
+## The secondary action: a quiet glass slab beside a [method gold_button].
+static func ghost_button(text: String, on_press := Callable(), icon_name := "", dense := false) -> Pressable:
+	var style := flat(Color("#FFFFFF14"), sc(14, 12), Tokens.HAIRLINE_STRONG, 1,
+			pad_hv(16, sc(11, 8) if dense else sc(15, 11)))
+	var l := label(text, sc(13, 12) if dense else sc(14, 13), Tokens.TEXT_ON_DARK, "semibold", HORIZONTAL_ALIGNMENT_CENTER)
+	return pressable(panel(style, _icon_row(icon_name, sc(17, 15), 7, Tokens.TEXT_ON_DARK, l)), on_press, 0.96)
+
+
+static func _icon_row(icon_name: String, icon_size: float, gap_px: float, color: Color, text: Label) -> Control:
+	if icon_name.is_empty():
+		return text
+	var row := hbox(gap_px, [icon(icon_name, icon_size, color), text])
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	return row
+
+
+## The raised glass surface every floating panel is painted with.
+static func glass_box(pad := Vector4(20, 20, 20, 20), accent := Tokens.GOLD_BORDER, radius := 20.0) -> GradientBox:
+	var box := GradientBox.new(Tokens.SURFACE, radius, true)
+	box.border_color = Color(accent, 0.38)
+	box.border_width = 1
+	box.shadows = Tokens.SHADOW_HIGH
+	_pad(box, pad)
+	return box
+
+
+## The raised glass card every floating panel sits in — dialogs, the bid
+## panel, the scoreboard, the reconnect notice.
+static func glass_panel(child: Control, pad := Vector4(20, 20, 20, 20), accent := Tokens.GOLD_BORDER) -> PanelContainer:
+	return panel(glass_box(pad, accent), child)
+
+
+## A one-shot scale-and-fade entrance for a panel appearing over the table.
+static func pop_in(node: Control, duration := 0.28, from := 0.9) -> void:
+	var run := func(t: float) -> void:
+		var e := Motion.ease_out_back(t)
+		node.modulate.a = clampf(e, 0.0, 1.0)
+		node.pivot_offset = node.size / 2.0
+		node.scale = Vector2.ONE * (from + (1.0 - from) * e)
+	run.call(0.0)
+	node.create_tween().tween_method(run, 0.0, 1.0, duration)
+
+
+## A one-shot rise-and-fade: [param node] drifts up [param rise] px into place
+## as it fades in over [param duration] (on the entrance curve). With a
+## [param stagger], item [param index] holds back for the first part of its
+## run. Returns a wrapper to add in the node's place — a container would
+## otherwise pin the node's position.
+static func rise_in(node: Control, duration: float, rise: float, index := 0, stagger := 0.0) -> Control:
+	var wrap := Control.new()
+	wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	wrap.size_flags_horizontal = node.size_flags_horizontal
+	wrap.add_child(node)
+	var fit := func(): wrap.custom_minimum_size = node.get_combined_minimum_size()
+	node.minimum_size_changed.connect(fit)
+	fit.call()
+	var run := func(t: float) -> void:
+		var local := clampf(Motion.enter(t) * (1.0 + index * stagger) - index * stagger, 0.0, 1.0)
+		node.modulate.a = local
+		node.position = Vector2(0, rise * (1.0 - local))
+	wrap.resized.connect(func(): node.size = wrap.size)
+	run.call(0.0)
+	wrap.create_tween().tween_method(run, 0.0, 1.0, duration)
+	return wrap
+
+
+## A suit glyph as a control, [param size] tall.
+static func suit_glyph(suit_value: int, size: float, color: Color) -> Control:
+	var c := Control.new()
+	c.custom_minimum_size = Vector2(size * Draw.suit_aspect(suit_value), size)
+	c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	c.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	c.draw.connect(func(): Draw.suit(c, suit_value, c.size / 2.0, size, color))
+	return c
 
 
 ## A translucent rounded pill — the home and table chrome.

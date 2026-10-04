@@ -23,12 +23,16 @@ func _build() -> void:
 	UI.free_children(_col)
 	var close := UI.pressable(UI.margin(UI.icon("close", 18, Tokens.TEXT_MUTED), UI.pad_all(4)),
 			func(): finished.emit(null), 0.9)
-	_col.add_child(UI.hbox(0, [UI.expand(UI.label("Settings", 18, Tokens.TEXT_PRIMARY, "bold")), close]))
+	var tune := UI.icon("tune", 18, Tokens.GOLD)
+	tune.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_col.add_child(UI.hbox(0, [tune, UI.gap(0, 8), UI.expand(UI.label("Settings", 18, Tokens.TEXT_PRIMARY, "bold")), close]))
 	_toggle("Drag to play", "drag_to_play")
+	_toggle("Tap twice to play", "tap_twice_to_play")
 	_toggle("Auto throw last card", "auto_throw_last_card")
 	_toggle("Auto throw last suit card", "auto_throw_last_suit_card")
 	_toggle("Background music", "music_enabled")
 	_toggle("Sound effects", "sfx_enabled")
+	_toggle("Vibration", "haptics_enabled")
 
 
 func _toggle(text: String, key: String) -> void:

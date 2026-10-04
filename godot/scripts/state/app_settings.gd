@@ -55,6 +55,17 @@ var music_enabled := true:
 	set(v): music_enabled = v; _changed("music_enabled", v)
 var sfx_enabled := true:
 	set(v): sfx_enabled = v; _changed("sfx_enabled", v)
+## Whether the table answers touches with a short vibration — a tick as the
+## finger slides from card to card, a thump when one is thrown. Defaults on; it
+## is the cheapest way to make a card feel picked up.
+var haptics_enabled := true:
+	set(v): haptics_enabled = v; _changed("haptics_enabled", v)
+## Whether a tap only raises a card, and a second tap on the raised card plays
+## it. Off by default, so one tap plays as it always has; players who keep
+## misfiring on a crowded fan can opt into the safety catch. Dragging a card
+## toward the table always plays it straight away either way.
+var tap_twice_to_play := false:
+	set(v): tap_twice_to_play = v; _changed("tap_twice_to_play", v)
 ## slow / normal / fast — scales every transient animation and the table's own
 ## pacing timers.
 var animation_speed := "normal":

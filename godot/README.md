@@ -36,6 +36,7 @@ test also fails that test. `TEST_FILTER=lan` runs only the matching tests.
 | `test_sessions.gd` | A whole solo game through the real timers. A LAN host and guest playing a full game over a loopback socket. Timeout to autoplay and back. LAN discovery over UDP. Identity and uuid. |
 | `test_server_e2e.gd` | Against the real Go server: create a private room, join, deal, play, drop the connection and reclaim the same seat, and check that server error messages reach the player. Skipped unless `E2E_SERVER_URL` is set. |
 | `test_ui.gd` | Drives every screen of the real app shell. Plays a full game through the table screen, taps and drags cards, opens every sheet, and covers the rejoin prompt and the failure states. |
+| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, and the animation budget: the trick sequence inside the hosts' 1100 ms linger at every speed. |
 
 End-to-end against the backend:
 
@@ -57,9 +58,9 @@ xvfb-run godot --path godot --rendering-driver opengl3 --resolution 780x1688 \
 
 - package `com.callbreak.callbreak`, the same id as the Flutter app
 - arm64-v8a and armeabi-v7a
-- permissions: `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, and
+- permissions: `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`,
   `CHANGE_WIFI_MULTICAST_STATE`, which some devices need to receive the LAN
-  discovery broadcasts
+  discovery broadcasts, and `VIBRATE` for the table's touch feedback
 
 To export, install the 4.5 export templates and point the editor at an Android
 SDK (*Editor → Editor Settings → Export → Android*). Then run
@@ -86,7 +87,7 @@ scripts/
             game_uploader.gd (autoload "Uploader"), sessions.gd, wire.gd
   state/    app_settings.gd (autoload "Settings"), identity_store.gd ← lib/state
   audio/    audio_controller.gd (autoload "Audio")                 ← lib/audio
-  ui/       tokens.gd, ui.gd, draw.gd                              ← lib/design
+  ui/       tokens.gd, motion.gd, ui.gd, draw.gd, haptics.gd     ← lib/design
             widgets/  cards, seats, hand fan, trick, deal, panels  ← lib/ui/widgets
             screens/  app (shell), home, table, settings, profile, ← lib/ui/screens
                       join/LAN/quick-settings sheets, dialogs
@@ -96,8 +97,18 @@ tests/      runner, suites, server fixture, screenshot tour
 ## Notes on the port
 
 - **The UI is built in code.** There are no `.tscn` files except the one-node
-  main scene. Cards, felt, avatars, suit glyphs and icons are drawn as vectors,
-  so they look the same on every device and don't depend on a symbol font.
+  main scene. Cards, felt, avatars and suit glyphs are drawn as vectors, so they
+  look the same on every device and don't depend on a symbol font. Icons are
+  the design's own Material glyphs, from a 45-glyph subset of the Material
+  Icons font (`assets/fonts/MaterialIcons-Subset.otf`, licence alongside it).
+- **Motion lives in `motion.gd`.** Every gameplay timing and curve sits in one
+  place, because several have to agree: the throw, gather and sweep of a trick
+  must finish inside the hosts' 1100 ms linger. The tests check it.
+- **Antialiasing is one device pixel wide.** Godot's antialiased lines feather
+  by a whole canvas unit, which is two or three device pixels on a phone and
+  makes every border read thick and soft. `Draw` strokes and fills with its
+  own one-device-pixel fringe instead, and shadows are fitted to the falloff of
+  the design's blurs.
 - **Design pixels.** The viewport is scaled so its short side is the design's
   390, with the same 0.78×–1.4× clamp the Flutter `Metrics` class used.
   Layouts use the design's numbers directly.
@@ -112,8 +123,9 @@ tests/      runner, suites, server fixture, screenshot tour
   because it runs on the widest range of Android devices. That renderer has no
   2D MSAA, so polygon edges are smoothed with a thin antialiased outline.
 - **Settings persist.** The Flutter app kept display settings in memory.
-  Here they are saved to `user://settings.cfg`. Identity (device id, session,
-  rejoin record) and the offline upload queue persist as before.
+  Here they are saved to `user://settings.cfg`, including Vibration and Tap
+  twice to play. Identity (device id, session, rejoin record) and the offline
+  upload queue persist as before.
 - **LAN lobby.** When a guest leaves before the deal, their chair is freed
   for someone else rather than kept as a disconnected seat.
 - The one sound that was a 24-bit WAVE (which Godot can't import) was
