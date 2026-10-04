@@ -180,6 +180,8 @@ static func icon(name: String, size: float, color: Color) -> IconView:
 static func scroll(child: Control) -> ScrollContainer:
 	var s := ScrollContainer.new()
 	s.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	# Scrolls by drag with no bar, as lists do on Android.
+	s.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
 	s.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	child.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	s.add_child(child)
@@ -309,34 +311,35 @@ static func line_edit(text := "", placeholder := "", font_size := 15.0) -> LineE
 	e.add_theme_color_override("font_color", Tokens.TEXT_PRIMARY)
 	e.add_theme_color_override("font_placeholder_color", Tokens.TEXT_FAINT)
 	e.add_theme_color_override("caret_color", Tokens.GOLD)
-	e.add_theme_stylebox_override("normal", flat(Tokens.PANEL, 12, Tokens.HAIRLINE_STRONG, 1, pad_hv(14, 12)))
-	e.add_theme_stylebox_override("focus", flat(Color.TRANSPARENT, 12, Tokens.GOLD_BORDER, 1.5, pad_hv(14, 12)))
-	e.custom_minimum_size.y = 46
+	# A filled panel whose hairline border warms to gold while it has focus.
+	var pad := pad_all(sc(14, 9))
+	e.add_theme_stylebox_override("normal", flat(Tokens.PANEL, sc(12, 9), Tokens.HAIRLINE, 1, pad))
+	e.add_theme_stylebox_override("focus", flat(Color.TRANSPARENT, sc(12, 9), Tokens.GOLD, 1.5, pad))
 	return e
 
 
 ## A segmented choice: [param options] are `[label, value]` pairs; the chip for
-## [param current] is highlighted, and tapping another calls
+## [param current] is filled gold, and tapping another calls
 ## [param on_change] with its value.
-static func choices(options: Array, current, on_change: Callable, font_size := 12.0) -> HBoxContainer:
-	var row := hbox(6)
+static func choices(options: Array, current, on_change: Callable, spacing := 6.0) -> HBoxContainer:
+	var row := hbox(spacing)
 	for opt in options:
 		var selected: bool = opt[1] == current
-		var style := flat(Color(Tokens.GOLD, 0.16) if selected else Tokens.PANEL,
-				10, Tokens.GOLD_BORDER if selected else Tokens.HAIRLINE_STRONG, 1, pad_hv(11, 7))
-		var chip := pressable(panel(style, label(opt[0], font_size,
-				Tokens.GOLD if selected else Tokens.TEXT_ON_DARK, "semibold", HORIZONTAL_ALIGNMENT_CENTER)),
-				func(): on_change.call(opt[1]), 0.94)
-		row.add_child(chip)
+		row.add_child(glass_pill(label(opt[0], sc(13, 11), Tokens.ON_GOLD if selected else Tokens.TEXT_ON_DARK, "semibold",
+				HORIZONTAL_ALIGNMENT_CENTER), func(): on_change.call(opt[1]), sc(10, 8), pad_hv(sc(16, 11), sc(10, 6)),
+				Tokens.GOLD if selected else Tokens.HAIRLINE, Tokens.GOLD if selected else Tokens.PANEL))
 	return row
 
 
 ## A settings row: label on the left, its choice chips on the right.
-static func setting_row(text: String, control: Control) -> HBoxContainer:
+static func setting_row(text: String, control: Control, gap_px := 12.0) -> HBoxContainer:
 	var l := label(text, sc(13, 12), Tokens.TEXT_ON_DARK)
 	l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	return hbox(10, [l, control])
+	l.max_lines_visible = 2
+	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	control.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	return hbox(gap_px, [l, control])
 
 
 static func free_children(node: Node) -> void:
