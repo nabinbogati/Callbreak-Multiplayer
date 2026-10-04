@@ -35,8 +35,9 @@ void main() {
 
     expect(find.text('Round 1 / 3'), findsOneWidget);
 
-    // Let the bots ahead of the human in bidding order take their turns.
-    for (var i = 0; i < 3; i++) {
+    // Bidding opens once the deal is down; then the bots ahead of the human
+    // in bidding order take their turns.
+    for (var i = 0; i < 10 && find.text('Confirm bid').evaluate().isEmpty; i++) {
       await tester.pump(const Duration(seconds: 1));
     }
 

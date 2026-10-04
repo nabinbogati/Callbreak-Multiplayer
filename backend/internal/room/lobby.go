@@ -422,6 +422,7 @@ func (r *Room) newGame() {
 	r.clearAutoplay()
 	r.handAdvanceAt = time.Time{}
 	r.game.Start()
+	r.dealtAt = time.Now()
 	// Started after the deal, so a table that was never dealt is never recorded,
 	// and with a clean log, so a restarted game shares nothing with the one
 	// before it.

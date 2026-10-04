@@ -2917,9 +2917,13 @@ class _SeatAt extends StatelessWidget {
         player: view.players[seat],
         slot: slot,
         palette: palette,
-        bid: view.bids[seat],
+        // Nothing about the bidding shows until this screen's deal is down: a
+        // table whose clock this app does not run (or a deal slowed by the
+        // animation-speed setting) can bid while cards are still in the air
+        // here. Bids made meanwhile pop up the moment the deal ends.
+        bid: dealt != null ? null : view.bids[seat],
         tricksWon: view.tricksWon[seat],
-        isTurn: view.turn == seat,
+        isTurn: dealt == null && view.turn == seat,
         isDealer: view.dealer == seat,
         isHost: view.hostSeat == seat,
         deadline: view.turn == seat ? turnDeadline : null,
@@ -3022,9 +3026,9 @@ class _HandArea extends StatelessWidget {
             player: view.players[you],
             slot: SeatSlot.bottom,
             palette: SettingsScope.of(context).palette,
-            bid: view.bids[you],
+            bid: dealing ? null : view.bids[you],
             tricksWon: view.tricksWon[you],
-            isTurn: view.turn == you,
+            isTurn: !dealing && view.turn == you,
             isDealer: view.dealer == you,
             isHost: view.hostSeat == you,
             deadline: view.turn == you ? turnDeadline : null,
