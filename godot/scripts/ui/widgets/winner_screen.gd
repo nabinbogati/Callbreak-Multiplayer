@@ -2,8 +2,9 @@ class_name WinnerScreen
 extends Control
 
 ## The final-game screen: a burst of confetti, a trophy, the podium (1st
-## tallest and centre-most, 2nd and 3rd flanking, 4th apart and lowest), the
-## full round history, and the player's next move — another game or home.
+## tallest and centre-most, 2nd and 3rd flanking, 4th apart and lowest), and
+## the player's next move — another game or home. The round history is a tap
+## away, behind the same pill as on the table, so it all fits on one screen.
 
 signal play_again
 signal go_home
@@ -22,12 +23,15 @@ const PEDESTALS := {
 const ENTRANCE := 0.9
 
 var _t := 0.0
+var _view: GameView
+var _history: Control
 var _trophy: Control
 var _headline: Control
 var _columns: Array = []
 
 
 func _init(view: GameView) -> void:
+	_view = view
 	set_anchors_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	var bg := Control.new()
@@ -52,7 +56,8 @@ func _init(view: GameView) -> void:
 		headline = "You win!" if you_won else "%s wins" % view.player(ranked[0]["seat"]).get("name", "")
 
 	var col := UI.vbox(0)
-	_trophy = _make_trophy(UI.sc(64, 44))
+	col.alignment = BoxContainer.ALIGNMENT_CENTER
+	_trophy = _make_trophy(UI.sc(64, 36))
 	col.add_child(_trophy)
 	col.add_child(UI.gap(UI.sc(10, 6)))
 	var word := UI.gold_text(headline, UI.sc(28, 22))
@@ -64,35 +69,55 @@ func _init(view: GameView) -> void:
 	col.add_child(word)
 	col.add_child(UI.label("Game over · %d rounds played" % view.hands_per_game, UI.sc(12, 11), Tokens.TEXT_FAINT,
 			"medium", HORIZONTAL_ALIGNMENT_CENTER))
-	col.add_child(UI.gap(UI.sc(22, 12)))
+	col.add_child(UI.gap(UI.sc(22, 8)))
 	if ranked.size() == 4:
 		col.add_child(_podium(view, ranked))
-	col.add_child(UI.gap(UI.sc(22, 14)))
+	col.add_child(UI.gap(UI.sc(28, 12)))
+	# Landscape leaves little height: the buttons go dense to keep the column
+	# clear of a gesture bar.
+	var dense := not UI.portrait
+	col.add_child(UI.hbox(12, [UI.expand(UI.ghost_button("Home", func(): go_home.emit(), "home_rounded", dense)),
+			UI.expand(UI.gold_button("Play again", func(): play_again.emit(), "replay_rounded", dense))]))
 
-	var chart := UI.icon("leaderboard_rounded", 16, Tokens.GOLD)
+	var padded := UI.margin(col, Vector4(20, UI.sc(20, 12), 20, UI.sc(20, 12)))
+	padded.set_anchors_preset(Control.PRESET_FULL_RECT)
+	add_child(padded)
+
+	# Where the table's round pill sits, so the history is found where it was.
+	var chart := UI.icon("leaderboard_rounded", 15, Color(Tokens.GOLD, 0.8))
 	chart.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	var history := UI.vbox(0, [UI.hbox(8, [chart, UI.label("Round history", 15, Tokens.TEXT_PRIMARY, "bold")]),
-			UI.gap(6)])
-	var table := RoundHistory.table(view)
-	table.custom_minimum_size.y = UI.sc(210, 150)
-	history.add_child(table)
-	col.add_child(UI.glass_panel(history, Vector4(16, 14, 16, 14)))
-	col.add_child(UI.gap(UI.sc(18, 12)))
-	col.add_child(UI.hbox(12, [UI.expand(UI.ghost_button("Home", func(): go_home.emit(), "home_rounded")),
-			UI.expand(UI.gold_button("Play again", func(): play_again.emit(), "replay_rounded"))]))
-
-	var padded := UI.margin(col, Vector4(20, UI.sc(20, 12), 20, 20))
-	var scroller := UI.scroll(padded)
-	scroller.set_anchors_preset(Control.PRESET_FULL_RECT)
-	add_child(scroller)
-	# Never wider than 560, centred.
-	resized.connect(func():
+	var pill := UI.glass_pill(UI.hbox(4, [UI.label("Round history", 12, Tokens.GOLD, "bold"), chart]), _toggle_history,
+			14, Vector4(UI.sc(12, 14), 9, UI.sc(12, 14), 9), Color(Tokens.GOLD_BORDER, 0.45))
+	add_child(pill)
+	# Never wider than 560, centred. Upright, the column starts below the pill,
+	# which would sit over the trophy on a narrow screen. A window too short
+	# for it all (a desktop one only just taller than wide) shrinks it whole
+	# rather than scroll.
+	var fit := func():
+		pill.reset_size()
+		pill.position = Vector2(size.x - UI.safe.z - UI.sc(12, 22) - pill.size.x, UI.safe.y + UI.sc(8, 10))
 		var w := minf(size.x, 560 + 40)
-		scroller.offset_left = (size.x - w) / 2.0 + UI.safe.x
-		scroller.offset_right = -(size.x - w) / 2.0 - UI.safe.z
-		scroller.offset_top = UI.safe.y
-		scroller.offset_bottom = -UI.safe.w)
+		var top := pill.position.y + pill.size.y if UI.portrait else UI.safe.y
+		padded.offset_left = (size.x - w) / 2.0 + UI.safe.x
+		padded.offset_right = -(size.x - w) / 2.0 - UI.safe.z
+		padded.offset_top = top
+		padded.offset_bottom = -UI.safe.w
+		padded.pivot_offset = Vector2(padded.size.x / 2.0, 0)
+		padded.scale = Vector2.ONE * minf((size.y - top - UI.safe.w) / padded.get_combined_minimum_size().y, 1.0)
+	resized.connect(fit)
+	padded.minimum_size_changed.connect(fit)
 	_apply(0.0)
+
+
+## Opens the round history over the podium, or closes it. Kept here rather
+## than in the table's overlay, whose rebuild would replay the entrance.
+func _toggle_history() -> void:
+	if _history != null:
+		_history.queue_free()
+		_history = null
+		return
+	_history = RoundHistory.overlay(_view, _toggle_history)
+	add_child(_history)
 
 
 func _process(delta: float) -> void:

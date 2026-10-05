@@ -147,6 +147,31 @@ func test_layout_holds_at_every_window_shape() -> void:
 		var board: Scoreboard = boards.call()[0]
 		var col: Control = board.get_child(0).get_child(0)
 		_expect_fits(board, col.get_combined_minimum_size().y, "scoreboard at %s" % shape)
+
+	# On to the end of the game: the winner screen fits whole, with no scroll,
+	# and keeps the round history behind its pill. Last, a desktop window only
+	# just taller than wide, too short for the upright column at full size.
+	var winners := func(): return table._overlay.find_children("*", "WinnerScreen", true, false)
+	expect_true(await wait_until(func():
+		if session.view.phase == GameView.HAND_OVER:
+			session.continue_to_next_hand()
+		return winners.call().size() == 1, 90.0), "the winner screen opens")
+	for shape in SHAPES + [Vector2i(390, 437)]:
+		await _resize(shape)
+		var winner: WinnerScreen = winners.call()[0]
+		var view := app.get_viewport_rect().grow(1.0)
+		var col: Control = winner.get_child(2).get_child(0)
+		expect_true(view.encloses(col.get_global_rect()), "winner screen at %s lies on screen: %s" % [shape,
+				col.get_global_rect()])
+		var pill: Pressable = winner.find_children("*", "Pressable", false, false)[0]
+		expect_true(view.encloses(pill.get_global_rect()), "history pill on screen at %s" % shape)
+		expect_true(not pill.get_global_rect().intersects(winner._trophy.get_global_rect()),
+				"history pill clear of the trophy at %s" % shape)
+	var winner: WinnerScreen = winners.call()[0]
+	winner.find_children("*", "Pressable", false, false)[0].pressed.emit()
+	expect_true(winner._history != null and winner._history.is_inside_tree(), "the pill opens the round history")
+	winner._toggle_history()
+	expect_true(winner._history == null, "and it closes again")
 	root.size = headless_size[0]
 	root.content_scale_size = headless_size[1]
 	app.queue_free()
