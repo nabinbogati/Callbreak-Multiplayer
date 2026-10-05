@@ -177,6 +177,55 @@ func test_a_restarted_solo_game_waits_for_its_own_deal_too() -> void:
 	session.shutdown()
 
 
+func test_debug_autoplay_plays_the_hand_and_waits_at_the_scoreboard() -> void:
+	_before()
+	var session := LocalSession.new("You", "normal", 3, 0.01, 9)
+	session.autoplay_self = true
+	add_child(session)
+	expect_true(await wait_until(func(): return session.view.phase == GameView.HAND_OVER, 20.0), "the hand plays itself")
+	expect_true(session.view.bids[0] >= 0, "the player's bid was placed for them")
+	expect_true(not session.view.my_player()["autoplay"], "not the timed-out kind: no banner, no wake-up")
+	await get_tree().create_timer(0.3).timeout
+	expect_eq(session.view.phase, GameView.HAND_OVER, "the next round waits for the player")
+	session.continue_to_next_hand()
+	expect_true(await wait_until(func(): return session.view.hand_index == 1 and session.view.phase == GameView.HAND_OVER,
+			20.0), "and the next hand plays itself too")
+	session.shutdown()
+
+
+func test_debug_tools_need_debug_mode() -> void:
+	_before()
+	Settings.debug_autoplay = true
+	Settings.debug_play_speed = "very_fast"
+	var off := Sessions.local(3)
+	expect_true(not off.autoplay_self, "no autoplay without Debug mode")
+	expect_eq(Settings.solo_time_scale(), 1.0, "nor a faster clock")
+	off.free()
+	Settings.debug_mode = true
+	var on := Sessions.local(3)
+	expect_true(on.autoplay_self, "autoplay once Debug mode is on")
+	expect_eq(Settings.solo_time_scale(), 4.0, "very fast is 4x")
+	on.free()
+	Settings.debug_mode = false
+	Settings.debug_autoplay = false
+	Settings.debug_play_speed = "normal"
+
+
+func test_a_faster_clock_shortens_the_wait_before_bidding() -> void:
+	_before()
+	Engine.time_scale = 4.0
+	var session := LocalSession.new("You", "normal", 3, 1.0, 7)
+	add_child(session)
+	var dealt := Time.get_ticks_msec()
+	# Half a second on the wall clock is two of the table's at 4x.
+	await get_tree().create_timer(0.5, true, false, true).timeout
+	var elapsed := (Time.get_ticks_msec() - dealt) / 1000.0
+	expect_near(session._until_bidding_opens(), GameSession.DEAL_GRACE - elapsed * 4.0, 0.1,
+			"the wait runs on the table's clock")
+	Engine.time_scale = 1.0
+	session.shutdown()
+
+
 func test_a_lan_host_holds_the_bots_bids_until_the_deal_is_down() -> void:
 	_before()
 	# The LAN wait is not scaled — a guest's animation speed is theirs — so

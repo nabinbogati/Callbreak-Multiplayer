@@ -248,7 +248,8 @@ func _schedule_next() -> void:
 ## from the deal itself so a republish (a guest joining, a tap) cannot push it
 ## back. Zero outside bidding and once it has passed. The stamp is keyed to the
 ## game and hand, so a new hand — or a restarted game, which starts again at
-## hand 0 — is stamped afresh.
+## hand 0 — is stamped afresh. Counted in the table's own time, like the timer
+## it feeds: the debug play speed runs that faster than the wall clock.
 func _until_bidding_opens() -> float:
 	if _game.phase != GameView.BIDDING:
 		return 0.0
@@ -256,7 +257,7 @@ func _until_bidding_opens() -> float:
 		_dealt_game = _game
 		_dealt_hand = _game.hand_index
 		_dealt_at_ms = Time.get_ticks_msec()
-	return maxf(0.0, _deal_grace() - (Time.get_ticks_msec() - _dealt_at_ms) / 1000.0)
+	return maxf(0.0, _deal_grace() - (Time.get_ticks_msec() - _dealt_at_ms) / 1000.0 * Engine.time_scale)
 
 
 ## How long after a deal bidding opens. Unscaled, like the server's: a guest's

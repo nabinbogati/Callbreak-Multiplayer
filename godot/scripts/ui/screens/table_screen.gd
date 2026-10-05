@@ -105,6 +105,10 @@ func _ready() -> void:
 	resized.connect(_on_layout_changed)
 	session.changed.connect(_on_session_changed)
 	session.game_event.connect(_on_game_event)
+	# The debug play speed runs a solo table's whole clock faster — deal, bots,
+	# animations. Nobody else is at it to fall out of step.
+	if session is LocalSession:
+		Engine.time_scale = Settings.solo_time_scale()
 	# Signals first, then the tree: a local session deals in its _ready.
 	add_child(session)
 	_on_layout_changed()
@@ -127,6 +131,8 @@ func _make_plate() -> void:
 func _exit_tree() -> void:
 	Audio.stop_deal()
 	Audio.stop_tick()
+	if session is LocalSession:
+		Engine.time_scale = 1.0
 
 
 # ------------------------------------------------------------------ input

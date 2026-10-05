@@ -6,7 +6,9 @@ extends RefCounted
 
 
 static func local(hands: int) -> LocalSession:
-	return LocalSession.new(Settings.player_name, Settings.difficulty, hands, Settings.animation_scale())
+	var s := LocalSession.new(Settings.player_name, Settings.difficulty, hands, Settings.animation_scale())
+	s.autoplay_self = Settings.solo_autoplay()
+	return s
 
 
 ## A seat at a table on the game server (or a LAN host). Identity rides along

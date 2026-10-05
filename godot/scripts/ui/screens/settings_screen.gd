@@ -4,8 +4,9 @@ extends Control
 ## Settings as a full page: a back button, the tab pills and a scrolling pane —
 ## Profile (display name, table colour, card colour), Gameplay (bot
 ## difficulty, play conveniences, sound, vibration, animation speed) and, in
-## debug builds only, Debug (server override, the "Go offline" tool). Being a
-## full page it is always one size: switching tabs never resizes anything.
+## debug builds only, Debug (server override, the "Go offline" tool, and the
+## vs Bots autoplay and play speed). Being a full page it is always one size:
+## switching tabs never resizes anything.
 
 var _tab := "profile"
 var _pane: VBoxContainer
@@ -204,14 +205,27 @@ func _debug_pane() -> void:
 	server.text_changed.connect(func(t): Settings.server_url = t)
 	server.text_submitted.connect(func(_t): server.release_focus())
 	_pane.add_child(server)
+	# Arming Debug mode puts a "Go offline" button on networked tables. It lives
+	# on the table, not here — this page is never open while a table plays.
+	_debug_choice("Debug mode", [["On", true], ["Off", false]], "debug_mode",
+			"Shows a \"Go offline\" button on networked tables.")
+	# The vs Bots tools only appear once Debug mode is armed; they take effect
+	# from the next table.
+	if not Settings.debug_mode:
+		return
+	_debug_choice("Autoplay", [["On", true], ["Off", false]], "debug_autoplay",
+			"Plays your bids and cards on vs Bots tables. Next round still waits for you.")
+	_debug_choice("Play speed", [["Normal", "normal"], ["Fast", "fast"], ["Very fast", "very_fast"]],
+			"debug_play_speed", "Runs vs Bots tables 2× or 4× faster.")
+
+
+## A centred debug option: its title, the chips, and a line on what it does.
+func _debug_choice(title: String, options: Array, key: String, note: String) -> void:
 	_pane.add_child(UI.gap(18))
-	_pane.add_child(_label("Debug mode"))
+	_pane.add_child(_label(title))
 	_pane.add_child(UI.gap(10))
-	var chips := UI.choices([["On", true], ["Off", false]], Settings.debug_mode, func(v): _pick("debug_mode", v), 8)
+	var chips := UI.choices(options, Settings.get(key), func(v): _pick(key, v), 8)
 	chips.alignment = BoxContainer.ALIGNMENT_CENTER
 	_pane.add_child(chips)
 	_pane.add_child(UI.gap(10))
-	# Arming Debug mode puts a "Go offline" button on networked tables. It lives
-	# on the table, not here — this page is never open while a table plays.
-	_pane.add_child(UI.paragraph("Shows a \"Go offline\" button on networked tables.", 11, Tokens.TEXT_MUTED, "medium",
-			HORIZONTAL_ALIGNMENT_CENTER))
+	_pane.add_child(UI.paragraph(note, 11, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_CENTER))

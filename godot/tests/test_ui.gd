@@ -98,6 +98,49 @@ func test_sheets_open_and_close() -> void:
 	app.queue_free()
 
 
+func test_debug_autoplay_and_play_speed_on_a_bots_table() -> void:
+	await _start_app()
+	# Both tools sit in Settings → Debug, shown only once Debug mode is on.
+	var settings := SettingsScreen.new()
+	app.push(settings)
+	settings._select_tab("debug")
+	await _frames(1)
+	var texts := func(): return settings._pane.find_children("*", "Label", true, false).map(func(l): return l.text)
+	expect_true(not texts.call().has("Autoplay"), "hidden while Debug mode is off")
+	settings._pick("debug_mode", true)
+	expect_true(texts.call().has("Autoplay") and texts.call().has("Play speed"), "shown once it is on")
+	settings._pick("debug_autoplay", true)
+	settings._pick("debug_play_speed", "very_fast")
+	app.pop()
+	await _frames(2)
+
+	# The player's hand plays itself at 4x, then the scoreboard waits for a tap.
+	var session := LocalSession.new("Tester", "normal", 3, 0.02, 11)
+	session.autoplay_self = Settings.solo_autoplay()
+	var table := TableScreen.new(session)
+	app.push(table)
+	await _frames(1)
+	expect_eq(Engine.time_scale, 4.0, "a bots table runs very fast")
+	expect_true(await wait_until(func(): return session.view.phase == GameView.HAND_OVER, 20.0), "the hand plays itself")
+	await _frames(3)
+	expect_eq(table._overlay.find_children("*", "Scoreboard", true, false).size(), 1, "the scoreboard waits")
+	var gone: WeakRef = weakref(table)
+	app.pop()
+	expect_true(await wait_until(func(): return gone.get_ref() == null, 3.0), "left the table")
+	expect_eq(Engine.time_scale, 1.0, "real time again off the table")
+
+	var lan := LanHostSession.new("Host", "LMNP", "normal", 3, 0.02)
+	app.push(TableScreen.new(lan))
+	await _frames(2)
+	expect_eq(Engine.time_scale, 1.0, "a LAN table keeps real time")
+	app.pop()
+	await _frames(2)
+	Settings.debug_mode = false
+	Settings.debug_autoplay = false
+	Settings.debug_play_speed = "normal"
+	app.queue_free()
+
+
 ## Window shapes in design pixels: a phone either way up (a 16:9 one too),
 ## then a desktop window tiled tall, widened just past square, and full screen.
 const SHAPES := [Vector2i(390, 844), Vector2i(844, 390), Vector2i(693, 390), Vector2i(673, 754), Vector2i(897, 754),

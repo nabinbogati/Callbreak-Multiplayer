@@ -5,6 +5,10 @@ extends HostedSession
 ## the player. Nobody is kept to a clock — a game against bots is never
 ## hurried.
 
+## Debug tool: the bots' brain plays the player's seat too, bids and cards
+## alike. The scoreboard still waits for the player.
+var autoplay_self := false
+
 
 func _init(name_in := "You", difficulty_in := "normal", hands := Rules.HANDS_PER_GAME,
 		scale := 1.0, seed_in := -1) -> void:
@@ -31,3 +35,9 @@ func _bot_name(seat: int, _bot_index: int) -> String:
 ## Scaled like the dealing animation itself.
 func _deal_grace() -> float:
 	return DEAL_GRACE * animation_scale
+
+
+## The player's own seat is played like a bot's while [member autoplay_self]
+## is on. Kept apart from a timed-out seat's autoplay, which a tap cancels.
+func _is_server_driven(seat: int) -> bool:
+	return (seat == HOST_SEAT and autoplay_self) or super(seat)

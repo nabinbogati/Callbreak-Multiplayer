@@ -15,6 +15,9 @@ const DEFAULT_SERVER_URL := "ws://192.168.1.133:8080/ws"
 const PATH := "user://settings.cfg"
 
 const ANIMATION_SCALE := {"slow": 1.6, "normal": 1.0, "fast": 0.6}
+## How many times faster than real time a vs Bots table runs, per debug play
+## speed.
+const PLAY_SPEED := {"normal": 1.0, "fast": 2.0, "very_fast": 4.0}
 
 var identity: IdentityStore
 
@@ -73,6 +76,14 @@ var animation_speed := "normal":
 ## Arms the debug "Go offline" tooling. Debug builds only.
 var debug_mode := false:
 	set(v): debug_mode = v; _changed("debug_mode", v)
+## Debug tool: the bots' brain plays the player's own bids and cards on a
+## vs Bots table. See [method solo_autoplay].
+var debug_autoplay := false:
+	set(v): debug_autoplay = v; _changed("debug_autoplay", v)
+## Debug tool: normal / fast / very_fast — how fast a vs Bots table's whole
+## clock runs. See [method solo_time_scale].
+var debug_play_speed := "normal":
+	set(v): debug_play_speed = v; _changed("debug_play_speed", v)
 
 var _loading := false
 
@@ -91,6 +102,18 @@ func use_memory_storage() -> void:
 
 func animation_scale() -> float:
 	return ANIMATION_SCALE.get(animation_speed, 1.0)
+
+
+## Whether a vs Bots table plays the player's seat for them: debug builds with
+## Debug mode armed only.
+func solo_autoplay() -> bool:
+	return OS.is_debug_build() and debug_mode and debug_autoplay
+
+
+## [constant Engine.time_scale] for a vs Bots table: above 1 only in debug
+## builds with Debug mode armed.
+func solo_time_scale() -> float:
+	return PLAY_SPEED.get(debug_play_speed, 1.0) if OS.is_debug_build() and debug_mode else 1.0
 
 
 ## The server the app should actually connect to: the debug override when
