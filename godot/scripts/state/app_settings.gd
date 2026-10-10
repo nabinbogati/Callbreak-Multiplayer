@@ -69,6 +69,11 @@ var haptics_enabled := true:
 ## toward the table always plays it straight away either way.
 var tap_twice_to_play := false:
 	set(v): tap_twice_to_play = v; _changed("tap_twice_to_play", v)
+## Whether the game is played on a felt table. Off, the seats stand at the
+## screen's edges and the played cards gather on its centre, with no table
+## drawn.
+var show_table := true:
+	set(v): show_table = v; _changed("show_table", v)
 ## slow / normal / fast — scales every transient animation and the table's own
 ## pacing timers.
 var animation_speed := "normal":

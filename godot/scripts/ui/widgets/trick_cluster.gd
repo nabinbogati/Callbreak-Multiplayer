@@ -25,6 +25,12 @@ signal throw_refused(card: String)
 ## How long a thrown card may wait, landed, for the table to confirm it before
 ## it is treated as refused.
 const CONFIRM_TIMEOUT := 2.5
+## How far each card rests from the centre toward its player, in card widths
+## sideways and card heights up and down: just far enough that no card covers
+## another.
+const SPREAD := Vector2(1.02, 0.54)
+## The largest resting tilt either way, in radians.
+const MAX_TILT := 0.08
 
 var card_width := 44.0
 ## card id → _Thrown
@@ -48,10 +54,18 @@ func card_height() -> float:
 	return card_width * CardView.FACE_ASPECT
 
 
+## Half the size of the four cards at rest, tilts included, for cards
+## [param width] wide: everything the table keeps clear of its centre.
+static func half_extent(width: float) -> Vector2:
+	var h := width * CardView.FACE_ASPECT
+	var tilt := Vector2(h, width) / 2.0 * sin(MAX_TILT)
+	return Vector2(width * SPREAD.x, h * SPREAD.y) + Vector2(width, h) / 2.0 + tilt
+
+
 ## Where a card thrown from [param slot] comes to rest (its centre).
 func rest_for(slot: int) -> Vector2:
-	var dx := card_width * 1.02
-	var dy := card_height() * 0.54
+	var dx := card_width * SPREAD.x
+	var dy := card_height() * SPREAD.y
 	match slot:
 		SeatView.Slot.BOTTOM: return _rest_center + Vector2(0, dy)
 		SeatView.Slot.LEFT: return _rest_center + Vector2(-dx, 0)
@@ -65,7 +79,7 @@ static func rest_angle(card: String) -> float:
 	var h := 0
 	for i in card.length():
 		h = (h * 31 + card.unicode_at(i)) & 0x7fffffff
-	return ((h % 1000) / 1000.0 - 0.5) * 0.16
+	return ((h % 1000) / 1000.0 - 0.5) * MAX_TILT * 2.0
 
 
 static func _spin_for(slot: int) -> float:

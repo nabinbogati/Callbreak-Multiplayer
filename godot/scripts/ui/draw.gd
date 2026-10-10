@@ -51,62 +51,226 @@ static func stroke_rid(item: RID, points: PackedVector2Array, closed: bool, colo
 	_strip(item, points, closed, colors, width, device_px(), false)
 
 
-## Builds the triangle strip behind [method stroke] and [method fringe]: four
-## rails per point — clear, solid, solid, clear — offset along the miter. As a
-## fringe the strip runs from the outline outward only.
+## Builds the triangle strip behind [method stroke] and [method fringe] (see
+## [method Batch.strip]) and draws it at once.
 static func _strip(item: RID, points: PackedVector2Array, closed: bool, colors: PackedColorArray, width: float,
 		f: float, outer_only: bool) -> void:
-	var n := points.size()
-	if n < 2:
-		return
-	var alpha_k := 1.0
-	var half := width / 2.0
-	if not outer_only and width < f:
-		alpha_k = width / f
-		half = f / 2.0
-	var core := maxf(half - f / 2.0, 0.0)
-	var reach := half + f / 2.0
-	# Which way is "outside": a fringe hugs a clockwise or anticlockwise loop.
-	var sign := 1.0
-	if outer_only:
-		var area := 0.0
+	var batch := Batch.new()
+	batch.strip(points, closed, colors, width, f, outer_only)
+	batch.flush_rid(item)
+
+
+## Untextured shapes gathered into one triangle array, stacked in the order
+## they are added. The Compatibility renderer gives every polygon, stroke and
+## fringe its own draw call, so a card built from a dozen of them costs a dozen
+## on a phone's GPU driver; gathered, it costs one.
+class Batch:
+	extends RefCounted
+
+	## Applied to every point added from here on: draw several cards, each
+	## turned and placed, into one batch.
+	var transform := Transform2D.IDENTITY
+	var _verts := PackedVector2Array()
+	var _colors := PackedColorArray()
+	var _idx := PackedInt32Array()
+
+	## [method Draw.fill]: a polygon with a one-device-pixel antialiased edge.
+	func fill(points: PackedVector2Array, color: Color) -> void:
+		fill_colors(points, PackedColorArray([color]))
+
+	## [method fill] with one colour per point.
+	func fill_colors(points: PackedVector2Array, colors: PackedColorArray) -> void:
+		polygon(points, colors)
+		strip(points, true, colors, 0.0, Draw.device_px(), true)
+
+	## A polygon with no antialiased edge, one colour or one per point.
+	func polygon(points: PackedVector2Array, colors: PackedColorArray) -> void:
+		var pts := transform * points
+		var tri := Geometry2D.triangulate_polygon(pts)
+		if tri.is_empty():
+			return
+		var base := _verts.size()
+		_verts.append_array(pts)
+		for i in pts.size():
+			_colors.append(colors[i] if colors.size() > 1 else colors[0])
+		for i in tri:
+			_idx.append(base + i)
+
+	## [method Draw.fill_linear] in flat colours: the polygon is cut along each
+	## inner stop's line so that every piece is a straight blend between two
+	## stops, which per-vertex colour reproduces exactly — no gradient texture,
+	## so it gathers with everything else. The cut points go into the outline
+	## too, so the pieces and the antialiased rim share every vertex and leave
+	## no seam.
+	func fill_linear(points: PackedVector2Array, from: Vector2, to: Vector2, stops: Array, offsets: Array = [],
+			rim := true) -> void:
+		var d := to - from
+		var len2 := maxf(d.length_squared(), 0.0001)
+		var along := d / sqrt(len2)
+		var offs := offsets.duplicate()
+		if offs.is_empty():
+			for i in stops.size():
+				offs.append(float(i) / maxf(stops.size() - 1, 1))
+		var cuts: Array[Vector2] = []
+		for k in range(1, stops.size() - 1):
+			cuts.append(from + d * float(offs[k]))
+		var outline := points
+		for at in cuts:
+			outline = _with_crossings(outline, at, along)
+		var pieces: Array[PackedVector2Array] = [outline]
+		for at in cuts:
+			var next: Array[PackedVector2Array] = []
+			for piece in pieces:
+				next.append_array(_split(piece, at, along))
+			pieces = next
+		for piece in pieces:
+			polygon(piece, _gradient_colors(piece, from, d, len2, stops, offsets))
+		if rim:
+			strip(outline, true, _gradient_colors(outline, from, d, len2, stops, offsets), 0.0, Draw.device_px(), true)
+
+	static func _gradient_colors(points: PackedVector2Array, from: Vector2, d: Vector2, len2: float, stops: Array,
+			offsets: Array) -> PackedColorArray:
+		var colors := PackedColorArray()
+		for p in points:
+			colors.append(Draw.sample(stops, clampf((p - from).dot(d) / len2, 0.0, 1.0), offsets))
+		return colors
+
+	## How far [param p] lies past the line through [param at] square to
+	## [param along], with points a hair from it counted as on it.
+	static func _side(p: Vector2, at: Vector2, along: Vector2) -> float:
+		var s := (p - at).dot(along)
+		return 0.0 if absf(s) < 1e-4 else s
+
+	## [param points] with a point added wherever an edge crosses the line.
+	static func _with_crossings(points: PackedVector2Array, at: Vector2, along: Vector2) -> PackedVector2Array:
+		var out := PackedVector2Array()
+		var n := points.size()
 		for i in n:
 			var a := points[i]
 			var b := points[(i + 1) % n]
-			area += a.x * b.y - b.x * a.y
-		sign = -1.0 if area > 0.0 else 1.0
-	var verts := PackedVector2Array()
-	var cols := PackedColorArray()
-	var idx := PackedInt32Array()
-	var count := n if closed else n
-	for i in count:
-		var p := points[i]
-		var prev := points[(i - 1 + n) % n] if (closed or i > 0) else p
-		var next := points[(i + 1) % n] if (closed or i < n - 1) else p
-		var d1 := (p - prev).normalized() if p != prev else (next - p).normalized()
-		var d2 := (next - p).normalized() if next != p else d1
-		var n1 := Vector2(-d1.y, d1.x)
-		var tangent := (d1 + d2)
-		var normal := Vector2(-tangent.y, tangent.x).normalized() if tangent.length_squared() > 1e-8 else n1
-		var miter := 1.0 / maxf(normal.dot(n1), 0.35)
-		var nn := normal * miter * sign
-		var c := colors[i] if colors.size() > 1 else colors[0]
-		var solid := Color(c, c.a * alpha_k)
-		var clear := Color(c, 0.0)
+			out.append(a)
+			var sa := _side(a, at, along)
+			var sb := _side(b, at, along)
+			if sa * sb < 0.0:
+				out.append(a + (b - a) * (sa / (sa - sb)))
+		return out
+
+	## A polygon whose crossings are already among its points, parted along the
+	## line: the points on each side, those on the line in both. A line that
+	## enters and leaves more than once would part it into several shapes; that
+	## one is left whole.
+	static func _split(points: PackedVector2Array, at: Vector2, along: Vector2) -> Array[PackedVector2Array]:
+		var before := PackedVector2Array()
+		var after := PackedVector2Array()
+		var changes := 0
+		var last := 0.0
+		for p in points:
+			var s := _side(p, at, along)
+			if s <= 0.0:
+				before.append(p)
+			if s >= 0.0:
+				after.append(p)
+			if s != 0.0:
+				if last != 0.0 and signf(s) != signf(last):
+					changes += 1
+				last = s
+		var out: Array[PackedVector2Array] = []
+		if changes > 2:
+			out.append(points)
+			return out
+		for side in [before, after]:
+			if side.size() >= 3:
+				out.append(side)
+		return out
+
+	## [method Draw.stroke].
+	func stroke(points: PackedVector2Array, closed: bool, color: Color, width: float) -> void:
+		strip(points, closed, PackedColorArray([color]), width, Draw.device_px(), false)
+
+	## [method Draw.stroke_rounded_rect].
+	func stroke_rounded_rect(rect: Rect2, radius: float, color: Color, width: float) -> void:
+		if color.a <= 0.0 or width <= 0.0:
+			return
+		stroke(Draw.rounded_rect_points(rect.grow(-width / 2.0), maxf(radius - width / 2.0, 0.0), 8), true, color,
+				width)
+
+	## [method Draw.suit].
+	func suit(suit_value: int, center: Vector2, size: float, color: Color) -> void:
+		var box := Vector2(size * Draw.suit_aspect(suit_value), size)
+		var origin := center - box / 2.0
+		for poly in Draw.suit_polygons(suit_value):
+			var pts := PackedVector2Array()
+			pts.resize(poly.size())
+			for i in poly.size():
+				pts[i] = origin + poly[i] * box
+			fill(pts, color)
+
+	## The triangle strip behind strokes and fringes: four rails per point —
+	## clear, solid, solid, clear — offset along the miter. As a fringe the
+	## strip runs from the outline outward only. [param f] is the feather, one
+	## device pixel.
+	func strip(points: PackedVector2Array, closed: bool, colors: PackedColorArray, width: float, f: float,
+			outer_only: bool) -> void:
+		points = transform * points
+		var n := points.size()
+		if n < 2:
+			return
+		var alpha_k := 1.0
+		var half := width / 2.0
+		if not outer_only and width < f:
+			alpha_k = width / f
+			half = f / 2.0
+		var core := maxf(half - f / 2.0, 0.0)
+		var reach := half + f / 2.0
+		# Which way is "outside": a fringe hugs a clockwise or anticlockwise loop.
+		var sign := 1.0
 		if outer_only:
-			verts.append_array([p, p + nn * f])
-			cols.append_array([solid, clear])
-		else:
-			verts.append_array([p + nn * reach, p + nn * core, p - nn * core, p - nn * reach])
-			cols.append_array([clear, solid, solid, clear])
-	var rails := 2 if outer_only else 4
-	var segments := n if closed else n - 1
-	for i in segments:
-		var a := i * rails
-		var b := ((i + 1) % n) * rails
-		for r in rails - 1:
-			idx.append_array([a + r, b + r, b + r + 1, a + r, b + r + 1, a + r + 1])
-	RenderingServer.canvas_item_add_triangle_array(item, idx, verts, cols)
+			var area := 0.0
+			for i in n:
+				var a := points[i]
+				var b := points[(i + 1) % n]
+				area += a.x * b.y - b.x * a.y
+			sign = -1.0 if area > 0.0 else 1.0
+		var base := _verts.size()
+		for i in n:
+			var p := points[i]
+			var prev := points[(i - 1 + n) % n] if (closed or i > 0) else p
+			var next := points[(i + 1) % n] if (closed or i < n - 1) else p
+			var d1 := (p - prev).normalized() if p != prev else (next - p).normalized()
+			var d2 := (next - p).normalized() if next != p else d1
+			var n1 := Vector2(-d1.y, d1.x)
+			var tangent := (d1 + d2)
+			var normal := Vector2(-tangent.y, tangent.x).normalized() if tangent.length_squared() > 1e-8 else n1
+			var miter := 1.0 / maxf(normal.dot(n1), 0.35)
+			var nn := normal * miter * sign
+			var c := colors[i] if colors.size() > 1 else colors[0]
+			var solid := Color(c, c.a * alpha_k)
+			var clear := Color(c, 0.0)
+			if outer_only:
+				_verts.append_array([p, p + nn * f])
+				_colors.append_array([solid, clear])
+			else:
+				_verts.append_array([p + nn * reach, p + nn * core, p - nn * core, p - nn * reach])
+				_colors.append_array([clear, solid, solid, clear])
+		var rails := 2 if outer_only else 4
+		var segments := n if closed else n - 1
+		for i in segments:
+			var a := base + i * rails
+			var b := base + ((i + 1) % n) * rails
+			for r in rails - 1:
+				_idx.append_array([a + r, b + r, b + r + 1, a + r, b + r + 1, a + r + 1])
+
+	## Draws everything gathered so far into [param ci] in one call, and starts
+	## afresh.
+	func flush(ci: CanvasItem) -> void:
+		flush_rid(ci.get_canvas_item())
+
+	func flush_rid(item: RID) -> void:
+		if not _idx.is_empty():
+			RenderingServer.canvas_item_add_triangle_array(item, _idx, _verts, _colors)
+		_verts = PackedVector2Array()
+		_colors = PackedColorArray()
+		_idx = PackedInt32Array()
 
 
 ## A filled circle with an antialiased edge.

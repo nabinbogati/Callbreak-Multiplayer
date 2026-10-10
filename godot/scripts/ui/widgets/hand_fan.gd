@@ -31,6 +31,8 @@ signal not_your_turn
 
 ## Room above the resting cards for the playable ones to rise into.
 const LIFT := 16.0
+## How far the playable cards rise on the player's turn.
+const RAISE := 14.0
 ## How far a finger travels before a press becomes a slide or a drag.
 const TOUCH_SLOP := 18.0
 const FLING_SPEED := 850.0
@@ -220,7 +222,7 @@ func _visual_for(i: int) -> Array:
 	var scale := 1.0
 	var elevation := 0.0
 	if interactive and legal:
-		top -= 14
+		top -= RAISE
 	if interactive and not legal and not _legal.is_empty():
 		top += 4
 	if id == _armed and not selected:
