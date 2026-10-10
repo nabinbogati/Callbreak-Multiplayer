@@ -13,6 +13,9 @@ extends Control
 
 ## How long a line of help above the hand stays up.
 const HINT_TIME := 2.2
+## How much of the player's own plate the resting hand reaches down over, as
+## a share of the plate's height.
+const PLATE_OVERLAP := 0.3
 
 var session: GameSession
 
@@ -83,9 +86,11 @@ func _ready() -> void:
 	_hand.card_thrown.connect(_on_card_thrown)
 	_hand.illegal.connect(_on_illegal)
 	_hand.not_your_turn.connect(func(): _show_hint(HintLine.waiting()))
+	# The hint goes under the hand, so a card raised to preview is never hidden
+	# behind it.
+	_body.add_child(_hint)
 	_body.add_child(_hand)
 	_make_plate()
-	_body.add_child(_hint)
 	_trick.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_trick.throw_refused.connect(func(_card): _refresh())
 	_body.add_child(_trick)
@@ -115,13 +120,15 @@ func _ready() -> void:
 	_on_session_changed()
 
 
-## The player's own plate: across in portrait, between the table and the
-## hand; stacked in landscape, standing at the left edge level with the hand.
+## The player's own plate, running across the bottom edge under the hand in
+## either orientation. Rebuilt on rotation, since its sizes are per
+## orientation. Drawn over the hand: the cards' corner indices clear it, and
+## the avatar's turn clock stays whole.
 func _make_plate() -> void:
 	_built_portrait = int(UI.portrait)
 	if _seats.has(SeatView.Slot.BOTTOM):
 		_seats[SeatView.Slot.BOTTOM].queue_free()
-	var plate := SeatView.new(SeatView.Slot.BOTTOM, 0 if UI.portrait else 1)
+	var plate := SeatView.new(SeatView.Slot.BOTTOM)
 	plate.visible = false
 	_seats[SeatView.Slot.BOTTOM] = plate
 	_body.add_child(plate)
@@ -232,22 +239,15 @@ func _layout() -> void:
 	var plate: SeatView = _seats[SeatView.Slot.BOTTOM]
 	plate.reset_size()
 	var ps := plate.get_combined_minimum_size()
-	var hand_area_h := ps.y + 2.0 + fan_h if UI.portrait else fan_h
-	var hand_top := area.y - pad.w - hand_area_h
-	if UI.portrait:
-		# The player's own plate sits between the table and the hand, never on
-		# top of the cards.
-		plate.position = Vector2((area.x - ps.x) / 2.0, hand_top)
-		_hand.position = Vector2(pad.x, hand_top + ps.y + 2.0)
-		_hand.size = Vector2(width, fan_h)
-		_hint.anchor_center = Vector2(area.x / 2.0, hand_top - 40)
-	else:
-		const SIDE := 104.0
-		plate.position = Vector2(pad.x, area.y - pad.w - 2.0 - ps.y)
-		_hand.position = Vector2(pad.x + SIDE, hand_top)
-		_hand.size = Vector2(width - SIDE * 2.0, fan_h)
-		_hint.anchor_center = Vector2(area.x / 2.0, hand_top - 30)
+	# The player's own plate runs along the bottom edge, centred, and the
+	# resting hand reaches down over the top of it.
+	var plate_top := area.y - pad.w - ps.y
+	plate.position = Vector2((area.x - ps.x) / 2.0, plate_top)
 	plate.size = ps
+	var hand_top := plate_top + ps.y * PLATE_OVERLAP - HandFan.LIFT - _hand.card_height()
+	_hand.position = Vector2(pad.x, hand_top)
+	_hand.size = Vector2(width, fan_h)
+	_hint.anchor_center = Vector2(area.x / 2.0, hand_top - UI.sc(50, 30))
 	_hint.reposition()
 
 	var box := Vector2(width, maxf(hand_top - UI.sc(4, 0) - top, 40))

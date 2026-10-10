@@ -30,13 +30,13 @@ static func slot_for(seat: int, viewer: int) -> int:
 	return (seat - maxi(viewer, 0) + 4) % 4
 
 
-## [param vertical_layout] stacks the plates above and below the avatar; by
-## default the side seats stack and the top and bottom run across.
-func _init(slot_in: int, vertical_layout := -1) -> void:
+## The side seats stack their plates above and below the avatar; the top and
+## bottom run across.
+func _init(slot_in: int) -> void:
 	slot = slot_in
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_body = BoxContainer.new()
-	_body.vertical = (slot == Slot.LEFT or slot == Slot.RIGHT) if vertical_layout < 0 else vertical_layout == 1
+	_body.vertical = slot == Slot.LEFT or slot == Slot.RIGHT
 	_body.alignment = BoxContainer.ALIGNMENT_CENTER
 	_body.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_body.add_theme_constant_override("separation", int(UI.sc(5, 3) if _body.vertical else UI.sc(6, 4)))
