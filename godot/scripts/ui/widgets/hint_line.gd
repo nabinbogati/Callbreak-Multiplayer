@@ -7,6 +7,8 @@ extends Control
 
 enum Tone { TURN, REFUSED, INFO }
 
+static var _widest := Vector2.ZERO
+
 ## The hint to show — `{"text", "tone", "suit", "icon"}` — or empty for none.
 var hint := {}:
 	set(v):
@@ -45,21 +47,48 @@ static func waiting() -> Dictionary:
 
 ## Explains, from the rules, why [param card] cannot be played into the trick.
 static func illegal(view: GameView, card: String) -> Dictionary:
-	var fallback := make("That card can't be played right now", Tone.REFUSED, -1, "block_rounded")
 	var trick := view.trick
 	if trick.is_empty():
-		return fallback
+		return _cannot()
 	var led := Cards.suit(trick[0]["card"])
 	var hand := view.hand
 	if hand.any(func(c): return Cards.suit(c) == led):
-		if Cards.suit(card) != led:
-			return make("Follow suit — play a %s" % _one(led), Tone.REFUSED, led)
-		return make("Beat the trick — play a higher %s" % _one(led), Tone.REFUSED, led)
+		return _follow(led) if Cards.suit(card) != led else _beat(led)
 	if hand.any(func(c): return Cards.is_trump(c)):
 		var trumped := trick.any(func(p): return Cards.is_trump(p["card"]))
-		return make("Overtrump — play a higher spade" if trumped else "No %ss left — you must play a spade" % _one(led),
-				Tone.REFUSED, Cards.Suit.SPADES)
-	return fallback
+		return _overtrump() if trumped else _must_trump(led)
+	return _cannot()
+
+
+static func _cannot() -> Dictionary:
+	return make("That card can't be played right now", Tone.REFUSED, -1, "block_rounded")
+
+
+static func _follow(led: int) -> Dictionary:
+	return make("Follow suit — play a %s" % _one(led), Tone.REFUSED, led)
+
+
+static func _beat(led: int) -> Dictionary:
+	return make("Beat the trick — play a higher %s" % _one(led), Tone.REFUSED, led)
+
+
+static func _overtrump() -> Dictionary:
+	return make("Overtrump — play a higher spade", Tone.REFUSED, Cards.Suit.SPADES)
+
+
+static func _must_trump(led: int) -> Dictionary:
+	return make("No %ss left — you must play a spade" % _one(led), Tone.REFUSED, Cards.Suit.SPADES)
+
+
+## The largest pill any hint can need, so the table can keep room for it.
+static func widest_size() -> Vector2:
+	if _widest == Vector2.ZERO:
+		var all := [your_turn_hint(), waiting(), _cannot(), _overtrump()]
+		for suit in 4:
+			all.append_array([_follow(suit), _beat(suit), _must_trump(suit)])
+		for h in all:
+			_widest = _widest.max(_pill_size(h))
+	return _widest
 
 
 static func _one(suit: int) -> String:

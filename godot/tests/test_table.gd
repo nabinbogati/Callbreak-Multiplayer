@@ -308,3 +308,150 @@ func test_the_trick_sequence_fits_the_host_linger_at_every_speed() -> void:
 
 func test_the_deal_animation_fits_before_bidding_opens() -> void:
 	expect_true(GameSession.DEAL_GRACE >= Motion.DEAL_TOTAL, "the grace covers the whole deal")
+
+
+# ---------------------------------------------------------- every screen
+
+## Phones and tablets, in dp: a fold's cover screen, small and tall phones, a
+## 7" tablet, an open fold, an iPad mini and a 12.9" iPad Pro.
+const DEVICES := [Vector2(280, 653), Vector2(320, 568), Vector2(360, 640), Vector2(360, 800), Vector2(390, 844),
+		Vector2(412, 915), Vector2(600, 960), Vector2(673, 841), Vector2(768, 1024), Vector2(1024, 1366)]
+const FULL_HAND: Array[String] = ["AS", "10S", "8S", "5S", "AH", "KH", "QH", "3H", "AD", "4D", "9C", "8C", "2C"]
+const FULL_TRICK := [{"seat": 1, "card": "KS"}, {"seat": 2, "card": "3S"}, {"seat": 3, "card": "QS"},
+		{"seat": 0, "card": "JS"}]
+
+
+## [param dp] in design pixels, the way [App] sizes the screen.
+static func _design(dp: Vector2) -> Vector2i:
+	var m := clampf(minf(dp.x, dp.y) / App.DESIGN_SHORT_SIDE, App.MIN_SCALE, App.MAX_SCALE)
+	return Vector2i((dp / m).round())
+
+
+## A table mid-hand: long names, double-figure scores and a dealer's badge.
+static func _busy_view(hand: Array[String], trick: Array, turn: int) -> GameView:
+	var v := _view(hand, trick, turn)
+	v.players = [GameView.make_player(0, "Nabin", "human"), GameView.make_player(1, "Bishnu Prasad", "human"),
+			GameView.make_player(2, "Kamal", "bot"), GameView.make_player(3, "Sita", "bot")]
+	v.hand_counts.assign([hand.size(), 12, 12, 12])
+	v.bids.assign([4, 3, 12, 2])
+	v.tricks_won.assign([2, 1, 10, 0])
+	return v
+
+
+## Every phone and tablet either way up, with a full hand and a full trick:
+## nothing at the table touches anything it must not or leaves the screen, the
+## played cards gather on the felt's centre, and a larger screen draws the
+## whole table larger.
+func test_the_table_fits_every_screen() -> void:
+	_before()
+	var root := get_tree().root
+	var headless := [root.size, root.content_scale_size]
+	var app: App = load("res://scenes/main.tscn").instantiate()
+	add_child(app)
+	await _frames(2)
+	var after_mine: Array[String] = FULL_HAND.filter(func(c): return c != "10S")
+	var session := ServerLike.new(_busy_view(FULL_HAND, FULL_TRICK.slice(0, 3), 0))
+	var table := TableScreen.new(session)
+	app.push(table)
+	await _seconds(0.4)
+	var scales := {}
+	for dp in DEVICES:
+		var standing := _design(dp)
+		for shape in [standing, Vector2i(standing.y, standing.x)]:
+			root.size = shape
+			root.content_scale_size = shape
+			# The player's turn, with the widest thing the hint ever says.
+			session.confirm(_busy_view(FULL_HAND, FULL_TRICK.slice(0, 3), 0))
+			table._hint.hint = HintLine._beat(Cards.Suit.DIAMONDS)
+			await _seconds(0.5)
+			_expect_clear(table, "%s on the player's turn" % shape)
+			session.confirm(_busy_view(after_mine, FULL_TRICK, 1))
+			table._hint.hint = {}
+			await _seconds(0.6)
+			_expect_clear(table, "%s with a full trick" % shape)
+			var trick := _bounds(_items(table).filter(func(it): return it[0] == "trick"))
+			var felt := table._felt.get_global_rect()
+			expect_near(trick.get_center().distance_to(felt.get_center()), 0.0, 2.0,
+					"the played cards gather on the felt's centre at %s" % shape)
+			expect_true(felt.encloses(trick), "the played cards lie on the felt at %s" % shape)
+			expect_eq(table._body.scale.x, table._body.scale.y, "one scale for the whole table at %s" % shape)
+			scales[shape] = table._body.scale.x
+	# A phone draws it at (or, for the longest name, all but at) its design size.
+	expect_true(scales[Vector2i(390, 844)] >= 0.99 and scales[Vector2i(390, 844)] <= 1.0,
+			"a phone draws the table at its design size, got %s" % scales[Vector2i(390, 844)])
+	expect_near(scales[Vector2i(844, 390)], 1.0, 0.001, "and on its side")
+	var ipad := _design(Vector2(1024, 1366))
+	expect_true(scales[ipad] > 1.2 and scales[Vector2i(ipad.y, ipad.x)] > 1.2, "a tablet draws it larger")
+	root.size = headless[0]
+	root.content_scale_size = headless[1]
+	app.queue_free()
+	await _frames(1)
+
+
+## Nothing on screen leaves it, and nothing touches anything of anyone else's.
+## The player's hand reaching over their own plate is the one overlap meant.
+func _expect_clear(table: TableScreen, what: String) -> void:
+	var items := _items(table)
+	var view := table.get_viewport_rect().grow(0.5)
+	for it in items:
+		expect_true(view.encloses(it[2]), "%s:%s on screen at %s: %s" % [it[0], it[1], what, it[2]])
+	for i in items.size():
+		for j in range(i + 1, items.size()):
+			var a: Array = items[i]
+			var b: Array = items[j]
+			if a[0] == b[0] or ([a[0], b[0]] as Array).has("hand") and ([a[0], b[0]] as Array).has("plate"):
+				continue
+			var shared: Rect2 = a[2].intersection(b[2])
+			expect_true(shared.size.x <= 1.5 or shared.size.y <= 1.5,
+					"%s:%s clear of %s:%s at %s" % [a[0], a[1], b[0], b[1], what])
+
+
+## Everything at the table that stays put through a trick, as
+## `[owner, part, screen rect]`.
+func _items(table: TableScreen) -> Array:
+	var items := []
+	var names := ["back", "tune", "spacer", "trump", "round"]
+	for i in table._hud.get_child_count():
+		if names[i] != "spacer":
+			items.append(["hud", names[i], (table._hud.get_child(i) as Control).get_global_rect()])
+	for slot in table._seats:
+		var seat: SeatView = table._seats[slot]
+		var owner := "plate" if slot == SeatView.Slot.BOTTOM else "seat %d" % slot
+		items.append([owner, "name", seat._name_chip.get_global_rect()])
+		items.append([owner, "avatar", seat.avatar.get_global_rect()])
+		items.append([owner, "score", seat._bid_chip.get_global_rect()])
+		var fan := seat.avatar.fan_rect()
+		if fan.has_area():
+			items.append([owner, "fan", _on_screen(seat.avatar, fan)])
+	for id in table._hand._nodes:
+		var card: CardView = table._hand._nodes[id]
+		if card.visible:
+			items.append(["hand", id, _on_screen(card, Rect2(Vector2.ZERO, card.size))])
+	for id in table._trick._cards:
+		var card: CardView = table._trick._cards[id].node
+		items.append(["trick", id, _on_screen(card, Rect2(Vector2.ZERO, card.size))])
+	if not table._hint.shown_text().is_empty():
+		items.append(["hint", table._hint.shown_text(), table._hint.get_global_rect()])
+	return items
+
+
+## [param local] in [param node]'s coordinates, turned and scaled onto the
+## screen: the box around it.
+static func _on_screen(node: CanvasItem, local: Rect2) -> Rect2:
+	var xf := node.get_global_transform()
+	return _bounds_of([xf * local.position, xf * Vector2(local.end.x, local.position.y), xf * local.end,
+			xf * Vector2(local.position.x, local.end.y)])
+
+
+static func _bounds_of(points: Array) -> Rect2:
+	var out := Rect2(points[0], Vector2.ZERO)
+	for p in points:
+		out = out.expand(p)
+	return out
+
+
+static func _bounds(items: Array) -> Rect2:
+	var out: Rect2 = items[0][2]
+	for it in items:
+		out = out.merge(it[2])
+	return out

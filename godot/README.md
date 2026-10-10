@@ -36,7 +36,7 @@ test also fails that test. `TEST_FILTER=lan` runs only the matching tests.
 | `test_sessions.gd` | A whole solo game through the real timers. A LAN host and guest playing a full game over a loopback socket. Timeout to autoplay and back. Bots holding their bids until the deal is down, on the solo and LAN tables. LAN discovery over UDP. Identity and uuid. |
 | `test_server_e2e.gd` | Against the real Go server: create a private room, join, deal, play, drop the connection and reclaim the same seat, and check that server error messages reach the player. Skipped unless `E2E_SERVER_URL` is set. |
 | `test_ui.gd` | Drives every screen of the real app shell. Plays a full game through the table screen, taps and drags cards, opens every sheet, and covers the rejoin prompt and the failure states. |
-| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, and the animation budgets: the trick sequence inside the hosts' 1100 ms linger at every speed, and the deal inside the wait before bidding opens. |
+| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, the animation budgets: the trick sequence inside the hosts' 1100 ms linger at every speed, and the deal inside the wait before bidding opens. And the table on every phone and tablet either way up: nothing touching or off screen, the played cards on the felt's centre, a larger screen drawing it larger. |
 
 End-to-end against the backend:
 
@@ -88,6 +88,8 @@ scripts/
   state/    app_settings.gd (autoload "Settings"), identity_store.gd ← lib/state
   audio/    audio_controller.gd (autoload "Audio")                 ← lib/audio
   ui/       tokens.gd, motion.gd, ui.gd, draw.gd, haptics.gd     ← lib/design
+            table_layout.gd (where everything at the table goes, and
+            the one scale it is drawn at on this screen)
             widgets/  cards, seats, hand fan, trick, deal, panels  ← lib/ui/widgets
             screens/  app (shell), home, table, settings, profile, ← lib/ui/screens
                       join/LAN/quick-settings sheets, dialogs

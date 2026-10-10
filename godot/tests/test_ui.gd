@@ -172,11 +172,13 @@ func test_layout_holds_at_every_window_shape() -> void:
 		await _resize(shape)
 		var col: Control = table._bid_panel.get_child(0).get_child(0)
 		_expect_fits(table._bid_panel, col.get_combined_minimum_size().y, "bid panel at %s" % shape)
+		# Upright standing, on its side lying down, in proportion either way.
 		var felt := table._felt.size
-		if shape.y >= shape.x:
-			expect_near(felt.y / felt.x, 1.62, 0.01, "an upright oval at %s" % shape)
-		else:
-			expect_true(felt.x / felt.y >= 1.6, "an oval on its side at %s, got %s" % [shape, felt])
+		var upright: bool = shape.y >= shape.x
+		var long: float = felt.y / felt.x if upright else felt.x / felt.y
+		var span: Vector2 = TableLayout.PORTRAIT_ASPECT if upright else TableLayout.LANDSCAPE_ASPECT
+		expect_true(long >= span.x - 0.01 and long <= span.y + 0.01, "the felt in proportion at %s, got %s" % [shape,
+				felt])
 
 	# Play the hand out and hold on its scoreboard.
 	session.changed.connect(func():
