@@ -410,7 +410,7 @@ func _expect_clear(table: TableScreen, what: String) -> void:
 ## `[owner, part, screen rect]`.
 func _items(table: TableScreen) -> Array:
 	var items := []
-	var names := ["back", "tune", "spacer", "trump", "round"]
+	var names := ["back", "tune", "spacer", "round"]
 	for i in table._hud.get_child_count():
 		if names[i] != "spacer":
 			items.append(["hud", names[i], (table._hud.get_child(i) as Control).get_global_rect()])

@@ -247,11 +247,11 @@ func _measure() -> TableLayout:
 	lay.portrait = UI.portrait
 	_hud.reset_size()
 	lay.hud_size = _hud.get_combined_minimum_size()
-	# back, tune | spacer | trump, round
+	# back, tune | spacer | round
 	var parts := _hud.get_children().map(func(c): return (c as Control).get_combined_minimum_size().x)
 	var sep := float(_hud.get_theme_constant("separation"))
 	lay.hud_left = parts[0] + sep + parts[1]
-	lay.hud_right = parts[3] + sep + parts[4]
+	lay.hud_right = parts[3]
 	var top: SeatView = _seats[SeatView.Slot.TOP]
 	lay.top_seat = top.reserved_size()
 	lay.top_reach = top.fan_reach()
@@ -303,13 +303,6 @@ func _to_body(global: Vector2) -> Vector2:
 func _build_hud() -> Control:
 	var back := _hud_button("back", handle_back)
 	var tune := _hud_button("tune", _open_quick_settings)
-	# Spades are always trump — said once, quietly, where it can be checked at
-	# a glance.
-	var trump := UI.glass_pill(UI.hbox(5, [UI.suit_glyph(Cards.Suit.SPADES, 14, Tokens.GOLD),
-			UI.label("Trump", 11, Tokens.GOLD, "semibold")]), Callable(), 14, Vector4(10, 7, 10, 7),
-			Color(Tokens.GOLD_BORDER, 0.3))
-	trump.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	trump.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	_round_label = UI.label("Round 1 / 5", 12, Tokens.GOLD, "bold", HORIZONTAL_ALIGNMENT_RIGHT)
 	_progress_label = UI.label("", 10, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_RIGHT)
 	var lines := UI.vbox(0, [_round_label, _progress_label])
@@ -319,7 +312,7 @@ func _build_hud() -> Control:
 	_round_pill = UI.glass_pill(UI.hbox(4, [lines, chart]), _toggle_history, 14, Vector4(UI.sc(12, 14), 5, UI.sc(12, 14), 5),
 			Color(Tokens.GOLD_BORDER, 0.45))
 	_round_pill.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	var row := UI.hbox(8, [back, tune, UI.spacer(), trump, _round_pill])
+	var row := UI.hbox(8, [back, tune, UI.spacer(), _round_pill])
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	return row
 
