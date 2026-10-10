@@ -14,6 +14,8 @@ signal layout_changed
 const DESIGN_SHORT_SIDE := 390.0
 const MIN_SCALE := 0.78
 const MAX_SCALE := 1.4
+## How many still frames in a row before the engine may stop drawing.
+const SETTLE_FRAMES := 10
 
 static var instance: App
 
@@ -22,6 +24,8 @@ var _overlays: Array[Control] = []
 var _screen_layer := Control.new()
 var _overlay_layer := Control.new()
 var _last_window := Vector2i.ZERO
+## Frames in a row in which nothing on screen changed.
+var _still_frames := 0
 
 
 func _ready() -> void:
@@ -35,6 +39,25 @@ func _ready() -> void:
 	get_tree().root.size_changed.connect(_update_scale)
 	_update_scale()
 	push(HomeScreen.new())
+	# Looks at each frame after every other node has had its turn in it. With
+	# no screen there is nothing to save.
+	process_priority = 1 << 20
+	set_process(DisplayServer.get_name() != "headless")
+
+
+## Lets the engine stop drawing while nothing on screen moves. A card game
+## spends most of its time waiting on a player, and redrawing an unchanged
+## table every frame only drains the battery and heats a phone toward
+## throttling. Anything that moves wakes it on the frame it starts: a node
+## animating in its _process, a running tween, a touch.
+func _process(_delta: float) -> void:
+	if RenderingServer.has_changed() or not get_tree().get_processed_tweens().is_empty():
+		_still_frames = 0
+		OS.low_processor_usage_mode = false
+	elif _still_frames < SETTLE_FRAMES:
+		_still_frames += 1
+		if _still_frames == SETTLE_FRAMES:
+			OS.low_processor_usage_mode = true
 
 
 func _make_theme() -> Theme:
@@ -114,6 +137,8 @@ func push(screen: Control) -> void:
 		# Hidden once covered, so it stops drawing (and taking touches).
 		if is_instance_valid(below) and _screens.has(below) and _screens.back() != below:
 			below.visible = false
+			# Nor does it animate unseen underneath.
+			below.process_mode = Node.PROCESS_MODE_DISABLED
 			if below.has_method("on_hidden"):
 				below.on_hidden())
 
@@ -148,6 +173,7 @@ func pop_to_root() -> void:
 
 
 func _reveal(screen: Control) -> void:
+	screen.process_mode = Node.PROCESS_MODE_INHERIT
 	screen.visible = true
 	if screen.has_method("on_shown"):
 		screen.on_shown()

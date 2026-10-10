@@ -174,6 +174,68 @@ func test_a_thrown_card_awaiting_confirmation_leaves_the_fan() -> void:
 	fan.queue_free()
 
 
+# ---------------------------------------------------------- idle and draw
+
+## A countdown with no deadline stays still: nothing to count and nothing to
+## redraw, so it never keeps an idle screen drawing.
+func test_a_deadline_bar_without_a_deadline_stays_idle() -> void:
+	var idle := DeadlineBar.new("Bidding for you", 0)
+	var counting := DeadlineBar.new("Bidding for you", Time.get_ticks_msec() + 5000)
+	add_child(idle)
+	add_child(counting)
+	await _frames(2)
+	expect_true(not idle.is_processing(), "no deadline, nothing running")
+	expect_true(counting.is_processing(), "a live deadline counts down")
+	idle.queue_free()
+	counting.queue_free()
+
+
+## A gradient gathered into a batch is cut at its inner stops into pieces that
+## cover the shape exactly — a card, and the spade on a card back, which is
+## not convex — and its antialiased rim runs through the same cut points, so
+## no seam opens between the pieces and the rim.
+func test_a_batched_gradient_covers_its_shape_without_seams() -> void:
+	var card := Rect2(0, 0, 62, 62 * CardView.FACE_ASPECT)
+	var spade := PackedVector2Array()
+	for p in Draw.suit_polygons(Cards.Suit.SPADES)[0]:
+		spade.append(p * 40.0)
+	var stops := [Color.WHITE, Color.GRAY, Color.BLACK]
+	for case in [[Draw.rounded_rect_points(card, 7, 8), card.size.y, [0.0, 0.55, 1.0]], [spade, 40.0, []]]:
+		var shape: PackedVector2Array = case[0]
+		var height: float = case[1]
+		var fill := Draw.Batch.new()
+		fill.fill_linear(shape, Vector2.ZERO, Vector2(0, height), stops, case[2], false)
+		expect_near(_covered(fill), _area(shape), 0.01, "the pieces cover the shape")
+	var cut_y := card.size.y * 0.55
+	var with_rim := Draw.Batch.new()
+	with_rim.fill_linear(Draw.rounded_rect_points(card, 7, 8), Vector2.ZERO, Vector2(0, card.size.y), stops,
+			[0.0, 0.55, 1.0])
+	for at in [Vector2(0, cut_y), Vector2(card.size.x, cut_y)]:
+		var uses := 0
+		for v in with_rim._verts:
+			if v.distance_to(at) < 1e-3:
+				uses += 1
+		# The piece above, the piece below, and the rim.
+		expect_true(uses >= 3, "the cut at %s is shared by both pieces and the rim (%d)" % [at, uses])
+
+
+static func _covered(batch: Draw.Batch) -> float:
+	var total := 0.0
+	for i in range(0, batch._idx.size(), 3):
+		var a := batch._verts[batch._idx[i]]
+		var b := batch._verts[batch._idx[i + 1]]
+		var c := batch._verts[batch._idx[i + 2]]
+		total += absf((b - a).cross(c - a)) / 2.0
+	return total
+
+
+static func _area(points: PackedVector2Array) -> float:
+	var total := 0.0
+	for i in points.size():
+		total += points[i].cross(points[(i + 1) % points.size()])
+	return absf(total) / 2.0
+
+
 # ------------------------------------------------------- throw hand-off
 
 ## Behaves like a networked table: a play is only sent, and the view changes

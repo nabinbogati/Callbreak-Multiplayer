@@ -94,6 +94,7 @@ func _exit_tree() -> void:
 
 func _draw() -> void:
 	_draw_deck()
+	var flying: Array[Transform2D] = []
 	var player_cards := 0
 	for i in _order.size():
 		var slot := SeatView.slot_for(_order[i], viewer)
@@ -118,8 +119,24 @@ func _draw() -> void:
 				SeatView.Slot.LEFT: end_angle = -PI / 2
 				SeatView.Slot.RIGHT: end_angle = PI / 2
 		var spin := 0.25 if is_player else (PI if i % 2 == 0 else -PI)
-		_draw_dealt(raw, target, end_angle, end_width, is_player, spin)
+		flying.append(_dealt_transform(raw, target, end_angle, end_width, is_player, spin))
+	# The cards in the air: their shadows, then all of them in one draw call.
+	var rect := _back_rect()
+	for xf in flying:
+		draw_set_transform_matrix(xf)
+		CardView.back_shadow(self, rect)
 	draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	var art := Draw.Batch.new()
+	for xf in flying:
+		art.transform = xf
+		CardView.back_art(art, rect)
+	art.flush(self)
+
+
+## Every card in the deal is the same drawing, placed and scaled.
+func _back_rect() -> Rect2:
+	var size := Vector2(DECK_WIDTH, DECK_WIDTH * CardView.FACE_ASPECT)
+	return Rect2(-size / 2.0, size)
 
 
 ## The deck at the centre: dropping in, riffling twice, then thinning as cards
@@ -133,7 +150,6 @@ func _draw_deck() -> void:
 		return
 	var layers := clampi(ceili(remaining * 10.0 / 52.0), 1, 10)
 	var w := DECK_WIDTH
-	var h := w * CardView.FACE_ASPECT
 	const STEP := 1.6
 	var intro := Motion.DEAL_INTRO_MS * _scale / 1000.0
 	var shuffle := Motion.SHUFFLE_MS * _scale / 1000.0
@@ -149,6 +165,8 @@ func _draw_deck() -> void:
 		var u := (_elapsed - intro) / shuffle
 		split = sin(fmod(u * 2.0, 1.0) * PI)
 	var apart := w * 0.62 * split
+	var rect := _back_rect()
+	var art := Draw.Batch.new()
 	for i in layers:
 		var dx := 0.0
 		var angle := 0.0
@@ -157,16 +175,24 @@ func _draw_deck() -> void:
 			dx = -apart if i % 2 == 0 else apart
 			angle = (-0.14 if i % 2 == 0 else 0.14) * split
 		var center := start + Vector2(dx + i * STEP * 0.5, drop - i * STEP)
-		draw_set_transform(center, angle, Vector2.ONE * scale)
-		CardView.paint_back(self, Rect2(-Vector2(w, h) / 2.0, Vector2(w, h)), false, i == 0)
+		var xf := Transform2D(angle, Vector2.ONE * scale, 0.0, center)
+		if i == 0:
+			# Only the bottom card casts a shadow, under the whole stack.
+			draw_set_transform_matrix(xf)
+			CardView.back_shadow(self, rect)
+			draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+		art.transform = xf
+		CardView.back_art(art, rect)
+	art.flush(self)
 
 
-func _draw_dealt(raw: float, target: Vector2, end_angle: float, end_width: float, flip_at_end: bool,
-		spin: float) -> void:
+## Where a dealt card is in its flight, as the transform its back is drawn
+## with.
+func _dealt_transform(raw: float, target: Vector2, end_angle: float, end_width: float, flip_at_end: bool,
+		spin: float) -> Transform2D:
 	var t := Motion.ease_out_cubic(raw)
 	var path := TrickCluster.ThrowPath.new(start, target, 1.0, end_angle - spin, end_angle, 0.1)
 	var w := DECK_WIDTH
-	var h := w * CardView.FACE_ASPECT
 	# Drawn at one fixed size and scaled, so every card in the air is the same
 	# drawing.
 	var width := w + (end_width - w) * t
@@ -174,5 +200,4 @@ func _draw_dealt(raw: float, target: Vector2, end_angle: float, end_width: float
 	var squash := 1.0
 	if flip_at_end and raw > 0.6:
 		squash = cos((raw - 0.6) / 0.4 * PI / 2.0)
-	draw_set_transform(path.position_at(t), path.angle_at(t), Vector2(scale * squash, scale))
-	CardView.paint_back(self, Rect2(-Vector2(w, h) / 2.0, Vector2(w, h)), false, true)
+	return Transform2D(path.angle_at(t), Vector2(scale * squash, scale), 0.0, path.position_at(t))

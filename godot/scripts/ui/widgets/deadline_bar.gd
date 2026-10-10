@@ -15,12 +15,14 @@ var deadline_ms := 0:
 	set(v):
 		deadline_ms = v
 		_span = 0
+		_shown_seconds = -1
 		visible = v > 0
 		set_process(v > 0)
 
 var _span := 0
 var _bar: Control
 var _label: Label
+var _shown_seconds := -1
 
 
 func _init(caption_in := "", deadline := 0) -> void:
@@ -36,14 +38,22 @@ func _init(caption_in := "", deadline := 0) -> void:
 	deadline_ms = deadline
 
 
+func _ready() -> void:
+	# Godot switches processing on here for any script with a _process; with no
+	# deadline there is nothing to count down, and nothing to redraw.
+	set_process(deadline_ms > 0)
+
+
 func _process(_delta: float) -> void:
 	var left := maxi(0, deadline_ms - Time.get_ticks_msec())
 	if _span == 0:
 		_span = maxi(left, 1)
 	var seconds := ceili(left / 1000.0)
-	var colour := Tokens.DANGER if seconds <= ALARM_SECONDS else Tokens.GOLD_MID
-	_label.text = "%s in %ds" % [caption, seconds]
-	_label.add_theme_color_override("font_color", colour)
+	# The caption changes once a second; only the bar drains every frame.
+	if seconds != _shown_seconds:
+		_shown_seconds = seconds
+		_label.text = "%s in %ds" % [caption, seconds]
+		_label.add_theme_color_override("font_color", Tokens.DANGER if seconds <= ALARM_SECONDS else Tokens.GOLD_MID)
 	_bar.queue_redraw()
 
 
