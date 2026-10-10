@@ -16,11 +16,17 @@ extends RefCounted
 ## scale 1, a larger screen scales it up, and a screen too cramped for the
 ## content (long names, a nearly square window) scales it down until it fits.
 ##
-## The rules, in table units: the top seat sits on the felt's top rim and the
-## side seats on its left and right rims, level with its centre; the played
-## cards gather around that centre, clear of every seat's face-down fan; the
-## player's own plate runs along the bottom edge under the hand. Nothing that
-## stays on screen through a trick touches anything else.
+## Two arrangements share every rule but where the seats go:
+##
+## * With the felt, the top seat sits on its top rim and the side seats on its
+##   left and right rims, level with its centre, where the played cards gather.
+## * [member open], with no felt, the side seats stand at the screen's left and
+##   right edges and the top seat at its top edge, all centred along their
+##   edge, and the played cards gather on the screen's own centre.
+##
+## Either way the player's own plate runs centred along the bottom edge under
+## the hand, the played cards stay clear of every seat's face-down fan, and
+## nothing that stays on screen through a trick touches anything else.
 
 ## Space kept between things that must not touch.
 const GAP := 6.0
@@ -43,6 +49,9 @@ const LANDSCAPE_ASPECT := Vector2(1.6, 2.0)
 # All in table units; set before [method solve].
 
 var portrait := true
+## No felt: the seats go out to the screen's edges and the played cards
+## gather on the screen's centre.
+var open := false
 ## The HUD row's minimum size, and the widths of its left and right groups.
 var hud_size := Vector2.ZERO
 var hud_left := 0.0
@@ -70,8 +79,11 @@ var scale := 1.0
 ## The table's size in table units: the screen's size over [member scale].
 var frame := Vector2.ZERO
 var hud := Rect2()
-## The felt's centre, where the played cards gather.
+## Where the played cards gather: the felt's centre, or the screen's when
+## [member open].
 var center := Vector2.ZERO
+## The felt, around [member center]. Laid out when [member open] too, though
+## nothing draws it.
 var felt := Rect2()
 ## Slot → the centre of that seat's box.
 var seats := {}
@@ -88,80 +100,65 @@ func solve(avail: Vector2) -> void:
 	need = need.max(ref)
 	scale = minf(avail.x / need.x, avail.y / need.y)
 	frame = avail / scale
-	if portrait:
+	if open:
+		_place_open()
+	elif portrait:
 		_place_portrait()
 	else:
 		_place_landscape()
+	_place_hint()
 
 
 ## The smallest frame this content fits in, in table units.
 func required() -> Vector2:
-	var trick := TrickCluster.half_extent(trick_width)
+	var w: float
 	if portrait:
-		var w := 2.0 * (EDGE + side_seat.x / 2.0 + _side_inner() + GAP + trick.x)
+		w = 2.0 * (EDGE + side_seat.x / 2.0 + _side_inner() + GAP + TrickCluster.half_extent(trick_width).x)
 		w = maxf(w, maxf(hud_size.x + _hud_pad().x * 2.0, top_seat.x + EDGE * 2.0))
 		w = maxf(w, hint_size.x + EDGE * 2.0)
-		return Vector2(w, _top_rim() + _above() + _below_portrait() + _bottom_reserve())
-	var w := 2.0 * (EDGE + side_seat.x / 2.0 + _landscape_reach())
-	w = maxf(w, 2.0 * (_hud_pad().x + maxf(hud_left, hud_right) + GAP) + top_seat.x)
-	return Vector2(w, _top_rim() + _above() + _below_landscape() + _bottom_reserve())
+	else:
+		w = 2.0 * (EDGE + side_seat.x / 2.0 + _landscape_reach())
+		w = maxf(w, 2.0 * (_hud_pad().x + maxf(hud_left, hud_right) + GAP) + top_seat.x)
+	var top := _top_rim() + _above()
+	var bottom := _below() + _bottom_reserve()
+	# Open, the played cards sit on the screen's centre, so whichever half needs
+	# more room sets the height of both.
+	return Vector2(w, 2.0 * maxf(top, bottom) if open else top + bottom)
 
 
-# ------------------------------------------------------------------ portrait
+# ------------------------------------------------------------------ placing
 
 func _place_portrait() -> void:
 	var rim := _top_rim()
-	var lowest := frame.y - _bottom_reserve()
-	var trick := TrickCluster.half_extent(trick_width)
-	center = Vector2(frame.x / 2.0, ((rim + _above()) + (lowest - _below_portrait())) / 2.0)
+	center = Vector2(frame.x / 2.0, ((rim + _above()) + (_lowest() - _below())) / 2.0)
 	# Standing, the side seats go out to the screen's edges and the top seat up
 	# under the HUD, as far as the felt's proportions allow; on a screen of
 	# another shape, one or the other comes in to the felt's rim.
-	var a := frame.x / 2.0 - EDGE - side_seat.x / 2.0
+	var a := _edge_reach()
 	var b := minf(center.y - rim, a * PORTRAIT_ASPECT.y)
 	a = clampf(b / PORTRAIT_ASPECT.x, _side_min(), a)
 	b = maxf(b, _above())
 	_place_common(a, b)
-	hint_anchor = Vector2(center.x, center.y + maxf(trick.y, side_seat.y / 2.0) + GAP)
 
-
-func _below_portrait() -> float:
-	var trick := TrickCluster.half_extent(trick_width)
-	return maxf(trick.y, side_seat.y / 2.0) + GAP + hint_size.y
-
-
-# ----------------------------------------------------------------- landscape
 
 func _place_landscape() -> void:
 	var rim := _top_rim()
-	var lowest := frame.y - _bottom_reserve()
-	center = Vector2(frame.x / 2.0, ((rim + _above()) + (lowest - _below_landscape())) / 2.0)
+	center = Vector2(frame.x / 2.0, ((rim + _above()) + (_lowest() - _below())) / 2.0)
 	# Lying down, the top seat sits level with the HUD and the side seats run
 	# out toward the screen's sides, as far as the felt's proportions allow; on
 	# a screen of another shape, one or the other comes in to the felt's rim.
 	var b := center.y - rim
-	var a := clampf(b * LANDSCAPE_ASPECT.y, _landscape_reach(), frame.x / 2.0 - EDGE - side_seat.x / 2.0)
+	var a := clampf(b * LANDSCAPE_ASPECT.y, _landscape_reach(), _edge_reach())
 	b = clampf(a / LANDSCAPE_ASPECT.x, _above(), b)
 	_place_common(a, b)
-	# In the player's own empty place among the played cards: on their turn it
-	# says so right where their card will land.
-	hint_anchor = Vector2(center.x, center.y + trick_width * CardView.FACE_ASPECT / 2.0 + GAP)
 
 
-func _below_landscape() -> float:
-	var trick := TrickCluster.half_extent(trick_width)
-	var hint := trick_width * CardView.FACE_ASPECT / 2.0 + GAP + hint_size.y
-	return maxf(maxf(trick.y, side_seat.y / 2.0), hint)
+## No felt: every seat at its own edge of the screen, the played cards on the
+## screen's centre.
+func _place_open() -> void:
+	center = frame / 2.0
+	_place_common(_edge_reach(), center.y - _top_rim())
 
-
-## From the felt's centre to the side seats' avatars: the played cards (and the
-## hint between them), then the seat's own reach toward the table.
-func _landscape_reach() -> float:
-	var trick := TrickCluster.half_extent(trick_width)
-	return maxf(trick.x, hint_size.x / 2.0) + GAP + _side_inner()
-
-
-# -------------------------------------------------------------------- shared
 
 func _place_common(a: float, b: float) -> void:
 	var pad := _hud_pad()
@@ -179,6 +176,19 @@ func _place_common(a: float, b: float) -> void:
 	hand = Rect2(side, hand_top, frame.x - side * 2.0, fan_height)
 
 
+## Standing, under the played cards and the side seats; lying down, in the
+## player's own empty place among the played cards, so on their turn it says
+## so right where their card will land.
+func _place_hint() -> void:
+	if portrait:
+		var trick := TrickCluster.half_extent(trick_width)
+		hint_anchor = Vector2(center.x, center.y + maxf(trick.y, side_seat.y / 2.0) + GAP)
+	else:
+		hint_anchor = Vector2(center.x, center.y + trick_width * CardView.FACE_ASPECT / 2.0 + GAP)
+
+
+# ----------------------------------------------------------------- measures
+
 ## The top seat's avatar centre, as high as it may go: under the HUD standing
 ## up, level with it lying down.
 func _top_rim() -> float:
@@ -188,9 +198,9 @@ func _top_rim() -> float:
 	return pad.y + maxf(hud_size.y, top_seat.y) / 2.0
 
 
-## From the top seat's avatar down to the felt's centre, at the least: past the
-## top seat's fan and the upper played card, with the side seats clear of the
-## top seat (and, lying down, of the HUD).
+## From the top seat's avatar down to the centre, at the least: past the top
+## seat's fan and the upper played card, with the side seats clear of the top
+## seat (and, lying down, of the HUD).
 func _above() -> float:
 	var trick := TrickCluster.half_extent(trick_width)
 	var out := maxf(top_reach + GAP + trick.y, top_seat.y / 2.0 + GAP + side_seat.y / 2.0)
@@ -199,13 +209,42 @@ func _above() -> float:
 	return out
 
 
-## From the bottom of the frame up to the lowest the felt's contents may come:
-## the plate, the hand over it, its cards raised on the player's turn, and a gap.
+## From the centre down to the lowest the played cards, the side seats and the
+## hint may come: standing, the hint goes under the lot; lying down, in the
+## player's own place among the played cards.
+func _below() -> float:
+	var trick := TrickCluster.half_extent(trick_width)
+	var out := maxf(trick.y, side_seat.y / 2.0)
+	if portrait:
+		return out + GAP + hint_size.y
+	return maxf(out, trick_width * CardView.FACE_ASPECT / 2.0 + GAP + hint_size.y)
+
+
+## The lowest the table's contents may come, measured from the frame's top.
+func _lowest() -> float:
+	return frame.y - _bottom_reserve()
+
+
+## From the bottom of the frame up to [method _lowest]: the plate, the hand over
+## it, its cards raised on the player's turn, and a gap.
 func _bottom_reserve() -> float:
 	return _bottom_pad() + plate.y * (1.0 - PLATE_OVERLAP) + hand_card.y + HandFan.RAISE + GAP
 
 
-## The closest the side seats' avatars may come to the felt's centre.
+## From the centre to a side seat's avatar with the seat at the screen's edge.
+func _edge_reach() -> float:
+	return frame.x / 2.0 - EDGE - side_seat.x / 2.0
+
+
+## From the centre to the side seats' avatars, lying down, at the least: the
+## played cards (and the hint between them), then the seat's own reach toward
+## the table.
+func _landscape_reach() -> float:
+	var trick := TrickCluster.half_extent(trick_width)
+	return maxf(trick.x, hint_size.x / 2.0) + GAP + _side_inner()
+
+
+## The closest the side seats' avatars may come to the centre.
 func _side_min() -> float:
 	return _landscape_reach() if not portrait else _side_inner() + GAP + TrickCluster.half_extent(trick_width).x
 

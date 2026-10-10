@@ -188,6 +188,7 @@ func _gameplay_pane() -> void:
 	_row("Sound effects", [["On", true], ["Off", false]], "sfx_enabled")
 	_row("Vibration", [["On", true], ["Off", false]], "haptics_enabled")
 	_row("Animation speed", [["Slow", "slow"], ["Normal", "normal"], ["Fast", "fast"]], "animation_speed")
+	_row("Show table", [["On", true], ["Off", false]], "show_table")
 
 
 func _row(text: String, options: Array, key: String) -> void:

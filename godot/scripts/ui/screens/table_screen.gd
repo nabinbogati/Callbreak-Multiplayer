@@ -74,6 +74,7 @@ func _ready() -> void:
 	_body.set_anchors_preset(Control.PRESET_TOP_LEFT)
 	add_child(_body)
 
+	_felt.visible = Settings.show_table
 	_body.add_child(_felt)
 	_hand.card_thrown.connect(_on_card_thrown)
 	_hand.illegal.connect(_on_illegal)
@@ -100,6 +101,7 @@ func _ready() -> void:
 
 	App.instance.layout_changed.connect(_on_layout_changed)
 	resized.connect(_on_layout_changed)
+	Settings.changed.connect(_on_settings_changed)
 	session.changed.connect(_on_session_changed)
 	session.game_event.connect(_on_game_event)
 	# The debug play speed runs a solo table's whole clock faster — deal, bots,
@@ -200,6 +202,14 @@ func _on_layout_changed() -> void:
 	_rebuild_overlay(true)
 
 
+## The table can be put away, or brought back, mid-game (Settings → Show
+## table): the seats and the played cards move to their places without it.
+func _on_settings_changed() -> void:
+	if _felt.visible != Settings.show_table:
+		_felt.visible = Settings.show_table
+		_layout()
+
+
 func _hand_card_width() -> float:
 	return UI.sc(58, 62)
 
@@ -245,6 +255,7 @@ func _layout() -> void:
 func _measure() -> TableLayout:
 	var lay := TableLayout.new()
 	lay.portrait = UI.portrait
+	lay.open = not Settings.show_table
 	_hud.reset_size()
 	lay.hud_size = _hud.get_combined_minimum_size()
 	# back, tune | spacer | round
@@ -279,7 +290,9 @@ func _aim_deal() -> void:
 	_deal.hand_targets = targets
 
 
-## The felt's centre in body coordinates — where the played cards gather.
+## Where the played cards gather, in body coordinates: the felt's centre, or
+## with the table put away, the screen's (the felt is laid out around it
+## either way).
 func _felt_center() -> Vector2:
 	return _felt.position + _felt.size / 2.0
 

@@ -31,6 +31,7 @@ func _build() -> void:
 	_toggle("Tap twice to play", "tap_twice_to_play")
 	_toggle("Auto throw last card", "auto_throw_last_card")
 	_toggle("Auto throw last suit card", "auto_throw_last_suit_card")
+	_toggle("Show table", "show_table")
 	# Sound sits a little apart from play.
 	_toggle("Background music", "music_enabled", 18)
 	_toggle("Sound effects", "sfx_enabled")

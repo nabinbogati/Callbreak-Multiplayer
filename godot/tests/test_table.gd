@@ -343,7 +343,29 @@ static func _busy_view(hand: Array[String], trick: Array, turn: int) -> GameView
 ## played cards gather on the felt's centre, and a larger screen draws the
 ## whole table larger.
 func test_the_table_fits_every_screen() -> void:
+	var scales := await _every_screen(true)
+	# A phone draws it at (or, for the longest name, all but at) its design size.
+	expect_true(scales[Vector2i(390, 844)] >= 0.99 and scales[Vector2i(390, 844)] <= 1.0,
+			"a phone draws the table at its design size, got %s" % scales[Vector2i(390, 844)])
+	expect_near(scales[Vector2i(844, 390)], 1.0, 0.001, "and on its side")
+	var ipad := _design(Vector2(1024, 1366))
+	expect_true(scales[ipad] > 1.2 and scales[Vector2i(ipad.y, ipad.x)] > 1.2, "a tablet draws it larger")
+
+
+## The same with the table put away (Settings → Show table off): nothing
+## touches or leaves the screen, every seat keeps to its own edge, centred
+## along it, and the played cards gather on the screen's centre.
+func test_without_the_table_the_seats_keep_to_the_edges() -> void:
+	var scales := await _every_screen(false)
+	var ipad := _design(Vector2(1024, 1366))
+	expect_true(scales[ipad] > 1.2 and scales[Vector2i(ipad.y, ipad.x)] > 1.2, "a tablet draws it larger")
+
+
+## Plays a busy table on every device either way up, with the table shown or
+## put away, checking each screen; gives back each screen's scale.
+func _every_screen(show_table: bool) -> Dictionary:
 	_before()
+	Settings.show_table = true
 	var root := get_tree().root
 	var headless := [root.size, root.content_scale_size]
 	var app: App = load("res://scenes/main.tscn").instantiate()
@@ -354,6 +376,10 @@ func test_the_table_fits_every_screen() -> void:
 	var table := TableScreen.new(session)
 	app.push(table)
 	await _seconds(0.4)
+	# Put away (or kept) mid-game, from the settings sheet.
+	Settings.show_table = show_table
+	await _frames(2)
+	expect_eq(table._felt.visible, show_table, "the felt drawn only with the table shown")
 	var scales := {}
 	for dp in DEVICES:
 		var standing := _design(dp)
@@ -370,22 +396,50 @@ func test_the_table_fits_every_screen() -> void:
 			await _seconds(0.6)
 			_expect_clear(table, "%s with a full trick" % shape)
 			var trick := _bounds(_items(table).filter(func(it): return it[0] == "trick"))
-			var felt := table._felt.get_global_rect()
-			expect_near(trick.get_center().distance_to(felt.get_center()), 0.0, 2.0,
-					"the played cards gather on the felt's centre at %s" % shape)
-			expect_true(felt.encloses(trick), "the played cards lie on the felt at %s" % shape)
+			if show_table:
+				var felt := table._felt.get_global_rect()
+				expect_near(trick.get_center().distance_to(felt.get_center()), 0.0, 2.0,
+						"the played cards gather on the felt's centre at %s" % shape)
+				expect_true(felt.encloses(trick), "the played cards lie on the felt at %s" % shape)
+			else:
+				_expect_at_edges(table, trick, shape)
 			expect_eq(table._body.scale.x, table._body.scale.y, "one scale for the whole table at %s" % shape)
 			scales[shape] = table._body.scale.x
-	# A phone draws it at (or, for the longest name, all but at) its design size.
-	expect_true(scales[Vector2i(390, 844)] >= 0.99 and scales[Vector2i(390, 844)] <= 1.0,
-			"a phone draws the table at its design size, got %s" % scales[Vector2i(390, 844)])
-	expect_near(scales[Vector2i(844, 390)], 1.0, 0.001, "and on its side")
-	var ipad := _design(Vector2(1024, 1366))
-	expect_true(scales[ipad] > 1.2 and scales[Vector2i(ipad.y, ipad.x)] > 1.2, "a tablet draws it larger")
 	root.size = headless[0]
 	root.content_scale_size = headless[1]
+	Settings.show_table = true
 	app.queue_free()
 	await _frames(1)
+	return scales
+
+
+## With the table put away: the side seats at the screen's left and right
+## edges and level with its centre, the top seat and the player's own plate at
+## its top and bottom edges and centred across it, the played cards on its
+## centre.
+func _expect_at_edges(table: TableScreen, trick: Rect2, shape: Vector2i) -> void:
+	var view := table.get_viewport_rect()
+	var mid := view.get_center()
+	var k := table._body.scale.x
+	var left := table._seats[SeatView.Slot.LEFT].get_global_rect() as Rect2
+	var right := table._seats[SeatView.Slot.RIGHT].get_global_rect() as Rect2
+	var top := table._seats[SeatView.Slot.TOP].get_global_rect() as Rect2
+	var plate := table._seats[SeatView.Slot.BOTTOM].get_global_rect() as Rect2
+	expect_near(trick.get_center().distance_to(mid), 0.0, 2.0, "the played cards on the screen's centre at %s" % shape)
+	# The side seats stand in a column as wide as the wider of them can grow,
+	# against the screen's side.
+	var column: float = table._seats[SeatView.Slot.LEFT].reserved_size().x
+	column = maxf(column, table._seats[SeatView.Slot.RIGHT].reserved_size().x)
+	var from_side := UI.sc(0, 8) + (TableLayout.EDGE + column / 2.0) * k
+	expect_near(left.get_center().x, from_side, 1.0, "the left seat at the left edge at %s" % shape)
+	expect_near(view.end.x - right.get_center().x, from_side, 1.0, "the right seat at the right edge at %s" % shape)
+	expect_near(left.get_center().y, mid.y, 1.0, "the left seat level with the centre at %s" % shape)
+	expect_near(right.get_center().y, mid.y, 1.0, "the right seat level with the centre at %s" % shape)
+	expect_near(top.get_center().x, mid.x, 1.0, "the top seat centred at %s" % shape)
+	expect_true(top.position.y <= table._hud.get_global_rect().end.y + (TableLayout.GAP + 1.0) * k,
+			"the top seat at the top edge, only the HUD above it, at %s" % shape)
+	expect_near(plate.get_center().x, mid.x, 1.0, "the player's plate centred at %s" % shape)
+	expect_true(plate.end.y >= view.end.y - (UI.sc(14, 4) + 1.0) * k, "the player's plate at the bottom edge at %s" % shape)
 
 
 ## Nothing on screen leaves it, and nothing touches anything of anyone else's.
