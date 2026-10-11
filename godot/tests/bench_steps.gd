@@ -50,12 +50,13 @@ func _measure(label: String, count: int, done := Callable()) -> void:
 	var draws: Array[int] = []
 	for i in count:
 		var t := Time.get_ticks_usec()
+		var drawn_before := Engine.get_frames_drawn()
 		await get_tree().process_frame
 		times.append((Time.get_ticks_usec() - t) / 1000.0)
-		# The last frame drawn; 0 when the engine skipped drawing an idle frame.
-		var calls := RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
-		if calls > 0:
-			draws.append(calls)
+		# Only frames the engine drew: a frame it skipped (nothing changed)
+		# reports the last drawn frame's count again.
+		if Engine.get_frames_drawn() != drawn_before:
+			draws.append(RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME))
 		if done.is_valid() and done.call():
 			break
 	var sorted := times.duplicate()

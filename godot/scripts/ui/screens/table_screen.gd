@@ -762,7 +762,7 @@ func _overlay_key(v: GameView) -> String:
 			session.hand_advance_deadline_ms, session.is_resuming() and not session.is_ready()]
 
 
-## Dims the table behind a decision and pops [param content] in over it.
+## Dims the table behind a decision and fades [param content] in over it.
 func _modal(content: Control, max_width: float) -> Control:
 	var scrim := ColorRect.new()
 	scrim.color = Tokens.MODAL_SCRIM

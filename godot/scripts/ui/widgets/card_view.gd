@@ -103,8 +103,9 @@ func _paint() -> void:
 ## are drawn, so each is built once: dealing a hand, lighting the playable
 ## cards or flipping a card over then costs a few engine calls, not a rebuild.
 static var _built := {}
-## Enough for two hands' worth of sizes of every card, with backs; a new
-## screen density or colour style starts the cache over.
+## Enough for two hands' worth of sizes of every card, with backs. Once full it
+## is emptied and refilled as cards are drawn; entries for a screen density or
+## colour style no longer in use wait until then.
 const _CACHE_LIMIT := 160
 
 

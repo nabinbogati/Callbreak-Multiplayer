@@ -58,13 +58,17 @@ func _exit_tree() -> void:
 	_set_ticking(false)
 
 
+## The tick loop is one player shared by every clock. A clock that should be
+## ticking keeps asking for it (a no-op while it plays): when the seats are
+## rebuilt mid-alarm (the phone turned), the old clock stops the loop on its
+## way out after the new one has started it.
 func _set_ticking(on: bool) -> void:
+	if on:
+		Audio.start_tick()
 	if _ticking == on:
 		return
 	_ticking = on
-	if on:
-		Audio.start_tick()
-	else:
+	if not on:
 		Audio.stop_tick()
 
 

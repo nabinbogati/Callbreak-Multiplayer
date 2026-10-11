@@ -100,7 +100,7 @@ func _init(view: GameView) -> void:
 
 
 ## Opens the round history over the podium, or closes it. Kept here rather
-## than in the table's overlay, whose rebuild would replay the entrance.
+## than in the table's overlay, whose rebuild would build the podium afresh.
 func _toggle_history() -> void:
 	if _history != null:
 		_history.queue_free()
@@ -129,14 +129,8 @@ func _podium(view: GameView, ranked: Array) -> Control:
 	for rank_index in VISUAL_ORDER:
 		var r: Dictionary = ranked[rank_index]
 		var column := _column(view, r, rank_index)
-		var wrap := Control.new()
-		wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		wrap.size_flags_vertical = Control.SIZE_SHRINK_END
-		wrap.add_child(column)
-		wrap.custom_minimum_size = column.get_combined_minimum_size()
-		column.minimum_size_changed.connect(func(): wrap.custom_minimum_size = column.get_combined_minimum_size())
-		wrap.resized.connect(func(): column.size = wrap.size)
-		row.add_child(wrap)
+		column.size_flags_vertical = Control.SIZE_SHRINK_END
+		row.add_child(column)
 	return row
 
 

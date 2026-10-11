@@ -135,9 +135,10 @@ tests/      runner, suites, server fixture, screenshot tour
   - Nothing redraws while nothing changes, so `App` can stop the engine
     drawing: the turn clock and countdown bars step once a second, the menus
     are still, and a toast is held up by a timer (any running tween keeps the
-    engine drawing). The one thing that keeps moving on its own is the ripple
-    on the "Connecting…" and LAN-search notices, so a wait never looks frozen;
-    it is never on screen during play.
+    engine drawing). The only things that keep moving on their own are the
+    waiting ripples (the "Connecting…"/"Reconnecting…" and LAN-search notices,
+    and the profile while it loads), so a wait never looks frozen; none of
+    them is up while you can play a card.
   - Layers the eye doesn't need are left out on every moving frame: one soft
     band for the table's shadow rather than ten full layers, no backdrop
     bloom behind the felt.

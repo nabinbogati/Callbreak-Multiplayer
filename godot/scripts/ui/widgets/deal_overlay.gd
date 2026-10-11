@@ -140,8 +140,8 @@ func _place() -> void:
 	_deck.position = start - _deck.size / 2.0
 
 
-## The deck waiting at the centre: a few backs squared up, drawn once, in one
-## draw call.
+## The deck waiting at the centre: a few backs squared up, drawn once — its
+## shadow, then all its backs in one draw call.
 class _Deck:
 	extends Control
 

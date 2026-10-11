@@ -5,9 +5,9 @@ extends Node
 ## music" or "Sound effects" takes effect immediately — and pauses the
 ## soundtrack while the app is in the background.
 ##
-## The card sounds are uncompressed WAV, trimmed to start on their attack:
-## a play is heard the frame it is asked for, with nothing to decode, on the
-## slowest phone. Only the soundtrack streams from a compressed file.
+## The card sounds are uncompressed WAV, so nothing is decoded when one plays,
+## and each is trimmed to start on its attack (the card sound used to open with
+## ~145 ms of near-silence). Only the soundtrack streams from a compressed file.
 
 const MUSIC := preload("res://assets/audio/music.mp3")
 const CARD_SHOT := preload("res://assets/audio/card_thrown.wav")
@@ -129,10 +129,12 @@ func _player(stream: AudioStream, db: float, voices := 1) -> AudioStreamPlayer:
 	return p
 
 
-## [param stream] looping end to end.
+## [param stream] looping end to end. [member AudioStreamWAV.loop_end] is the
+## last frame played, not one past it (the importer's own -1 means the same):
+## one frame further reads past the end of the samples on every wrap.
 func _looping(stream: AudioStreamWAV) -> AudioStreamWAV:
 	var s: AudioStreamWAV = stream.duplicate()
 	s.loop_mode = AudioStreamWAV.LOOP_FORWARD
 	s.loop_begin = 0
-	s.loop_end = int(round(s.get_length() * s.mix_rate))
+	s.loop_end = int(round(s.get_length() * s.mix_rate)) - 1
 	return s

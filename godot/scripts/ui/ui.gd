@@ -269,7 +269,7 @@ static func glass_panel(child: Control, pad := Vector4(20, 20, 20, 20), accent :
 	return panel(glass_box(pad, accent), child)
 
 
-## A short fade-in for a panel appearing over the table.
+## A short fade-in for a panel or dialog appearing over a screen.
 static func fade_in(node: Control, duration := 0.15) -> void:
 	node.modulate.a = 0.0
 	node.create_tween().tween_property(node, "modulate:a", 1.0, duration)

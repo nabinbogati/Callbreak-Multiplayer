@@ -234,13 +234,16 @@ func test_a_taken_trick_is_announced_once_even_if_cleared_early() -> void:
 	var center := Vector2(180, 320)
 	var taken := []
 	trick.trick_taken.connect(func(winner): taken.append(winner))
+	# An empty felt first, so the cards fly in rather than appear as on a rejoin.
+	trick.sync([], 0, -1, anchors, {}, center, 52)
 	var plays := [{"seat": 1, "card": "KH"}, {"seat": 2, "card": "3H"}, {"seat": 3, "card": "QH"},
 			{"seat": 0, "card": "AH"}]
 	trick.sync(plays, 0, 0, anchors, {}, center, 52)
 	var whole := Motion.scaled(Motion.TRICK_ANIMATION_MS, Motion.trick_scale(Settings.animation_scale()))
 	await _seconds(whole + 0.1)
+	expect_eq(taken, [0], "a trick is taken as it sweeps off, before the table clears it")
 	trick.sync([], 0, -1, anchors, {}, center, 52)
-	expect_eq(taken, [0], "a trick that sweeps off is taken once")
+	expect_eq(taken, [0], "and only once")
 	plays = [{"seat": 0, "card": "2C"}, {"seat": 1, "card": "9C"}, {"seat": 2, "card": "4C"}, {"seat": 3, "card": "5C"}]
 	trick.sync(plays, 0, 1, anchors, {}, center, 52)
 	await _frames(2)
@@ -279,6 +282,7 @@ func test_placed_copies_of_shapes_make_one_batch() -> void:
 ## painted the first time it shows, the deck once, and nothing again while
 ## they fly.
 func test_dealt_cards_are_drawn_once_then_only_moved() -> void:
+	_before()
 	Settings.animation_speed = "fast"
 	var deal := DealOverlay.new()
 	add_child(deal)
@@ -505,6 +509,29 @@ func test_refusal_hints_explain_the_rule() -> void:
 	var low := [{"seat": 1, "card": "9H"}]
 	var hearts: Array[String] = ["2H", "KH"]
 	expect_eq(HintLine.illegal(_view(hearts, low), "2H")["text"], "Beat the trick — play a higher heart")
+
+
+# ---------------------------------------------------------------- sound
+
+## The deal's looping card sound ends each pass on its own last frame:
+## AudioStreamWAV's loop end is inclusive, and one frame further reads past the
+## samples on every wrap (a click, or a crash where the allocator guards the
+## end of a large block). Played across the seam, the silent tail runs straight
+## into the faded-in start, with nothing between.
+func test_the_deal_loop_wraps_within_its_samples() -> void:
+	var loop: AudioStreamWAV = Audio._deal.stream
+	var frames := loop.data.size() / (4 if loop.stereo else 2)
+	expect_eq(loop.loop_end, frames - 1, "the loop ends on the last frame")
+	var copy: AudioStreamWAV = loop.duplicate()
+	# At the mixer's own rate, so each output frame is one source frame.
+	copy.mix_rate = int(AudioServer.get_mix_rate())
+	var playback := copy.instantiate_playback()
+	playback.start()
+	var out := playback.mix_audio(1.0, frames + 64)
+	var stray := 0.0
+	for i in range(frames - 64, frames + 8):
+		stray = maxf(stray, absf(out[i].x) + absf(out[i].y))
+	expect_true(stray < 0.01, "nothing plays at the seam but the sound itself (%.3f)" % stray)
 
 
 # --------------------------------------------------------------- motion
