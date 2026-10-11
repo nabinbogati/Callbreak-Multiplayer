@@ -38,8 +38,7 @@ func _init(view: GameView, deadline_ms := 0, max_height := INF) -> void:
 		var scores: Array = view.round_scores[seat]
 		var row := _row(view, seat, i == 0 and view.totals[seats[0]] > view.totals[seats[1]],
 				scores.back() if not scores.is_empty() else null, place_of.get(seat, 0) if final else 0)
-		# Rows slide in one after another.
-		col.add_child(UI.rise_in(row, (320 + 70 * i) / 1000.0, 10))
+		col.add_child(row)
 		col.add_child(UI.gap(UI.sc(6, 4)))
 	col.add_child(UI.gap(UI.sc(10, 6)))
 
@@ -116,11 +115,6 @@ func _row(view: GameView, seat: int, leader: bool, delta, place: int) -> Control
 				Tokens.DANGER if dv < 0 else Tokens.SUCCESS, "bold", HORIZONTAL_ALIGNMENT_CENTER), UI.sc(50, 44))
 	var total_label := UI.label("%.1f" % total, UI.sc(16, 13.5), Tokens.GOLD, "bold", HORIZONTAL_ALIGNMENT_RIGHT)
 	var total_cell := _cell(total_label, UI.sc(52, 46))
-	# The total counts up from last round's to this one's.
-	var from: float = total - (delta if delta != null else 0.0)
-	total_label.text = "%.1f" % from
-	total_label.create_tween().tween_method(func(t: float):
-		total_label.text = "%.1f" % lerpf(from, total, Motion.ease_out_cubic(t)), 0.0, 1.0, 0.7)
 
 	for c in [bid_cell, delta_cell, total_cell]:
 		c.size_flags_vertical = Control.SIZE_SHRINK_CENTER

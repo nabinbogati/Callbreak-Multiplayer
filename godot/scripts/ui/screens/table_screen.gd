@@ -6,27 +6,25 @@ extends Control
 ## game against bots, a LAN table and a server table — it only ever talks to
 ## [GameSession].
 ##
-## Layout is computed by hand (see [method _layout]) rather than with
-## containers, because the animations need exact positions: a thrown card
-## starts where the finger let go, dealt cards land on the slot the real card
-## will occupy, and a won trick sweeps toward the winner's seat.
+## Layout is computed by hand ([TableLayout]) rather than with containers,
+## because the animations need exact positions: a thrown card starts where the
+## finger let go, dealt cards land on the slot the real card will occupy, and a
+## won trick sweeps toward the winner's seat. It is solved in table units and
+## the whole table is then scaled to the screen, so every device shows the same
+## table at its own size.
 
-## How long a line of help above the hand stays up.
+## How long a line of help stays up.
 const HINT_TIME := 2.2
-## How much of the player's own plate the resting hand reaches down over, as
-## a share of the plate's height.
-const PLATE_OVERLAP := 0.3
 
 var session: GameSession
 
 var _backdrop := Backdrop.new("table")
-## Everything inside the safe area.
+## Everything inside the safe area, in table units: scaled to fill it.
 var _body := Control.new()
 var _hud: Control
 var _round_label: Label
 var _progress_label: Label
 var _round_pill: Control
-var _felt_area := Control.new()
 var _felt := FeltSurface.new()
 var _seats := {}
 var _hand := HandFan.new()
@@ -69,20 +67,13 @@ func _init(session_in: GameSession) -> void:
 
 func _ready() -> void:
 	add_child(_backdrop)
-	_backdrop.glow_alignment_portrait = Vector2(0, -0.2)
-	_backdrop.glow_alignment_landscape = Vector2(0, -0.2)
-	_backdrop.glow_scale = 1.5
+	_backdrop.bloom = false
 	_body.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_body.set_anchors_preset(Control.PRESET_TOP_LEFT)
 	add_child(_body)
 
-	_felt_area.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_felt_area.add_child(_felt)
-	_body.add_child(_felt_area)
-	for slot in [SeatView.Slot.LEFT, SeatView.Slot.TOP, SeatView.Slot.RIGHT]:
-		var seat := SeatView.new(slot)
-		seat.visible = false
-		_seats[slot] = seat
-		_body.add_child(seat)
+	_felt.visible = Settings.show_table
+	_body.add_child(_felt)
 	_hand.card_thrown.connect(_on_card_thrown)
 	_hand.illegal.connect(_on_illegal)
 	_hand.not_your_turn.connect(func(): _show_hint(HintLine.waiting()))
@@ -90,9 +81,10 @@ func _ready() -> void:
 	# behind it.
 	_body.add_child(_hint)
 	_body.add_child(_hand)
-	_make_plate()
+	_make_seats()
 	_trick.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_trick.throw_refused.connect(func(_card): _refresh())
+	_trick.trick_taken.connect(_on_trick_taken)
 	_body.add_child(_trick)
 	_fx.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_fx.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -108,6 +100,7 @@ func _ready() -> void:
 
 	App.instance.layout_changed.connect(_on_layout_changed)
 	resized.connect(_on_layout_changed)
+	Settings.changed.connect(_on_settings_changed)
 	session.changed.connect(_on_session_changed)
 	session.game_event.connect(_on_game_event)
 	# The debug play speed runs a solo table's whole clock faster — deal, bots,
@@ -120,19 +113,23 @@ func _ready() -> void:
 	_on_session_changed()
 
 
-## The player's own plate, running across the bottom edge under the hand in
-## either orientation. Rebuilt on rotation, since its sizes are per
-## orientation. Drawn over the hand: the cards' corner indices clear it, and
-## the avatar's turn clock stays whole.
-func _make_plate() -> void:
+## The seats, rebuilt on rotation since their sizes are per orientation. The
+## opponents sit under the hint and the hand; the player's own plate, running
+## across the bottom edge under the hand, is drawn over it: the cards' corner
+## indices clear it, and the avatar's turn clock stays whole.
+func _make_seats() -> void:
 	_built_portrait = int(UI.portrait)
-	if _seats.has(SeatView.Slot.BOTTOM):
-		_seats[SeatView.Slot.BOTTOM].queue_free()
-	var plate := SeatView.new(SeatView.Slot.BOTTOM)
-	plate.visible = false
-	_seats[SeatView.Slot.BOTTOM] = plate
-	_body.add_child(plate)
-	_body.move_child(plate, _hand.get_index() + 1)
+	for slot in [SeatView.Slot.LEFT, SeatView.Slot.TOP, SeatView.Slot.RIGHT, SeatView.Slot.BOTTOM]:
+		var old: SeatView = _seats.get(slot)
+		var seat := SeatView.new(slot)
+		seat.visible = false
+		_seats[slot] = seat
+		_body.add_child(seat)
+		_body.move_child(seat, _hand.get_index() + 1 if slot == SeatView.Slot.BOTTOM else _hint.get_index())
+		if old != null:
+			# A bid already announced stays announced.
+			seat._bid = old._bid
+			old.queue_free()
 
 
 func _exit_tree() -> void:
@@ -190,17 +187,12 @@ func _leave() -> void:
 # ----------------------------------------------------------------- layout
 
 func _on_layout_changed() -> void:
-	_body.set_anchors_preset(Control.PRESET_FULL_RECT)
-	_body.offset_left = UI.safe.x + UI.sc(0, 8)
-	_body.offset_top = UI.safe.y
-	_body.offset_right = -UI.safe.z - UI.sc(0, 8)
-	_body.offset_bottom = -UI.safe.w
 	# Announcements ride above the table rather than inside it, so they never
 	# disturb the felt's measured geometry.
 	_banners.position = Vector2(0, UI.safe.y + 52)
 	_banners.size.x = size.x
 	if int(UI.portrait) != _built_portrait:
-		_make_plate()
+		_make_seats()
 		_hud.queue_free()
 		_hud = _build_hud()
 		_body.add_child(_hud)
@@ -209,73 +201,78 @@ func _on_layout_changed() -> void:
 	_rebuild_overlay(true)
 
 
+## The table can be put away, or brought back, mid-game (Settings → Show
+## table): the seats and the played cards move to their places without it.
+func _on_settings_changed() -> void:
+	if _felt.visible != Settings.show_table:
+		_felt.visible = Settings.show_table
+		_layout()
+
+
 func _hand_card_width() -> float:
 	return UI.sc(58, 62)
 
 
-## Positions the felt, seats, hand and trick for the current size.
+## The width cards on the felt are drawn at.
+func _trick_card_width() -> float:
+	return UI.sc(56, 52)
+
+
+## Lays the table out in table units (see [TableLayout]) and scales it to fill
+## the safe area, so every screen shows the same table at its own size.
 func _layout() -> void:
-	var area := _body.size
-	if area.x <= 0 or area.y <= 0:
+	var side := UI.sc(0, 8)
+	var avail := size - Vector2(UI.safe.x + UI.safe.z + side * 2.0, UI.safe.y + UI.safe.w)
+	if avail.x <= 0 or avail.y <= 0:
 		return
-	var pad := Vector4(UI.sc(12, 7), UI.sc(8, 4), UI.sc(12, 7), UI.sc(14, 4))
-	_hud.reset_size()
-	var hud_h := _hud.get_combined_minimum_size().y
-	var top := pad.y
-	if UI.portrait:
-		_hud.position = Vector2(pad.x, pad.y)
-		_hud.size = Vector2(area.x - pad.x - pad.z, hud_h)
-		top += hud_h + UI.sc(6, 4)
-	else:
-		# In landscape the HUD floats over the felt so the table can run to the
-		# top edge.
-		_hud.position = Vector2(14, 10)
-		_hud.size = Vector2(area.x - 28, hud_h)
-		top += 34
-
-	var width := area.x - pad.x - pad.z
 	_hand.card_width = _hand_card_width()
-	var fan_h := _hand.fan_height()
-	var plate: SeatView = _seats[SeatView.Slot.BOTTOM]
-	plate.reset_size()
-	var ps := plate.get_combined_minimum_size()
-	# The player's own plate runs along the bottom edge, centred, and the
-	# resting hand reaches down over the top of it.
-	var plate_top := area.y - pad.w - ps.y
-	plate.position = Vector2((area.x - ps.x) / 2.0, plate_top)
-	plate.size = ps
-	var hand_top := plate_top + ps.y * PLATE_OVERLAP - HandFan.LIFT - _hand.card_height()
-	_hand.position = Vector2(pad.x, hand_top)
-	_hand.size = Vector2(width, fan_h)
-	_hint.anchor_center = Vector2(area.x / 2.0, hand_top - UI.sc(50, 30))
-	_hint.reposition()
+	var lay := _measure()
+	lay.solve(avail)
+	_body.position = Vector2(UI.safe.x + side, UI.safe.y)
+	_body.scale = Vector2.ONE * lay.scale
+	_body.size = lay.frame
 
-	var box := Vector2(width, maxf(hand_top - UI.sc(4, 0) - top, 40))
-	_felt_area.position = Vector2(pad.x, top)
-	_felt_area.size = box
-	var geo := _felt_geometry(box)
-	_felt.position = Vector2((box.x - geo.x) / 2.0, geo.z)
-	_felt.size = Vector2(geo.x, geo.y)
-
-	# Side seats are measured in from the box edge so they track the table's
-	# rim; the top seat straddles it.
-	var felt_inset := maxf(0.0, (box.x - geo.x) / 2.0)
-	var seat_inset := clampf(felt_inset - UI.sc(16, 12), 0.0, felt_inset)
-	for slot in [SeatView.Slot.LEFT, SeatView.Slot.TOP, SeatView.Slot.RIGHT]:
+	_hud.position = lay.hud.position
+	_hud.size = lay.hud.size
+	_felt.position = lay.felt.position
+	_felt.size = lay.felt.size
+	for slot in _seats:
 		var seat: SeatView = _seats[slot]
 		seat.reset_size()
-		var s := seat.get_combined_minimum_size()
-		match slot:
-			SeatView.Slot.TOP:
-				seat.position = _felt_area.position + Vector2((box.x - s.x) / 2.0, geo.z - s.y / 2.0)
-			SeatView.Slot.LEFT:
-				seat.position = _felt_area.position + Vector2(seat_inset, (box.y - s.y) / 2.0)
-			SeatView.Slot.RIGHT:
-				seat.position = _felt_area.position + Vector2(box.x - seat_inset - s.x, (box.y - s.y) / 2.0)
-		seat.size = s
+		seat.size = seat.get_combined_minimum_size()
+		seat.position = lay.seats[slot] - seat.size / 2.0
+	_hand.position = lay.hand.position
+	_hand.size = lay.hand.size
+	_hint.anchor_center = lay.hint_anchor
+	_hint.reposition()
 	_sync_trick()
 	if _deal != null:
 		_aim_deal()
+
+
+## What the table holds, in table units, for [TableLayout] to arrange.
+func _measure() -> TableLayout:
+	var lay := TableLayout.new()
+	lay.portrait = UI.portrait
+	lay.open = not Settings.show_table
+	_hud.reset_size()
+	lay.hud_size = _hud.get_combined_minimum_size()
+	# back, tune | spacer | round
+	var parts := _hud.get_children().map(func(c): return (c as Control).get_combined_minimum_size().x)
+	var sep := float(_hud.get_theme_constant("separation"))
+	lay.hud_left = parts[0] + sep + parts[1]
+	lay.hud_right = parts[3]
+	var top: SeatView = _seats[SeatView.Slot.TOP]
+	lay.top_seat = top.reserved_size()
+	lay.top_reach = top.fan_reach()
+	lay.side_seat = _seats[SeatView.Slot.LEFT].reserved_size().max(_seats[SeatView.Slot.RIGHT].reserved_size())
+	lay.side_reach = _seats[SeatView.Slot.LEFT].fan_reach()
+	lay.plate = _seats[SeatView.Slot.BOTTOM].reserved_size()
+	lay.hand_card = Vector2(_hand.card_width, _hand.card_height())
+	lay.fan_height = _hand.fan_height()
+	lay.trick_width = _trick_card_width()
+	lay.hint_size = HintLine.widest_size()
+	return lay
 
 
 ## Points the deal at the current layout: it can start before the first
@@ -292,39 +289,11 @@ func _aim_deal() -> void:
 	_deal.hand_targets = targets
 
 
-## The table's size and its top edge within the felt box: (width, height,
-## top). Portrait stands the oval on end (long axis from the top seat down to
-## the player's own); landscape lays it on its side and runs it past the bottom
-## of its box, so its rim tucks behind the hand. Lying down it is never rounder
-## than standing: a wide window stretches it sideways (up to [code]MAX_WIDTH[/code]
-## of the box), and a box too narrow for that shrinks it about the same centre.
-func _felt_geometry(box: Vector2) -> Vector3:
-	const ASPECT := 1.62
-	if UI.portrait:
-		var h := minf(box.y * 0.86, box.x * 0.86 * ASPECT)
-		return Vector3(h / ASPECT, h, (box.y - h) / 2.0)
-	const TOP_INSET := 0.04
-	const OVERHANG := 0.12
-	const MIN_WIDTH := 0.6
-	const MAX_WIDTH := 0.8
-	var top := box.y * TOP_INSET
-	var h := box.y * (1.0 + OVERHANG - TOP_INSET - TOP_INSET * (1.0 - 0.33))
-	var w := clampf(h * ASPECT, box.x * MIN_WIDTH, box.x * MAX_WIDTH)
-	if w < h * ASPECT:
-		top += (h - w / ASPECT) / 2.0
-		h = w / ASPECT
-	return Vector3(w, h, top)
-
-
-## The width cards on the felt are drawn at.
-func _trick_card_width() -> float:
-	var box := _felt_area.size
-	return clampf(58.0, 0.0, minf(box.x * 0.19, box.y * 0.27))
-
-
-## The felt's visual centre in body coordinates — the trick's resting centre.
+## Where the played cards gather, in body coordinates: the felt's centre, or
+## with the table put away, the screen's (the felt is laid out around it
+## either way).
 func _felt_center() -> Vector2:
-	return _felt_area.position + _felt.position + _felt.size / 2.0
+	return _felt.position + _felt.size / 2.0
 
 
 ## Where each seat sits (the centre of its whole plate), in body coordinates.
@@ -346,13 +315,6 @@ func _to_body(global: Vector2) -> Vector2:
 func _build_hud() -> Control:
 	var back := _hud_button("back", handle_back)
 	var tune := _hud_button("tune", _open_quick_settings)
-	# Spades are always trump — said once, quietly, where it can be checked at
-	# a glance.
-	var trump := UI.glass_pill(UI.hbox(5, [UI.suit_glyph(Cards.Suit.SPADES, 14, Tokens.GOLD),
-			UI.label("Trump", 11, Tokens.GOLD, "semibold")]), Callable(), 14, Vector4(10, 7, 10, 7),
-			Color(Tokens.GOLD_BORDER, 0.3))
-	trump.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	trump.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	_round_label = UI.label("Round 1 / 5", 12, Tokens.GOLD, "bold", HORIZONTAL_ALIGNMENT_RIGHT)
 	_progress_label = UI.label("", 10, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_RIGHT)
 	var lines := UI.vbox(0, [_round_label, _progress_label])
@@ -362,7 +324,7 @@ func _build_hud() -> Control:
 	_round_pill = UI.glass_pill(UI.hbox(4, [lines, chart]), _toggle_history, 14, Vector4(UI.sc(12, 14), 5, UI.sc(12, 14), 5),
 			Color(Tokens.GOLD_BORDER, 0.45))
 	_round_pill.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	var row := UI.hbox(8, [back, tune, UI.spacer(), trump, _round_pill])
+	var row := UI.hbox(8, [back, tune, UI.spacer(), _round_pill])
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	return row
 
@@ -439,11 +401,13 @@ func _refresh() -> void:
 		_hand.gestures_enabled = not _dealing
 		_hand.set_hand(v.hand, v.legal_move_ids, interactive, shown, _trick.pending_ids())
 		_hint.your_turn = interactive
-		var waiting := not _dealing and v.turn >= 0 and not v.awaiting_trick_clear \
-				and (v.phase == GameView.BIDDING or v.phase == GameView.PLAYING)
-		_felt.spotlight = SeatView.slot_for(v.turn, v.you) if waiting else -1
 		_felt.lead_suit = Cards.suit(v.trick[0]["card"]) if not v.awaiting_trick_clear and not v.trick.is_empty() \
 				else -1
+		# Lying down, the hint sits in the player's own place among the played
+		# cards. Once their card is there, a hint (only ever "wait for your
+		# turn") shows over it rather than hidden under it.
+		var mine_down := v.you >= 0 and v.visible_trick().any(func(p): return p["seat"] == v.you)
+		_hint.z_index = 1 if mine_down and not UI.portrait else 0
 		_layout()
 	_refresh_banners()
 	_rebuild_overlay(false)
@@ -464,10 +428,6 @@ func _on_game_event(event: Dictionary) -> void:
 			Audio.play_shot()
 			if _is_trump_into_side_suit(str(event.get("card", ""))):
 				Audio.play_trump()
-		"trickWon":
-			Audio.play_collect()
-			if session.view != null and int(event.get("seat", -1)) == session.view.you:
-				Haptics.thud()
 		"seatChanged":
 			var online: bool = event.get("connected", true)
 			var bot: bool = event.get("kind") == "bot"
@@ -485,6 +445,15 @@ func _on_game_event(event: Dictionary) -> void:
 			var name := str(event.get("name", "A player"))
 			_announce("%s is idle — playing automatically" % name if on else "%s is playing again" % name, not on,
 					"robot" if on else "touch", int(event.get("seat", -1)))
+
+
+## The collect sound, and for the player's own tricks a thud, go with the
+## cards leaving for the winner rather than with the last one landing, so
+## sound, touch and picture arrive together.
+func _on_trick_taken(winner: int) -> void:
+	Audio.play_collect()
+	if session.view != null and winner == session.view.you:
+		Haptics.thud()
 
 
 ## A trump landing into a trick a side suit led — the moment the lead suit
@@ -668,7 +637,6 @@ func _refresh_banners() -> void:
 		_autoplay_banner.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		_banners.add_child(_autoplay_banner)
 		_banners.move_child(_autoplay_banner, 0)
-		_slide_in(_autoplay_banner)
 	elif not autoplay and _autoplay_banner != null:
 		_autoplay_banner.queue_free()
 		_autoplay_banner = null
@@ -697,20 +665,9 @@ func _announce(text: String, online: bool, icon: String, seat: int) -> void:
 	var banner := _presence_banner
 	get_tree().create_timer(4.0).timeout.connect(func():
 		if is_instance_valid(banner):
-			var t := banner.create_tween()
-			t.tween_property(banner, "modulate:a", 0.0, 0.24)
-			t.tween_callback(banner.queue_free)
+			banner.queue_free()
 			if _presence_banner == banner:
 				_presence_banner = null)
-
-
-## Fades a banner in as it drops into place from slightly above.
-func _slide_in(node: Control) -> void:
-	var run := func(t: float) -> void:
-		node.modulate.a = t
-		node.position.y = node.size.y * -0.3 * (1.0 - t)
-	run.call(0.0)
-	node.create_tween().tween_method(run, 0.0, 1.0, 0.26)
 
 
 func _banner_box(content: Control, border: Color, bg: Color) -> Control:
@@ -720,8 +677,6 @@ func _banner_box(content: Control, border: Color, bg: Color) -> Control:
 	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	for c in panel.find_children("*", "Control", true, false):
 		c.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	panel.modulate.a = 0.0
-	panel.create_tween().tween_property(panel, "modulate:a", 1.0, 0.24)
 	return panel
 
 
@@ -779,7 +734,7 @@ func _rebuild_overlay(force: bool) -> void:
 		c.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		c.add_child(_bid_panel)
 		_overlay.add_child(c)
-		UI.pop_in(_bid_panel)
+		UI.fade_in(_bid_panel)
 	if v.phase == GameView.HAND_OVER:
 		var board := Scoreboard.new(v, session.hand_advance_deadline_ms, _modal_max_height())
 		board.continue_pressed.connect(func(): session.continue_to_next_hand())
@@ -807,7 +762,7 @@ func _overlay_key(v: GameView) -> String:
 			session.hand_advance_deadline_ms, session.is_resuming() and not session.is_ready()]
 
 
-## Dims the table behind a decision and pops [param content] in over it.
+## Dims the table behind a decision and fades [param content] in over it.
 func _modal(content: Control, max_width: float) -> Control:
 	var scrim := ColorRect.new()
 	scrim.color = Tokens.MODAL_SCRIM
@@ -818,7 +773,7 @@ func _modal(content: Control, max_width: float) -> Control:
 	content.custom_minimum_size.x = minf(max_width, size.x) - pad * 2.0
 	center.add_child(content)
 	scrim.add_child(center)
-	UI.pop_in(content)
+	UI.fade_in(content)
 	return scrim
 
 
@@ -905,28 +860,22 @@ func _reconnect_overlay() -> Control:
 func _connect_failure() -> Control:
 	var message := session.error_message if not session.error_message.is_empty() \
 			else "Something went wrong while connecting. Check your internet and try again."
-	var pulse := Control.new()
-	pulse.custom_minimum_size = Vector2(72, 72)
-	pulse.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	pulse.draw.connect(func():
-		var t := (sin(Time.get_ticks_msec() / 1500.0 * PI) + 1.0) / 2.0
+	var badge := Control.new()
+	badge.custom_minimum_size = Vector2(72, 72)
+	badge.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	badge.draw.connect(func():
 		var c := Vector2(36, 36)
-		Draw.disc(pulse, c, 27 + 5 * t, Color(Tokens.DANGER, 0.08 + 0.05 * t))
-		Draw.circle_border(pulse, c, 27 + 5 * t + 0.75, Color(Tokens.DANGER, 0.3 + 0.15 * t), 1.5)
-		Draw.disc(pulse, c, 26, Color(Tokens.DANGER, 0.14))
-		Draw.icon(pulse, "wifi_off", Rect2(c - Vector2(13, 13), Vector2(26, 26)), Tokens.DANGER))
-	var timer := Timer.new()
-	timer.wait_time = 1.0 / 30.0
-	timer.autostart = true
-	timer.timeout.connect(pulse.queue_redraw)
-	pulse.add_child(timer)
+		Draw.disc(badge, c, 30, Color(Tokens.DANGER, 0.1))
+		Draw.circle_border(badge, c, 30.75, Color(Tokens.DANGER, 0.38), 1.5)
+		Draw.disc(badge, c, 26, Color(Tokens.DANGER, 0.14))
+		Draw.icon(badge, "wifi_off", Rect2(c - Vector2(13, 13), Vector2(26, 26)), Tokens.DANGER))
 	var buttons := UI.hbox(10)
 	# Only a brand-new connect can simply try again; a seat that was given up
 	# cannot be retried into existence.
 	if session.is_network() and session.view == null:
 		buttons.add_child(UI.expand(UI.gold_button("Try again", func(): session.retry_connect(), "refresh_rounded", true)))
 	buttons.add_child(UI.expand(UI.ghost_button("Back", _leave, "", true)))
-	var col := UI.vbox(0, [pulse, UI.gap(14),
+	var col := UI.vbox(0, [badge, UI.gap(14),
 		UI.label("Can't connect", 18, Tokens.TEXT_PRIMARY, "bold", HORIZONTAL_ALIGNMENT_CENTER), UI.gap(6),
 		UI.paragraph(message, 13, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_CENTER), UI.gap(22), buttons])
 	col.custom_minimum_size.x = minf(300, size.x - 48)

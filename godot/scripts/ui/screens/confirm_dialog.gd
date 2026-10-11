@@ -40,7 +40,7 @@ func _init(title: String, message: String, cancel_label: String, ok_label: Strin
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
 	center.add_child(card)
 	add_child(center)
-	card.ready.connect(func(): UI.pop_in(card))
+	card.ready.connect(func(): UI.fade_in(card))
 
 
 func _ready() -> void:

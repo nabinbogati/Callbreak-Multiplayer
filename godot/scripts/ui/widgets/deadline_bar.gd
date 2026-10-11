@@ -5,7 +5,8 @@ extends VBoxContainer
 ## past — the bid they have not confirmed, the scoreboard nobody dismissed.
 ## Unlike [TurnClock] it shows for the whole wait: what it says (*this gets
 ## decided with or without you*) is worth knowing before the last second. It
-## only reports; the host acts on the deadline.
+## only reports; the host acts on the deadline. Like the clock it steps once a
+## second, so it never keeps the screen drawing in between.
 
 const ALARM_SECONDS := 5
 
@@ -15,12 +16,14 @@ var deadline_ms := 0:
 	set(v):
 		deadline_ms = v
 		_span = 0
+		_shown_seconds = -1
 		visible = v > 0
 		set_process(v > 0)
 
 var _span := 0
 var _bar: Control
 var _label: Label
+var _shown_seconds := -1
 
 
 func _init(caption_in := "", deadline := 0) -> void:
@@ -36,22 +39,31 @@ func _init(caption_in := "", deadline := 0) -> void:
 	deadline_ms = deadline
 
 
+func _ready() -> void:
+	# Godot switches processing on here for any script with a _process; with no
+	# deadline there is nothing to count down, and nothing to redraw.
+	set_process(deadline_ms > 0)
+
+
 func _process(_delta: float) -> void:
 	var left := maxi(0, deadline_ms - Time.get_ticks_msec())
 	if _span == 0:
 		_span = maxi(left, 1)
 	var seconds := ceili(left / 1000.0)
-	var colour := Tokens.DANGER if seconds <= ALARM_SECONDS else Tokens.GOLD_MID
-	_label.text = "%s in %ds" % [caption, seconds]
-	_label.add_theme_color_override("font_color", colour)
-	_bar.queue_redraw()
+	if seconds != _shown_seconds:
+		_shown_seconds = seconds
+		_label.text = "%s in %ds" % [caption, seconds]
+		_label.add_theme_color_override("font_color", Tokens.DANGER if seconds <= ALARM_SECONDS else Tokens.GOLD_MID)
+		_bar.queue_redraw()
+	if left <= 0:
+		set_process(false)
 
 
 func _draw_bar() -> void:
-	var left := maxi(0, deadline_ms - Time.get_ticks_msec())
-	var fraction := clampf(float(left) / maxf(_span, 1), 0.0, 1.0)
-	var seconds := ceili(left / 1000.0)
-	var colour := Tokens.DANGER if seconds <= ALARM_SECONDS else Tokens.GOLD_MID
+	# Full until the first count, then a step a second.
+	var seconds := _shown_seconds
+	var fraction := 1.0 if seconds < 0 else clampf(seconds / maxf(ceilf(_span / 1000.0), 1.0), 0.0, 1.0)
+	var colour := Tokens.DANGER if seconds >= 0 and seconds <= ALARM_SECONDS else Tokens.GOLD_MID
 	var r := Rect2(Vector2.ZERO, _bar.size)
 	_bar.draw_style_box(UI.flat(Color(1, 1, 1, 0.08), 2), r)
 	if fraction > 0.0:

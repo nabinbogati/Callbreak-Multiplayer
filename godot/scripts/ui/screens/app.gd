@@ -14,6 +14,8 @@ signal layout_changed
 const DESIGN_SHORT_SIDE := 390.0
 const MIN_SCALE := 0.78
 const MAX_SCALE := 1.4
+## How many still frames in a row before the engine may stop drawing.
+const SETTLE_FRAMES := 10
 
 static var instance: App
 
@@ -22,6 +24,8 @@ var _overlays: Array[Control] = []
 var _screen_layer := Control.new()
 var _overlay_layer := Control.new()
 var _last_window := Vector2i.ZERO
+## Frames in a row in which nothing on screen changed.
+var _still_frames := 0
 
 
 func _ready() -> void:
@@ -35,6 +39,25 @@ func _ready() -> void:
 	get_tree().root.size_changed.connect(_update_scale)
 	_update_scale()
 	push(HomeScreen.new())
+	# Looks at each frame after every other node has had its turn in it. With
+	# no screen there is nothing to save.
+	process_priority = 1 << 20
+	set_process(DisplayServer.get_name() != "headless")
+
+
+## Lets the engine stop drawing while nothing on screen moves. A card game
+## spends most of its time waiting on a player, and redrawing an unchanged
+## table every frame only drains the battery and heats a phone toward
+## throttling. Anything that moves wakes it on the frame it starts: a node
+## animating in its _process, a running tween, a touch.
+func _process(_delta: float) -> void:
+	if RenderingServer.has_changed() or not get_tree().get_processed_tweens().is_empty():
+		_still_frames = 0
+		OS.low_processor_usage_mode = false
+	elif _still_frames < SETTLE_FRAMES:
+		_still_frames += 1
+		if _still_frames == SETTLE_FRAMES:
+			OS.low_processor_usage_mode = true
 
 
 func _make_theme() -> Theme:
@@ -98,9 +121,9 @@ func _safe_insets(view: Vector2) -> Vector4:
 
 # ---------------------------------------------------------------- screens
 
-## One transition everywhere: the next screen fades up out of a slight zoom,
-## which reads as moving *into* the table rather than sliding sideways past it.
-const TRANSITION := 0.3
+## One transition everywhere: a short fade. Every frame of it redraws the
+## whole screen, so it is kept brief and plain.
+const TRANSITION := 0.15
 
 
 func push(screen: Control) -> void:
@@ -114,6 +137,8 @@ func push(screen: Control) -> void:
 		# Hidden once covered, so it stops drawing (and taking touches).
 		if is_instance_valid(below) and _screens.has(below) and _screens.back() != below:
 			below.visible = false
+			# Nor does it animate unseen underneath.
+			below.process_mode = Node.PROCESS_MODE_DISABLED
 			if below.has_method("on_hidden"):
 				below.on_hidden())
 
@@ -148,22 +173,17 @@ func pop_to_root() -> void:
 
 
 func _reveal(screen: Control) -> void:
+	screen.process_mode = Node.PROCESS_MODE_INHERIT
 	screen.visible = true
 	if screen.has_method("on_shown"):
 		screen.on_shown()
 
 
-## Fades [param screen] in from a 0.96 zoom (or back out to it), then calls
-## [param done].
+## Fades [param screen] in (or out), then calls [param done].
 func _animate(screen: Control, entering: bool, done: Callable) -> void:
-	var step := func(t: float) -> void:
-		var e := Motion.emphasized(t) if entering else Motion.ease_in_cubic(t)
-		screen.modulate.a = e
-		screen.pivot_offset = screen.size / 2.0
-		screen.scale = Vector2.ONE * (0.96 + 0.04 * e)
-	step.call(0.0 if entering else 1.0)
+	screen.modulate.a = 0.0 if entering else 1.0
 	var tween := screen.create_tween()
-	tween.tween_method(step, 0.0 if entering else 1.0, 1.0 if entering else 0.0, TRANSITION)
+	tween.tween_property(screen, "modulate:a", 1.0 if entering else 0.0, TRANSITION)
 	tween.tween_callback(done)
 
 
@@ -203,12 +223,11 @@ func toast(text: String) -> void:
 	t.custom_minimum_size.x = minf(view.x - 32, 360)
 	t.reset_size()
 	t.position = Vector2((view.x - t.size.x) / 2.0, view.y - t.size.y - 28 - UI.safe.w)
-	var tw := t.create_tween()
-	t.modulate.a = 0.0
-	tw.tween_property(t, "modulate:a", 1.0, 0.2)
-	tw.tween_interval(2.6)
-	tw.tween_property(t, "modulate:a", 0.0, 0.3)
-	tw.tween_callback(t.queue_free)
+	# A timer, not a tween, holds it up: while any tween runs the engine draws
+	# every frame, and nothing moves while a toast is being read.
+	get_tree().create_timer(3.0).timeout.connect(func():
+		if is_instance_valid(t):
+			t.queue_free())
 
 
 func close_overlays() -> void:

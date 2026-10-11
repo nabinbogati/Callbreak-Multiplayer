@@ -5,9 +5,9 @@ extends Control
 ## row at the top and bottom, a column at the sides. Opponents' avatars wear
 ## their face-down hand as a small fan pointing at the table centre.
 ##
-## Also where the table talks about a player: a ring that pings when their
-## turn comes, a speech bubble when they bid, and a "+1" that floats off their
-## score when they take a trick.
+## Also where the table talks about a player: a ring while it is their turn
+## and a speech bubble when they bid. Nothing here animates: each part redraws
+## only when what it shows changes.
 
 enum Slot { BOTTOM, LEFT, TOP, RIGHT }
 
@@ -42,6 +42,9 @@ func _init(slot_in: int) -> void:
 	_body.add_theme_constant_override("separation", int(UI.sc(5, 3) if _body.vertical else UI.sc(6, 4)))
 	var is_you := slot == Slot.BOTTOM
 	_name_chip = NameChip.new()
+	# The side seats share the table's width with the played cards between
+	# them, so their names are held to the narrower width at either angle.
+	_name_chip.max_name_width = 64.0 if _body.vertical or not UI.portrait else 84.0
 	avatar = SeatAvatar.new(UI.sc(44, 42) if is_you else UI.sc(44, 40), slot)
 	_bid_chip = BidChip.new()
 	for c in [_name_chip, avatar, _bid_chip]:
@@ -57,6 +60,27 @@ func _init(slot_in: int) -> void:
 
 func _get_minimum_size() -> Vector2:
 	return _body.get_combined_minimum_size()
+
+
+## The most room this seat can need — as if it held the dealer's badge and the
+## widest score — so the table can keep it free without shuffling as the deal
+## moves round and scores grow. Laid out like the seat itself.
+func reserved_size() -> Vector2:
+	var parts: Array[Vector2] = [_name_chip.reserved_size(), avatar.get_combined_minimum_size(), BidChip.widest()]
+	var sep := float(_body.get_theme_constant("separation"))
+	var out := Vector2.ZERO
+	for p in parts:
+		if _body.vertical:
+			out = Vector2(maxf(out.x, p.x), out.y + p.y)
+		else:
+			out = Vector2(out.x + p.x, maxf(out.y, p.y))
+	return out + (Vector2(0, sep * 2.0) if _body.vertical else Vector2(sep * 2.0, 0))
+
+
+## How far this seat reaches from its avatar's centre toward the middle of the
+## table: its face-down fan, or for the player's own plate, the avatar.
+func fan_reach() -> float:
+	return avatar.fan_reach()
 
 
 ## Refreshes everything from the current view.
@@ -125,6 +149,8 @@ class NameChip:
 	extends Control
 
 	var name_text := ""
+	## The widest a name may run before it is cut short.
+	var max_name_width := 84.0
 	var dealer := false
 	var host := false
 	## Their turn — the plate's border warms to match the ring.
@@ -148,13 +174,20 @@ class NameChip:
 
 	func _name_width() -> float:
 		var w := Tokens.font("semibold").get_string_size(name_text, HORIZONTAL_ALIGNMENT_LEFT, -1, _font_size()).x
-		return minf(w, UI.sc(84, 64))
+		return minf(w, max_name_width)
 
 	func _get_minimum_size() -> Vector2:
+		return _size_with(dealer)
+
+	## The size with the dealer's badge, wherever the deal is now.
+	func reserved_size() -> Vector2:
+		return _size_with(true)
+
+	func _size_with(with_dealer: bool) -> Vector2:
 		var badge := UI.sc(14, 11)
 		var gap := UI.sc(4, 3)
-		var w := _name_width() + (badge + gap if host else 0.0) + (badge + gap if dealer else 0.0)
-		var h := maxf(_font_size() * 1.25, badge if host or dealer else 0.0)
+		var w := _name_width() + (badge + gap if host else 0.0) + (badge + gap if with_dealer else 0.0)
+		var h := maxf(_font_size() * 1.25, badge if host or with_dealer else 0.0)
 		return Vector2(w + UI.sc(8, 6) * 2.0, h + UI.sc(4, 3) * 2.0)
 
 	func _draw() -> void:
@@ -189,69 +222,56 @@ class NameChip:
 
 
 ## Tricks won against the bid, as "won/bid" with a thin progress bar under it.
-## Turns green with a check once the bid is made, and floats a "+1" off itself
-## whenever a trick is taken.
+## Turns green with a check once the bid is made.
 class BidChip:
 	extends Control
 
-	const POP_TIME := 0.8
-
 	var bid := -1
 	var won := 0
-	var _progress := 0.0
-	var _progress_from := 0.0
-	var _progress_t := 1.0
-	var _pop_t := 1.0
 
 	func _init() -> void:
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
-		set_process(false)
 
 	func set_state(bid_in: int, won_in: int) -> void:
 		if bid_in == bid and won_in == won:
 			return
-		if won_in > won and bid_in == bid:
-			_pop_t = 0.0
-		var target := _target(bid_in, won_in)
-		if target != _target(bid, won):
-			_progress_from = _progress
-			_progress_t = 0.0
 		bid = bid_in
 		won = won_in
-		set_process(true)
 		update_minimum_size()
 		queue_redraw()
 
-	static func _target(b: int, w: int) -> float:
-		return 0.0 if b <= 0 else clampf(float(w) / b, 0.0, 1.0)
-
-	func _process(delta: float) -> void:
-		_pop_t = minf(_pop_t + delta / POP_TIME, 1.0)
-		_progress_t = minf(_progress_t + delta / 0.32, 1.0)
-		_progress = lerpf(_progress_from, _target(bid, won), Motion.emphasized(_progress_t))
-		if _pop_t >= 1.0 and _progress_t >= 1.0:
-			set_process(false)
-		queue_redraw()
+	func _progress() -> float:
+		return 0.0 if bid <= 0 else clampf(float(won) / bid, 0.0, 1.0)
 
 	func _made() -> bool:
 		return bid >= 0 and won >= bid
 
 	func _sizes() -> Array:
+		return _sizes_for(bid, won)
+
+	static func _sizes_for(b: int, w: int) -> Array:
 		var big := int(round(UI.sc(13, 11)))
 		var small := int(round(UI.sc(11, 9.5)))
-		var main := "–" if bid < 0 else str(won)
-		var rest := "" if bid < 0 else "/%d" % bid
+		var main := "–" if b < 0 else str(w)
+		var rest := "" if b < 0 else "/%d" % b
 		var mw := Tokens.font("bold").get_string_size(main, HORIZONTAL_ALIGNMENT_LEFT, -1, big).x
 		var rw := Tokens.font("semibold").get_string_size(rest, HORIZONTAL_ALIGNMENT_LEFT, -1, small).x if rest != "" else 0.0
-		var check := UI.sc(12, 10) + UI.sc(2, 1) if _made() else 0.0
+		var check := UI.sc(12, 10) + UI.sc(2, 1) if b >= 0 and w >= b else 0.0
 		return [big, small, main, rest, mw, rw, check]
 
 	func _get_minimum_size() -> Vector2:
-		var s := _sizes()
+		return _size_for(bid, won)
+
+	## The size of the widest score there can be: a bid of 13, made.
+	static func widest() -> Vector2:
+		return _size_for(Rules.MAX_BID, Rules.MAX_BID)
+
+	static func _size_for(b: int, won_in: int) -> Vector2:
+		var s := _sizes_for(b, won_in)
 		var row_w: float = s[4] + s[5] + s[6]
 		var w := row_w
 		var h: float = s[0] * 1.25
-		if bid >= 0:
+		if b >= 0:
 			w = maxf(w, UI.sc(26, 20))
 			h += UI.sc(3, 2) + UI.sc(3, 2.5)
 		return Vector2(w + UI.sc(8, 6) * 2.0, h + UI.sc(4, 3) * 2.0)
@@ -260,8 +280,6 @@ class BidChip:
 		var s := _sizes()
 		var made := _made()
 		var accent := Tokens.SUCCESS if made else Tokens.GOLD
-		var bump := 0.18 * sin(PI * clampf(_pop_t * 2.5, 0.0, 1.0)) if _pop_t < 1.0 else 0.0
-		draw_set_transform(size / 2.0 * (1.0 - (1.0 + bump)), 0.0, Vector2.ONE * (1.0 + bump))
 		SeatView._chip(self, Rect2(Vector2.ZERO, size), Color(Tokens.SUCCESS, 0.6) if made else Tokens.HAIRLINE_STRONG)
 		var pad_y := UI.sc(4, 3)
 		var row_h: float = s[0] * 1.25
@@ -285,60 +303,35 @@ class BidChip:
 			var bh := UI.sc(3, 2.5)
 			var bar := Rect2((size.x - bw) / 2.0, pad_y + row_h + UI.sc(3, 2), bw, bh)
 			Draw.fill(self, Draw.rounded_rect_points(bar, 2), Tokens.HAIRLINE_STRONG)
-			if _progress > 0.01:
-				Draw.fill(self, Draw.rounded_rect_points(Rect2(bar.position, Vector2(bw * _progress, bh)), 2), accent)
-		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
-		if _pop_t < 1.0:
-			var font := Tokens.font("bold")
-			var tw := font.get_string_size("+1", HORIZONTAL_ALIGNMENT_LEFT, -1, 14).x
-			var top := -14.0 - 18.0 * Motion.enter(_pop_t)
-			var alpha := clampf(1.0 - _pop_t, 0.0, 1.0)
-			var pos := Vector2((size.x - tw) / 2.0, top + 14 * 1.25 * Tokens.SANS_BASELINE)
-			draw_string_outline(font, pos, "+1", HORIZONTAL_ALIGNMENT_LEFT, -1, 14, 4, Color(0, 0, 0, 0.45 * alpha))
-			draw_string(font, pos, "+1", HORIZONTAL_ALIGNMENT_LEFT, -1, 14, Color(Tokens.TURN_GLOW, alpha))
+			var progress := _progress()
+			if progress > 0.01:
+				Draw.fill(self, Draw.rounded_rect_points(Rect2(bar.position, Vector2(bw * progress, bh)), 2), accent)
 
 
-## "Bid 4" in a speech bubble, popping out of a seat for a moment when that
-## player commits to their bid.
+## "Bid 4" in a speech bubble, shown by a seat for a moment when that player
+## commits to their bid.
 class BidBubble:
 	extends Control
 
 	var bid := -1
 	var _shown := -1
-	var _t := 1.0
-	var _entering := false
 
 	func _init() -> void:
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
-		set_process(false)
 		visible = false
 
 	func show_bid(b: int) -> void:
 		bid = b
 		if b >= 0:
 			_shown = b
-			_entering = true
-			visible = true
-		else:
-			_entering = false
-		_t = 0.0
+			queue_redraw()
+		visible = b >= 0
 		update_minimum_size()
-		set_process(true)
 
 	func _get_minimum_size() -> Vector2:
 		var a := Tokens.font("semibold").get_string_size("Bid ", HORIZONTAL_ALIGNMENT_LEFT, -1, 11).x
 		var b := Tokens.font("bold").get_string_size(str(maxi(_shown, 0)), HORIZONTAL_ALIGNMENT_LEFT, -1, 15).x
 		return Vector2(a + b + 22, 15 * 1.25 + 12)
-
-	func _process(delta: float) -> void:
-		_t = minf(_t + delta / 0.26, 1.0)
-		var e := Motion.ease_out_back(_t) if _entering else 1.0 - Motion.ease_in(_t)
-		modulate.a = clampf(e, 0.0, 1.0)
-		scale = Vector2.ONE * maxf(e, 0.0)
-		if _t >= 1.0:
-			set_process(false)
-			if not _entering:
-				visible = false
 
 	func _draw() -> void:
 		var rect := Rect2(Vector2.ZERO, size)
@@ -354,7 +347,9 @@ class BidBubble:
 class SeatAvatar:
 	extends Control
 
-	const PING_TIME := 0.75
+	## How far out from the avatar's centre the face-down fan's cards sit, in
+	## card heights.
+	const FAN_OFFSET := 0.55
 
 	var diameter: float
 	var slot: int
@@ -362,9 +357,9 @@ class SeatAvatar:
 	var is_turn := false
 	var hand_count := 0
 	var clock: TurnClock
-	var _turn_alpha := 0.0
-	var _ping_t := 1.0
-	var _tween: Tween
+	## The face-down fan, on a layer of its own under the avatar: it changes
+	## once a trick, the avatar when the turn moves.
+	var _fan := Control.new()
 
 	func _init(d: float, slot_in: int) -> void:
 		diameter = d
@@ -372,56 +367,37 @@ class SeatAvatar:
 		var ring := d + 10.0
 		custom_minimum_size = Vector2(ring, ring)
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_fan.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_fan.show_behind_parent = true
+		_fan.draw.connect(_draw_hand_fan)
+		add_child(_fan)
 		clock = TurnClock.new()
 		clock.audible = slot == SeatView.Slot.BOTTOM
 		clock.size = Vector2(ring, ring)
 		clock.custom_minimum_size = Vector2(ring, ring)
 		add_child(clock)
 		Settings.changed.connect(queue_redraw)
-		set_process(false)
+		Settings.changed.connect(_fan.queue_redraw)
+		resized.connect(func(): _fan.size = size)
 
 	func update(p: Dictionary, turn: bool, deadline_ms: int, count: int) -> void:
-		var changed := p != player or count != hand_count or turn != is_turn
-		player = p
-		hand_count = count
 		clock.deadline_ms = deadline_ms
-		if turn != is_turn:
+		if count != hand_count:
+			hand_count = count
+			_fan.queue_redraw()
+		if p != player or turn != is_turn:
+			player = p
 			is_turn = turn
-			if turn:
-				# The ring pings once as the turn arrives, then holds steady.
-				_ping_t = 0.0
-				set_process(true)
-			if _tween != null:
-				_tween.kill()
-			_tween = create_tween()
-			_tween.tween_method(_set_turn_alpha, _turn_alpha, 1.0 if turn else 0.0, 0.22)
-		if changed:
 			queue_redraw()
-
-	func _set_turn_alpha(v: float) -> void:
-		_turn_alpha = v
-		queue_redraw()
-
-	func _process(delta: float) -> void:
-		_ping_t = minf(_ping_t + delta / PING_TIME, 1.0)
-		if _ping_t >= 1.0:
-			set_process(false)
-		queue_redraw()
 
 	func _draw() -> void:
 		var ring := diameter + 10.0
 		var c := Vector2(ring, ring) / 2.0
 		var is_you := slot == SeatView.Slot.BOTTOM
-		_draw_hand_fan(c, ring)
-		if _turn_alpha > 0.01:
-			var a := _turn_alpha
-			if _ping_t < 1.0:
-				var t := Motion.enter(_ping_t)
-				var pd := ring * (1.0 + 0.55 * t)
-				Draw.circle_border(self, c, pd / 2.0, Color(Tokens.TURN_GLOW, 0.8 * (1.0 - t) * a), 2.0)
+		if is_turn:
 			var rr := Rect2(c - Vector2.ONE * ring / 2.0, Vector2.ONE * ring)
-			Draw.box_shadow(self, rr, ring / 2.0, [[Color(Tokens.TURN_GLOW, 0.45 * 1.1 * a), 16.0, Vector2.ZERO, 0.55]])
-			Draw.circle_border(self, c, ring / 2.0, Color(Tokens.TURN_GLOW, a), 2.2)
+			Draw.box_shadow(self, rr, ring / 2.0, [[Color(Tokens.TURN_GLOW, 0.45 * 1.1), 16.0, Vector2.ZERO, 0.55]])
+			Draw.circle_border(self, c, ring / 2.0, Tokens.TURN_GLOW, 2.2)
 		var rect := Rect2(c - Vector2(diameter, diameter) / 2.0, Vector2(diameter, diameter))
 		Draw.box_shadow(self, rect, diameter / 2.0, Tokens.SHADOW_LOW)
 		var stops: Array
@@ -463,30 +439,78 @@ class SeatAvatar:
 			Draw.disc(self, dc, dot / 2.0, Tokens.SUCCESS if connected else Tokens.TEXT_MUTED)
 			Draw.circle_border(self, dc, dot / 2.0, Color("#0A1207E6"), dot * 0.18)
 
+	## The size of one card in the face-down fan.
+	static func _fan_card() -> Vector2:
+		var cw := UI.sc(24, 20)
+		return Vector2(cw, cw * CardView.FACE_ASPECT)
+
+	## How far the face-down fan reaches from the avatar's centre toward the
+	## table, at most: with a full hand, where it spreads widest.
+	func fan_reach() -> float:
+		var ring := diameter / 2.0 + 5.0
+		if slot == SeatView.Slot.BOTTOM:
+			return ring
+		var fan := fan_rect(Rules.TRICKS_PER_HAND)
+		var c := Vector2.ONE * ring
+		match slot:
+			SeatView.Slot.TOP: return maxf(fan.end.y - c.y, ring)
+			SeatView.Slot.LEFT: return maxf(fan.end.x - c.x, ring)
+		return maxf(c.x - fan.position.x, ring)
+
 	func _bot_badge(center: Vector2, size: float) -> void:
 		Draw.disc(self, center, size / 2.0, Color("#0A1207F0"))
 		Draw.circle_border(self, center, size / 2.0, Tokens.GOLD_MID, size * 0.09)
 		Draw.icon(self, "robot", Rect2(center - Vector2.ONE * size * 0.29, Vector2.ONE * size * 0.58), Tokens.GOLD_MID)
 
 	## A face-down fan of the opponent's remaining cards in front of the avatar
-	## (toward the table centre), pivoting on the avatar's centre.
-	func _draw_hand_fan(c: Vector2, _ring: float) -> void:
-		if hand_count <= 0 or slot == SeatView.Slot.BOTTOM:
+	## (toward the table centre), pivoting on the avatar's centre. Every card is
+	## the same kept drawing, placed: the cards behind in one draw call, then
+	## the front one, the only one with a shadow, over it.
+	func _draw_hand_fan() -> void:
+		var placed := _fan_transforms(hand_count)
+		if placed.is_empty():
 			return
-		var cw := UI.sc(24, 20)
-		var ch := cw * CardView.FACE_ASPECT
-		var sweep := (hand_count - 1) * 0.13
+		var card := _fan_card()
+		var rect := Rect2(-card / 2.0, card)
+		var back := CardView.back_shapes(rect)
+		back.placed(placed.slice(0, placed.size() - 1)).draw(_fan)
+		_fan.draw_set_transform_matrix(placed[-1])
+		CardView.back_shadow(_fan, rect)
+		back.draw(_fan)
+		_fan.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+	## Where each card of a face-down fan of [param count] is drawn: its centre
+	## and turn.
+	func _fan_transforms(count: int) -> Array[Transform2D]:
+		var out: Array[Transform2D] = []
+		if count <= 0 or slot == SeatView.Slot.BOTTOM:
+			return out
+		var c := Vector2.ONE * (diameter + 10.0) / 2.0
+		var sweep := (count - 1) * 0.13
 		var dir0: Vector2
 		var base: float
 		match slot:
 			SeatView.Slot.TOP: dir0 = Vector2(0, 1); base = 0.0
 			SeatView.Slot.LEFT: dir0 = Vector2(1, 0); base = -PI / 2
 			_: dir0 = Vector2(-1, 0); base = PI / 2
-		for i in hand_count:
-			var t := 0.0 if hand_count == 1 else float(i) / (hand_count - 1) - 0.5
+		for i in count:
+			var t := 0.0 if count == 1 else float(i) / (count - 1) - 0.5
 			var theta := t * sweep
-			var center := c + dir0.rotated(theta) * (ch * 0.55)
-			draw_set_transform(center, base + theta, Vector2.ONE)
-			# Only the frontmost card casts a shadow.
-			CardView.paint_back(self, Rect2(-Vector2(cw, ch) / 2.0, Vector2(cw, ch)), false, i == hand_count - 1)
-		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+			out.append(Transform2D(base + theta, c + dir0.rotated(theta) * (_fan_card().y * FAN_OFFSET)))
+		return out
+
+	## The face-down fan's bounds in this avatar's own coordinates — as it is
+	## now, or holding [param count] cards — or an empty rect when there is none.
+	func fan_rect(count := -1) -> Rect2:
+		var half := _fan_card() / 2.0
+		var corners := [-half, Vector2(half.x, -half.y), half, Vector2(-half.x, half.y)]
+		var points := PackedVector2Array()
+		for xf in _fan_transforms(hand_count if count < 0 else count):
+			for corner in corners:
+				points.append(xf * corner)
+		if points.is_empty():
+			return Rect2()
+		var out := Rect2(points[0], Vector2.ZERO)
+		for p in points:
+			out = out.expand(p)
+		return out

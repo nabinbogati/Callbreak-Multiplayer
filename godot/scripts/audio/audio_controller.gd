@@ -4,12 +4,17 @@ extends Node
 ## one-shot card sounds. It mirrors the Settings toggles — flipping "Background
 ## music" or "Sound effects" takes effect immediately — and pauses the
 ## soundtrack while the app is in the background.
+##
+## The card sounds are uncompressed WAV, so nothing is decoded when one plays,
+## and each is trimmed to start on its attack (the card sound used to open with
+## ~145 ms of near-silence). Only the soundtrack streams from a compressed file.
 
 const MUSIC := preload("res://assets/audio/music.mp3")
-const CARD_SHOT := preload("res://assets/audio/card_thrown.mp3")
-const COLLECT := preload("res://assets/audio/woosh.mp3")
-const TRUMP := preload("res://assets/audio/trump_play.mp3")
-const TICK := preload("res://assets/audio/ticking-sound.ogg")
+const CARD_SHOT := preload("res://assets/audio/card_thrown.wav")
+const COLLECT := preload("res://assets/audio/woosh.wav")
+const TRUMP := preload("res://assets/audio/trump_play.wav")
+## Loops (set in its import options).
+const TICK := preload("res://assets/audio/ticking-sound.wav")
 
 ## Background music sits well under the table's own sounds.
 const MUSIC_DB := -8.0
@@ -17,27 +22,34 @@ const MUSIC_DB := -8.0
 const TICK_DB := -5.2
 ## The deal loop sits under the deal as a rhythm.
 const DEAL_DB := -3.1
-## The card sound is one swish; looped at its natural speed it lags a
-## 55ms-per-card deal, so it plays faster to keep time.
+## The card sound is one swish; looped at its natural speed it lags the deal,
+## so it plays faster to keep time.
 const DEAL_RATE := 3.0
-const ONE_SHOT_VOICES := 6
+## Card sounds that may ring at once: a trick's four plays can overlap.
+const SHOT_VOICES := 4
 
 var _music: AudioStreamPlayer
 var _tick: AudioStreamPlayer
 var _deal: AudioStreamPlayer
-var _voices: Array[AudioStreamPlayer] = []
-var _next_voice := 0
+var _shot: AudioStreamPlayer
+var _collect: AudioStreamPlayer
+var _trump: AudioStreamPlayer
 var _paused_for_lifecycle := false
 
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
-	_music = _player(_looping(MUSIC), MUSIC_DB)
-	_tick = _player(_looping(TICK), TICK_DB)
+	var music: AudioStreamMP3 = MUSIC.duplicate()
+	music.loop = true
+	_music = _player(music, MUSIC_DB)
+	_tick = _player(TICK, TICK_DB)
 	_deal = _player(_looping(CARD_SHOT), DEAL_DB)
 	_deal.pitch_scale = DEAL_RATE
-	for i in ONE_SHOT_VOICES:
-		_voices.append(_player(null, 0.0))
+	# One player per sound, each its own few voices: a play never waits on, or
+	# cuts off, a different sound.
+	_shot = _player(CARD_SHOT, 0.0, SHOT_VOICES)
+	_collect = _player(COLLECT, 0.0, 2)
+	_trump = _player(TRUMP, 0.0, 2)
 	Settings.changed.connect(_sync)
 	_sync()
 
@@ -69,20 +81,18 @@ func _sync() -> void:
 
 ## The card-hits-the-table sound.
 func play_shot() -> void:
-	_one_shot(CARD_SHOT)
+	_one_shot(_shot)
 
 
-## The winner-takes-the-trick collect sound, slightly delayed so it never
-## smothers a card still landing.
+## The winner-takes-the-trick collect sound. The table plays it as the trick
+## sweeps off, so it never smothers a card still landing.
 func play_collect() -> void:
-	if not Settings.sfx_enabled:
-		return
-	get_tree().create_timer(0.11).timeout.connect(func(): _one_shot(COLLECT))
+	_one_shot(_collect)
 
 
 ## The flourish for a trump landing into a trick led by a side suit.
 func play_trump() -> void:
-	_one_shot(TRUMP)
+	_one_shot(_trump)
 
 
 ## Starts the dealing loop; [method stop_deal] ends it.
@@ -105,27 +115,26 @@ func stop_tick() -> void:
 	_tick.stop()
 
 
-func _one_shot(stream: AudioStream) -> void:
-	if not Settings.sfx_enabled:
-		return
-	var voice := _voices[_next_voice]
-	_next_voice = (_next_voice + 1) % _voices.size()
-	voice.stream = stream
-	voice.play()
+func _one_shot(player: AudioStreamPlayer) -> void:
+	if Settings.sfx_enabled:
+		player.play()
 
 
-func _player(stream: AudioStream, db: float) -> AudioStreamPlayer:
+func _player(stream: AudioStream, db: float, voices := 1) -> AudioStreamPlayer:
 	var p := AudioStreamPlayer.new()
 	p.stream = stream
 	p.volume_db = db
+	p.max_polyphony = voices
 	add_child(p)
 	return p
 
 
-func _looping(stream: AudioStream) -> AudioStream:
-	var s: AudioStream = stream.duplicate()
-	if s is AudioStreamMP3:
-		(s as AudioStreamMP3).loop = true
-	elif s is AudioStreamOggVorbis:
-		(s as AudioStreamOggVorbis).loop = true
+## [param stream] looping end to end. [member AudioStreamWAV.loop_end] is the
+## last frame played, not one past it (the importer's own -1 means the same):
+## one frame further reads past the end of the samples on every wrap.
+func _looping(stream: AudioStreamWAV) -> AudioStreamWAV:
+	var s: AudioStreamWAV = stream.duplicate()
+	s.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	s.loop_begin = 0
+	s.loop_end = int(round(s.get_length() * s.mix_rate)) - 1
 	return s

@@ -174,6 +174,226 @@ func test_a_thrown_card_awaiting_confirmation_leaves_the_fan() -> void:
 	fan.queue_free()
 
 
+# ---------------------------------------------------------- idle and draw
+
+## A countdown with no deadline stays still: nothing to count and nothing to
+## redraw, so it never keeps an idle screen drawing.
+func test_a_deadline_bar_without_a_deadline_stays_idle() -> void:
+	var idle := DeadlineBar.new("Bidding for you", 0)
+	var counting := DeadlineBar.new("Bidding for you", Time.get_ticks_msec() + 5000)
+	add_child(idle)
+	add_child(counting)
+	await _frames(2)
+	expect_true(not idle.is_processing(), "no deadline, nothing running")
+	expect_true(counting.is_processing(), "a live deadline counts down")
+	idle.queue_free()
+	counting.queue_free()
+
+
+## A turn being thought over leaves the screen still, so the engine can stop
+## drawing: the clock draws nothing before its last ten seconds, and inside
+## them redraws only as its number steps down — never for the table restating
+## the same deadline (every refresh does), and never blank.
+func test_a_turn_clock_redraws_only_as_its_seconds_change() -> void:
+	var far := TurnClock.new()
+	var near := TurnClock.new()
+	var shown := {"far": [], "near": []}
+	for clock in [far, near]:
+		clock.size = Vector2(54, 54)
+		add_child(clock)
+	far.deadline_ms = Time.get_ticks_msec() + 25000
+	# Just over seven seconds left: it shows 8, and steps to 7 in a moment.
+	near.deadline_ms = Time.get_ticks_msec() + 7150
+	await _frames(2)
+	expect_eq(near._shown, 8, "inside its window it shows the seconds left")
+	far.draw.connect(func(): shown["far"].append(far._shown))
+	near.draw.connect(func(): shown["near"].append(near._shown))
+	await _seconds(0.4)
+	far.deadline_ms = far.deadline_ms
+	near.deadline_ms = near.deadline_ms
+	await _frames(3)
+	expect_eq(shown["far"], [], "a clock outside its window never redraws")
+	var steps := []
+	for n in range(7, near._shown - 1, -1):
+		steps.append(n)
+	expect_eq(shown["near"], steps, "one redraw per step down, none for a restated deadline, never blank")
+	far.queue_free()
+	near.queue_free()
+
+
+## The take is always heard: a decided trick announces itself once as it
+## sweeps off to the winner, and still once if the table clears it before the
+## sweep could start (a host on a faster animation speed, a phone that
+## stalled).
+func test_a_taken_trick_is_announced_once_even_if_cleared_early() -> void:
+	var trick := TrickCluster.new()
+	trick.size = Vector2(360, 640)
+	add_child(trick)
+	var anchors := {SeatView.Slot.BOTTOM: Vector2(180, 600), SeatView.Slot.LEFT: Vector2(20, 320),
+			SeatView.Slot.TOP: Vector2(180, 40), SeatView.Slot.RIGHT: Vector2(340, 320)}
+	var center := Vector2(180, 320)
+	var taken := []
+	trick.trick_taken.connect(func(winner): taken.append(winner))
+	# An empty felt first, so the cards fly in rather than appear as on a rejoin.
+	trick.sync([], 0, -1, anchors, {}, center, 52)
+	var plays := [{"seat": 1, "card": "KH"}, {"seat": 2, "card": "3H"}, {"seat": 3, "card": "QH"},
+			{"seat": 0, "card": "AH"}]
+	trick.sync(plays, 0, 0, anchors, {}, center, 52)
+	var whole := Motion.scaled(Motion.TRICK_ANIMATION_MS, Motion.trick_scale(Settings.animation_scale()))
+	await _seconds(whole + 0.1)
+	expect_eq(taken, [0], "a trick is taken as it sweeps off, before the table clears it")
+	trick.sync([], 0, -1, anchors, {}, center, 52)
+	expect_eq(taken, [0], "and only once")
+	plays = [{"seat": 0, "card": "2C"}, {"seat": 1, "card": "9C"}, {"seat": 2, "card": "4C"}, {"seat": 3, "card": "5C"}]
+	trick.sync(plays, 0, 1, anchors, {}, center, 52)
+	await _frames(2)
+	trick.sync([], 0, -1, anchors, {}, center, 52)
+	await _frames(2)
+	expect_eq(taken, [0, 1], "a trick cleared before it could sweep is still taken, once")
+	trick.queue_free()
+
+
+## Copies of one card back placed into a single batch (an opponent's fan, the
+## deck) are the same shapes, each moved by its own transform and indexing its
+## own vertices — one draw call for them all.
+func test_placed_copies_of_shapes_make_one_batch() -> void:
+	var back := CardView.back_shapes(Rect2(-12, -18, 24, 36))
+	var a := Transform2D(0.3, Vector2(40, 10))
+	var b := Transform2D(-0.2, Vector2(-5, 60))
+	var both := back.placed([a, b])
+	var n := back.verts.size()
+	var m := back.idx.size()
+	expect_eq(both.verts.size(), 2 * n, "a copy's worth of vertices each")
+	expect_eq(both.colors.size(), 2 * back.colors.size(), "and of colours")
+	var moved := true
+	for i in n:
+		moved = moved and both.verts[i].is_equal_approx(a * back.verts[i]) \
+				and both.verts[n + i].is_equal_approx(b * back.verts[i])
+	expect_true(moved, "each copy is the back under its own transform")
+	var indexed := both.idx.size() == 2 * m
+	for i in m:
+		indexed = indexed and both.idx[i] == back.idx[i] and both.idx[m + i] == back.idx[i] + n
+	expect_true(indexed, "the second copy's triangles index the second copy's vertices")
+	expect_eq(back.placed([b]).idx, back.idx, "one copy has the back's own triangles")
+	expect_eq(back.placed([]).idx.size(), 0, "no copies, nothing to draw")
+
+
+## The deal moves its cards rather than repainting them: each card back is
+## painted the first time it shows, the deck once, and nothing again while
+## they fly.
+func test_dealt_cards_are_drawn_once_then_only_moved() -> void:
+	_before()
+	Settings.animation_speed = "fast"
+	var deal := DealOverlay.new()
+	add_child(deal)
+	deal.start = Vector2(180, 300)
+	deal.seat_targets = {SeatView.Slot.LEFT: Vector2(20, 300), SeatView.Slot.TOP: Vector2(180, 40),
+			SeatView.Slot.RIGHT: Vector2(340, 300)}
+	var targets := []
+	for i in 13:
+		targets.append([Vector2(40 + i * 22, 560), 0.0])
+	deal.hand_targets = targets
+	var counts := {"draws": 0, "frames": 0}
+	var painted: Array = [deal._deck]
+	for card in deal._flying:
+		painted.append(card._art)
+	for node in painted:
+		node.draw.connect(func(): counts["draws"] += 1)
+	deal.begin(0, 0)
+	expect_true(await wait_until(func():
+		counts["frames"] += 1
+		return not deal.is_processing(), 10.0), "the deal finishes")
+	expect_true(counts["frames"] > 30, "the deal ran over many frames (%d)" % counts["frames"])
+	expect_true(counts["draws"] <= DealOverlay.POOL + 1, "%d paints for a whole deal" % counts["draws"])
+	Settings.animation_speed = "normal"
+	deal.queue_free()
+
+
+## Cards gliding about the fan are moved, not repainted: pressing a card to
+## preview it repaints that one card once (its shadow deepens), however many
+## frames it takes to grow and the others to part around it.
+func test_a_previewed_card_glides_without_repainting_the_fan() -> void:
+	var made: Array = await _fan()
+	var fan: HandFan = made[0]
+	await _seconds(0.3)
+	var paints := {"count": 0}
+	for id in fan._nodes:
+		fan._nodes[id]._art.draw.connect(func(): paints["count"] += 1)
+	_button(fan, _strip(fan, "5H"), true)
+	await _seconds(0.3)
+	expect_eq(fan._selected, "5H", "the card is held up")
+	expect_eq(paints["count"], 1, "only the lifted card repaints, once")
+	fan.queue_free()
+
+
+## The turn moving round redraws an opponent's avatar once, for its ring, and
+## leaves their face-down fan alone; the fan redraws only as a card leaves it.
+func test_a_turn_moving_round_redraws_the_avatar_once_and_not_the_fan() -> void:
+	var seat := SeatView.new(SeatView.Slot.TOP)
+	add_child(seat)
+	var player := GameView.make_player(2, "Kamal", "human")
+	seat.update(player, 3, 1, false, false, false, 0, 13)
+	seat.size = seat.get_combined_minimum_size()
+	await _frames(3)
+	var draws := {"avatar": 0, "fan": 0}
+	seat.avatar.draw.connect(func(): draws["avatar"] += 1)
+	seat.avatar._fan.draw.connect(func(): draws["fan"] += 1)
+	seat.update(player, 3, 1, true, false, false, 0, 13)
+	await _frames(20)
+	expect_eq(draws["avatar"], 1, "the ring goes on in one redraw")
+	expect_eq(draws["fan"], 0, "the fan is left as it was")
+	seat.update(player, 3, 1, true, false, false, 0, 12)
+	await _frames(3)
+	expect_eq(draws["fan"], 1, "a card leaving the fan redraws it once")
+	seat.queue_free()
+
+
+## A gradient gathered into a batch is cut at its inner stops into pieces that
+## cover the shape exactly — a card, and the spade on a card back, which is
+## not convex — and its antialiased rim runs through the same cut points, so
+## no seam opens between the pieces and the rim.
+func test_a_batched_gradient_covers_its_shape_without_seams() -> void:
+	var card := Rect2(0, 0, 62, 62 * CardView.FACE_ASPECT)
+	var spade := PackedVector2Array()
+	for p in Draw.suit_polygons(Cards.Suit.SPADES)[0]:
+		spade.append(p * 40.0)
+	var stops := [Color.WHITE, Color.GRAY, Color.BLACK]
+	for case in [[Draw.rounded_rect_points(card, 7, 8), card.size.y, [0.0, 0.55, 1.0]], [spade, 40.0, []]]:
+		var shape: PackedVector2Array = case[0]
+		var height: float = case[1]
+		var fill := Draw.Batch.new()
+		fill.fill_linear(shape, Vector2.ZERO, Vector2(0, height), stops, case[2], false)
+		expect_near(_covered(fill), _area(shape), 0.01, "the pieces cover the shape")
+	var cut_y := card.size.y * 0.55
+	var with_rim := Draw.Batch.new()
+	with_rim.fill_linear(Draw.rounded_rect_points(card, 7, 8), Vector2.ZERO, Vector2(0, card.size.y), stops,
+			[0.0, 0.55, 1.0])
+	for at in [Vector2(0, cut_y), Vector2(card.size.x, cut_y)]:
+		var uses := 0
+		for v in with_rim._verts:
+			if v.distance_to(at) < 1e-3:
+				uses += 1
+		# The piece above, the piece below, and the rim.
+		expect_true(uses >= 3, "the cut at %s is shared by both pieces and the rim (%d)" % [at, uses])
+
+
+static func _covered(batch: Draw.Batch) -> float:
+	var total := 0.0
+	for i in range(0, batch._idx.size(), 3):
+		var a := batch._verts[batch._idx[i]]
+		var b := batch._verts[batch._idx[i + 1]]
+		var c := batch._verts[batch._idx[i + 2]]
+		total += absf((b - a).cross(c - a)) / 2.0
+	return total
+
+
+static func _area(points: PackedVector2Array) -> float:
+	var total := 0.0
+	for i in points.size():
+		total += points[i].cross(points[(i + 1) % points.size()])
+	return absf(total) / 2.0
+
+
 # ------------------------------------------------------- throw hand-off
 
 ## Behaves like a networked table: a play is only sent, and the view changes
@@ -291,6 +511,29 @@ func test_refusal_hints_explain_the_rule() -> void:
 	expect_eq(HintLine.illegal(_view(hearts, low), "2H")["text"], "Beat the trick — play a higher heart")
 
 
+# ---------------------------------------------------------------- sound
+
+## The deal's looping card sound ends each pass on its own last frame:
+## AudioStreamWAV's loop end is inclusive, and one frame further reads past the
+## samples on every wrap (a click, or a crash where the allocator guards the
+## end of a large block). Played across the seam, the silent tail runs straight
+## into the faded-in start, with nothing between.
+func test_the_deal_loop_wraps_within_its_samples() -> void:
+	var loop: AudioStreamWAV = Audio._deal.stream
+	var frames := loop.data.size() / (4 if loop.stereo else 2)
+	expect_eq(loop.loop_end, frames - 1, "the loop ends on the last frame")
+	var copy: AudioStreamWAV = loop.duplicate()
+	# At the mixer's own rate, so each output frame is one source frame.
+	copy.mix_rate = int(AudioServer.get_mix_rate())
+	var playback := copy.instantiate_playback()
+	playback.start()
+	var out := playback.mix_audio(1.0, frames + 64)
+	var stray := 0.0
+	for i in range(frames - 64, frames + 8):
+		stray = maxf(stray, absf(out[i].x) + absf(out[i].y))
+	expect_true(stray < 0.01, "nothing plays at the seam but the sound itself (%.3f)" % stray)
+
+
 # --------------------------------------------------------------- motion
 
 ## Every host — the Go server, the LAN host and the solo table — leaves a
@@ -308,3 +551,204 @@ func test_the_trick_sequence_fits_the_host_linger_at_every_speed() -> void:
 
 func test_the_deal_animation_fits_before_bidding_opens() -> void:
 	expect_true(GameSession.DEAL_GRACE >= Motion.DEAL_TOTAL, "the grace covers the whole deal")
+
+
+# ---------------------------------------------------------- every screen
+
+## Phones and tablets, in dp: a fold's cover screen, small and tall phones, a
+## 7" tablet, an open fold, an iPad mini and a 12.9" iPad Pro.
+const DEVICES := [Vector2(280, 653), Vector2(320, 568), Vector2(360, 640), Vector2(360, 800), Vector2(390, 844),
+		Vector2(412, 915), Vector2(600, 960), Vector2(673, 841), Vector2(768, 1024), Vector2(1024, 1366)]
+const FULL_HAND: Array[String] = ["AS", "10S", "8S", "5S", "AH", "KH", "QH", "3H", "AD", "4D", "9C", "8C", "2C"]
+const FULL_TRICK := [{"seat": 1, "card": "KS"}, {"seat": 2, "card": "3S"}, {"seat": 3, "card": "QS"},
+		{"seat": 0, "card": "JS"}]
+
+
+## [param dp] in design pixels, the way [App] sizes the screen.
+static func _design(dp: Vector2) -> Vector2i:
+	var m := clampf(minf(dp.x, dp.y) / App.DESIGN_SHORT_SIDE, App.MIN_SCALE, App.MAX_SCALE)
+	return Vector2i((dp / m).round())
+
+
+## A table mid-hand: long names, double-figure scores and a dealer's badge.
+static func _busy_view(hand: Array[String], trick: Array, turn: int) -> GameView:
+	var v := _view(hand, trick, turn)
+	v.players = [GameView.make_player(0, "Nabin", "human"), GameView.make_player(1, "Bishnu Prasad", "human"),
+			GameView.make_player(2, "Kamal", "bot"), GameView.make_player(3, "Sita", "bot")]
+	v.hand_counts.assign([hand.size(), 12, 12, 12])
+	v.bids.assign([4, 3, 12, 2])
+	v.tricks_won.assign([2, 1, 10, 0])
+	return v
+
+
+## Every phone and tablet either way up, with a full hand and a full trick:
+## nothing at the table touches anything it must not or leaves the screen, the
+## played cards gather on the felt's centre, and a larger screen draws the
+## whole table larger.
+func test_the_table_fits_every_screen() -> void:
+	var scales := await _every_screen(true)
+	# A phone draws it at (or, for the longest name, all but at) its design size.
+	expect_true(scales[Vector2i(390, 844)] >= 0.99 and scales[Vector2i(390, 844)] <= 1.0,
+			"a phone draws the table at its design size, got %s" % scales[Vector2i(390, 844)])
+	expect_near(scales[Vector2i(844, 390)], 1.0, 0.001, "and on its side")
+	var ipad := _design(Vector2(1024, 1366))
+	expect_true(scales[ipad] > 1.2 and scales[Vector2i(ipad.y, ipad.x)] > 1.2, "a tablet draws it larger")
+
+
+## The same with the table put away (Settings → Show table off): nothing
+## touches or leaves the screen, every seat keeps to its own edge, centred
+## along it, and the played cards gather on the screen's centre.
+func test_without_the_table_the_seats_keep_to_the_edges() -> void:
+	var scales := await _every_screen(false)
+	var ipad := _design(Vector2(1024, 1366))
+	expect_true(scales[ipad] > 1.2 and scales[Vector2i(ipad.y, ipad.x)] > 1.2, "a tablet draws it larger")
+
+
+## Plays a busy table on every device either way up, with the table shown or
+## put away, checking each screen; gives back each screen's scale.
+func _every_screen(show_table: bool) -> Dictionary:
+	_before()
+	Settings.show_table = true
+	var root := get_tree().root
+	var headless := [root.size, root.content_scale_size]
+	var app: App = load("res://scenes/main.tscn").instantiate()
+	add_child(app)
+	await _frames(2)
+	var after_mine: Array[String] = FULL_HAND.filter(func(c): return c != "10S")
+	var session := ServerLike.new(_busy_view(FULL_HAND, FULL_TRICK.slice(0, 3), 0))
+	var table := TableScreen.new(session)
+	app.push(table)
+	await _seconds(0.4)
+	# Put away (or kept) mid-game, from the settings sheet.
+	Settings.show_table = show_table
+	await _frames(2)
+	expect_eq(table._felt.visible, show_table, "the felt drawn only with the table shown")
+	var scales := {}
+	for dp in DEVICES:
+		var standing := _design(dp)
+		for shape in [standing, Vector2i(standing.y, standing.x)]:
+			root.size = shape
+			root.content_scale_size = shape
+			# The player's turn, with the widest thing the hint ever says.
+			session.confirm(_busy_view(FULL_HAND, FULL_TRICK.slice(0, 3), 0))
+			table._hint.hint = HintLine._beat(Cards.Suit.DIAMONDS)
+			await _seconds(0.5)
+			_expect_clear(table, "%s on the player's turn" % shape)
+			session.confirm(_busy_view(after_mine, FULL_TRICK, 1))
+			table._hint.hint = {}
+			await _seconds(0.6)
+			_expect_clear(table, "%s with a full trick" % shape)
+			var trick := _bounds(_items(table).filter(func(it): return it[0] == "trick"))
+			if show_table:
+				var felt := table._felt.get_global_rect()
+				expect_near(trick.get_center().distance_to(felt.get_center()), 0.0, 2.0,
+						"the played cards gather on the felt's centre at %s" % shape)
+				expect_true(felt.encloses(trick), "the played cards lie on the felt at %s" % shape)
+			else:
+				_expect_at_edges(table, trick, shape)
+			expect_eq(table._body.scale.x, table._body.scale.y, "one scale for the whole table at %s" % shape)
+			scales[shape] = table._body.scale.x
+	root.size = headless[0]
+	root.content_scale_size = headless[1]
+	Settings.show_table = true
+	app.queue_free()
+	await _frames(1)
+	return scales
+
+
+## With the table put away: the side seats at the screen's left and right
+## edges and level with its centre, the top seat and the player's own plate at
+## its top and bottom edges and centred across it, the played cards on its
+## centre.
+func _expect_at_edges(table: TableScreen, trick: Rect2, shape: Vector2i) -> void:
+	var view := table.get_viewport_rect()
+	var mid := view.get_center()
+	var k := table._body.scale.x
+	var left := table._seats[SeatView.Slot.LEFT].get_global_rect() as Rect2
+	var right := table._seats[SeatView.Slot.RIGHT].get_global_rect() as Rect2
+	var top := table._seats[SeatView.Slot.TOP].get_global_rect() as Rect2
+	var plate := table._seats[SeatView.Slot.BOTTOM].get_global_rect() as Rect2
+	expect_near(trick.get_center().distance_to(mid), 0.0, 2.0, "the played cards on the screen's centre at %s" % shape)
+	# The side seats stand in a column as wide as the wider of them can grow,
+	# against the screen's side.
+	var column: float = table._seats[SeatView.Slot.LEFT].reserved_size().x
+	column = maxf(column, table._seats[SeatView.Slot.RIGHT].reserved_size().x)
+	var from_side := UI.sc(0, 8) + (TableLayout.EDGE + column / 2.0) * k
+	expect_near(left.get_center().x, from_side, 1.0, "the left seat at the left edge at %s" % shape)
+	expect_near(view.end.x - right.get_center().x, from_side, 1.0, "the right seat at the right edge at %s" % shape)
+	expect_near(left.get_center().y, mid.y, 1.0, "the left seat level with the centre at %s" % shape)
+	expect_near(right.get_center().y, mid.y, 1.0, "the right seat level with the centre at %s" % shape)
+	expect_near(top.get_center().x, mid.x, 1.0, "the top seat centred at %s" % shape)
+	expect_true(top.position.y <= table._hud.get_global_rect().end.y + (TableLayout.GAP + 1.0) * k,
+			"the top seat at the top edge, only the HUD above it, at %s" % shape)
+	expect_near(plate.get_center().x, mid.x, 1.0, "the player's plate centred at %s" % shape)
+	expect_true(plate.end.y >= view.end.y - (UI.sc(14, 4) + 1.0) * k, "the player's plate at the bottom edge at %s" % shape)
+
+
+## Nothing on screen leaves it, and nothing touches anything of anyone else's.
+## The player's hand reaching over their own plate is the one overlap meant.
+func _expect_clear(table: TableScreen, what: String) -> void:
+	var items := _items(table)
+	var view := table.get_viewport_rect().grow(0.5)
+	for it in items:
+		expect_true(view.encloses(it[2]), "%s:%s on screen at %s: %s" % [it[0], it[1], what, it[2]])
+	for i in items.size():
+		for j in range(i + 1, items.size()):
+			var a: Array = items[i]
+			var b: Array = items[j]
+			if a[0] == b[0] or ([a[0], b[0]] as Array).has("hand") and ([a[0], b[0]] as Array).has("plate"):
+				continue
+			var shared: Rect2 = a[2].intersection(b[2])
+			expect_true(shared.size.x <= 1.5 or shared.size.y <= 1.5,
+					"%s:%s clear of %s:%s at %s" % [a[0], a[1], b[0], b[1], what])
+
+
+## Everything at the table that stays put through a trick, as
+## `[owner, part, screen rect]`.
+func _items(table: TableScreen) -> Array:
+	var items := []
+	var names := ["back", "tune", "spacer", "round"]
+	for i in table._hud.get_child_count():
+		if names[i] != "spacer":
+			items.append(["hud", names[i], (table._hud.get_child(i) as Control).get_global_rect()])
+	for slot in table._seats:
+		var seat: SeatView = table._seats[slot]
+		var owner := "plate" if slot == SeatView.Slot.BOTTOM else "seat %d" % slot
+		items.append([owner, "name", seat._name_chip.get_global_rect()])
+		items.append([owner, "avatar", seat.avatar.get_global_rect()])
+		items.append([owner, "score", seat._bid_chip.get_global_rect()])
+		var fan := seat.avatar.fan_rect()
+		if fan.has_area():
+			items.append([owner, "fan", _on_screen(seat.avatar, fan)])
+	for id in table._hand._nodes:
+		var card: CardView = table._hand._nodes[id]
+		if card.visible:
+			items.append(["hand", id, _on_screen(card, Rect2(Vector2.ZERO, card.size))])
+	for id in table._trick._cards:
+		var card: CardView = table._trick._cards[id].node
+		items.append(["trick", id, _on_screen(card, Rect2(Vector2.ZERO, card.size))])
+	if not table._hint.shown_text().is_empty():
+		items.append(["hint", table._hint.shown_text(), table._hint.get_global_rect()])
+	return items
+
+
+## [param local] in [param node]'s coordinates, turned and scaled onto the
+## screen: the box around it.
+static func _on_screen(node: CanvasItem, local: Rect2) -> Rect2:
+	var xf := node.get_global_transform()
+	return _bounds_of([xf * local.position, xf * Vector2(local.end.x, local.position.y), xf * local.end,
+			xf * Vector2(local.position.x, local.end.y)])
+
+
+static func _bounds_of(points: Array) -> Rect2:
+	var out := Rect2(points[0], Vector2.ZERO)
+	for p in points:
+		out = out.expand(p)
+	return out
+
+
+static func _bounds(items: Array) -> Rect2:
+	var out: Rect2 = items[0][2]
+	for it in items:
+		out = out.merge(it[2])
+	return out

@@ -2,7 +2,7 @@ class_name Pressable
 extends MarginContainer
 
 ## Instant press feedback for anything tappable: the content dips a little
-## while held and springs back, so a surface reads as a button. Emits
+## while held and comes back on release, so a surface reads as a button. Emits
 ## [signal pressed] on release inside the control. A drag that strays far
 ## from the touch-down point (a scroll) cancels the press.
 
@@ -17,7 +17,6 @@ var enabled := true:
 
 var _down := false
 var _down_pos := Vector2.ZERO
-var _tween: Tween
 
 
 func _init() -> void:
@@ -72,8 +71,5 @@ func _notification(what: int) -> void:
 
 
 func _animate(to: float) -> void:
-	if _tween != null:
-		_tween.kill()
-	_tween = create_tween().set_parallel().set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
-	_tween.tween_property(self, "scale", Vector2(to, to), 0.09)
-	_tween.tween_property(self, "modulate:a", 0.82 if to < 1.0 else 1.0, 0.09)
+	scale = Vector2(to, to)
+	modulate.a = 0.82 if to < 1.0 else 1.0
