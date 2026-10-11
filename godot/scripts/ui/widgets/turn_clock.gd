@@ -4,9 +4,11 @@ extends Control
 ## The last stretch of a turn, drawn as a draining ring around a seat's avatar.
 ##
 ## It says nothing for most of a turn — a clock that is always visible stops
-## being read. It appears for the final [constant WINDOW_MS] and turns red,
-## pulses and (for the viewer's own seat only) ticks below
-## [constant ALARM_SECONDS]: past the deadline the table plays the seat.
+## being read. It appears for the final [constant WINDOW_MS], draining a step a
+## second, and turns red and (for the viewer's own seat only) ticks below
+## [constant ALARM_SECONDS]: past the deadline the table plays the seat. It
+## redraws once a second at most, so a turn being thought over leaves the
+## screen still.
 
 const WINDOW_MS := 10000
 const ALARM_SECONDS := 5
@@ -17,12 +19,15 @@ var deadline_ms := 0:
 		if v != deadline_ms:
 			_set_ticking(false)
 		deadline_ms = v
+		_shown = 0
 		set_process(v > 0)
 		queue_redraw()
 ## Only the viewer's own clock may tick out loud.
 var audible := false
 
 var _ticking := false
+## The whole seconds on screen, or 0 while the clock is not showing.
+var _shown := 0
 
 
 func _init() -> void:
@@ -34,9 +39,12 @@ func _process(_delta: float) -> void:
 	var left := deadline_ms - Time.get_ticks_msec()
 	var seconds := ceili(left / 1000.0)
 	_set_ticking(audible and seconds > 0 and seconds <= ALARM_SECONDS)
+	var shown := seconds if left > 0 and left < WINDOW_MS else 0
+	if shown != _shown:
+		_shown = shown
+		queue_redraw()
 	if left <= 0:
 		set_process(false)
-	queue_redraw()
 
 
 func _exit_tree() -> void:
@@ -54,23 +62,17 @@ func _set_ticking(on: bool) -> void:
 
 
 func _draw() -> void:
-	if deadline_ms <= 0:
+	if _shown <= 0:
 		return
-	var left := deadline_ms - Time.get_ticks_msec()
-	if left >= WINDOW_MS or left <= 0:
-		return
-	var fraction := clampf(float(left) / WINDOW_MS, 0.0, 1.0)
-	var seconds := ceili(left / 1000.0)
-	var alarm := seconds <= ALARM_SECONDS
+	var seconds := _shown
+	var fraction := clampf(seconds * 1000.0 / WINDOW_MS, 0.0, 1.0)
 	var urgency := clampf(1.0 - fraction / 0.6, 0.0, 1.0)
-	var colour := Tokens.GOLD_MID.lerp(Tokens.DANGER, urgency)
-	var beat := 1.0 + 0.06 * sin(left / 1000.0 * TAU) if alarm else 1.0
-	var d := minf(size.x, size.y) * beat
+	var colour := Tokens.DANGER if seconds <= ALARM_SECONDS else Tokens.GOLD_MID.lerp(Tokens.DANGER, urgency)
+	var d := minf(size.x, size.y)
 	var stroke := d * 0.075
 	var c := size / 2.0
 	var r := d / 2.0 - stroke / 2.0
 	draw_arc(c, r, 0, TAU, 48, Color(0, 0, 0, 0.4), stroke, true)
-	draw_arc(c, r, -PI / 2, -PI / 2 + TAU * fraction, 48, Color(colour, 0.55), stroke * 1.8, true)
 	draw_arc(c, r, -PI / 2, -PI / 2 + TAU * fraction, 48, colour, stroke, true)
 	# The count itself, for players who want the number rather than the shape.
 	var badge := d * 0.4

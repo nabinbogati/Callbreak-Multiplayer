@@ -269,38 +269,10 @@ static func glass_panel(child: Control, pad := Vector4(20, 20, 20, 20), accent :
 	return panel(glass_box(pad, accent), child)
 
 
-## A one-shot scale-and-fade entrance for a panel appearing over the table.
-static func pop_in(node: Control, duration := 0.28, from := 0.9) -> void:
-	var run := func(t: float) -> void:
-		var e := Motion.ease_out_back(t)
-		node.modulate.a = clampf(e, 0.0, 1.0)
-		node.pivot_offset = node.size / 2.0
-		node.scale = Vector2.ONE * (from + (1.0 - from) * e)
-	run.call(0.0)
-	node.create_tween().tween_method(run, 0.0, 1.0, duration)
-
-
-## A one-shot rise-and-fade: [param node] drifts up [param rise] px into place
-## as it fades in over [param duration] (on the entrance curve). With a
-## [param stagger], item [param index] holds back for the first part of its
-## run. Returns a wrapper to add in the node's place — a container would
-## otherwise pin the node's position.
-static func rise_in(node: Control, duration: float, rise: float, index := 0, stagger := 0.0) -> Control:
-	var wrap := Control.new()
-	wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	wrap.size_flags_horizontal = node.size_flags_horizontal
-	wrap.add_child(node)
-	var fit := func(): wrap.custom_minimum_size = node.get_combined_minimum_size()
-	node.minimum_size_changed.connect(fit)
-	fit.call()
-	var run := func(t: float) -> void:
-		var local := clampf(Motion.enter(t) * (1.0 + index * stagger) - index * stagger, 0.0, 1.0)
-		node.modulate.a = local
-		node.position = Vector2(0, rise * (1.0 - local))
-	wrap.resized.connect(func(): node.size = wrap.size)
-	run.call(0.0)
-	wrap.create_tween().tween_method(run, 0.0, 1.0, duration)
-	return wrap
+## A short fade-in for a panel appearing over the table.
+static func fade_in(node: Control, duration := 0.15) -> void:
+	node.modulate.a = 0.0
+	node.create_tween().tween_property(node, "modulate:a", 1.0, duration)
 
 
 ## A suit glyph as a control, [param size] tall.

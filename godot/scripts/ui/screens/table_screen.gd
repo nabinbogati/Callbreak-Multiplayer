@@ -67,9 +67,7 @@ func _init(session_in: GameSession) -> void:
 
 func _ready() -> void:
 	add_child(_backdrop)
-	_backdrop.glow_alignment_portrait = Vector2(0, -0.2)
-	_backdrop.glow_alignment_landscape = Vector2(0, -0.2)
-	_backdrop.glow_scale = 1.5
+	_backdrop.bloom = false
 	_body.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_body.set_anchors_preset(Control.PRESET_TOP_LEFT)
 	add_child(_body)
@@ -86,6 +84,9 @@ func _ready() -> void:
 	_make_seats()
 	_trick.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_trick.throw_refused.connect(func(_card): _refresh())
+	# The collect sound goes with the cards leaving, not with the last one
+	# landing.
+	_trick.sweep_started.connect(Audio.play_collect)
 	_body.add_child(_trick)
 	_fx.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_fx.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -402,9 +403,6 @@ func _refresh() -> void:
 		_hand.gestures_enabled = not _dealing
 		_hand.set_hand(v.hand, v.legal_move_ids, interactive, shown, _trick.pending_ids())
 		_hint.your_turn = interactive
-		var waiting := not _dealing and v.turn >= 0 and not v.awaiting_trick_clear \
-				and (v.phase == GameView.BIDDING or v.phase == GameView.PLAYING)
-		_felt.spotlight = SeatView.slot_for(v.turn, v.you) if waiting else -1
 		_felt.lead_suit = Cards.suit(v.trick[0]["card"]) if not v.awaiting_trick_clear and not v.trick.is_empty() \
 				else -1
 		# Lying down, the hint sits in the player's own place among the played
@@ -433,7 +431,6 @@ func _on_game_event(event: Dictionary) -> void:
 			if _is_trump_into_side_suit(str(event.get("card", ""))):
 				Audio.play_trump()
 		"trickWon":
-			Audio.play_collect()
 			if session.view != null and int(event.get("seat", -1)) == session.view.you:
 				Haptics.thud()
 		"seatChanged":
@@ -636,7 +633,6 @@ func _refresh_banners() -> void:
 		_autoplay_banner.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		_banners.add_child(_autoplay_banner)
 		_banners.move_child(_autoplay_banner, 0)
-		_slide_in(_autoplay_banner)
 	elif not autoplay and _autoplay_banner != null:
 		_autoplay_banner.queue_free()
 		_autoplay_banner = null
@@ -665,20 +661,9 @@ func _announce(text: String, online: bool, icon: String, seat: int) -> void:
 	var banner := _presence_banner
 	get_tree().create_timer(4.0).timeout.connect(func():
 		if is_instance_valid(banner):
-			var t := banner.create_tween()
-			t.tween_property(banner, "modulate:a", 0.0, 0.24)
-			t.tween_callback(banner.queue_free)
+			banner.queue_free()
 			if _presence_banner == banner:
 				_presence_banner = null)
-
-
-## Fades a banner in as it drops into place from slightly above.
-func _slide_in(node: Control) -> void:
-	var run := func(t: float) -> void:
-		node.modulate.a = t
-		node.position.y = node.size.y * -0.3 * (1.0 - t)
-	run.call(0.0)
-	node.create_tween().tween_method(run, 0.0, 1.0, 0.26)
 
 
 func _banner_box(content: Control, border: Color, bg: Color) -> Control:
@@ -688,8 +673,6 @@ func _banner_box(content: Control, border: Color, bg: Color) -> Control:
 	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	for c in panel.find_children("*", "Control", true, false):
 		c.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	panel.modulate.a = 0.0
-	panel.create_tween().tween_property(panel, "modulate:a", 1.0, 0.24)
 	return panel
 
 
@@ -747,7 +730,7 @@ func _rebuild_overlay(force: bool) -> void:
 		c.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		c.add_child(_bid_panel)
 		_overlay.add_child(c)
-		UI.pop_in(_bid_panel)
+		UI.fade_in(_bid_panel)
 	if v.phase == GameView.HAND_OVER:
 		var board := Scoreboard.new(v, session.hand_advance_deadline_ms, _modal_max_height())
 		board.continue_pressed.connect(func(): session.continue_to_next_hand())
@@ -786,7 +769,7 @@ func _modal(content: Control, max_width: float) -> Control:
 	content.custom_minimum_size.x = minf(max_width, size.x) - pad * 2.0
 	center.add_child(content)
 	scrim.add_child(center)
-	UI.pop_in(content)
+	UI.fade_in(content)
 	return scrim
 
 
@@ -873,28 +856,22 @@ func _reconnect_overlay() -> Control:
 func _connect_failure() -> Control:
 	var message := session.error_message if not session.error_message.is_empty() \
 			else "Something went wrong while connecting. Check your internet and try again."
-	var pulse := Control.new()
-	pulse.custom_minimum_size = Vector2(72, 72)
-	pulse.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	pulse.draw.connect(func():
-		var t := (sin(Time.get_ticks_msec() / 1500.0 * PI) + 1.0) / 2.0
+	var badge := Control.new()
+	badge.custom_minimum_size = Vector2(72, 72)
+	badge.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	badge.draw.connect(func():
 		var c := Vector2(36, 36)
-		Draw.disc(pulse, c, 27 + 5 * t, Color(Tokens.DANGER, 0.08 + 0.05 * t))
-		Draw.circle_border(pulse, c, 27 + 5 * t + 0.75, Color(Tokens.DANGER, 0.3 + 0.15 * t), 1.5)
-		Draw.disc(pulse, c, 26, Color(Tokens.DANGER, 0.14))
-		Draw.icon(pulse, "wifi_off", Rect2(c - Vector2(13, 13), Vector2(26, 26)), Tokens.DANGER))
-	var timer := Timer.new()
-	timer.wait_time = 1.0 / 30.0
-	timer.autostart = true
-	timer.timeout.connect(pulse.queue_redraw)
-	pulse.add_child(timer)
+		Draw.disc(badge, c, 30, Color(Tokens.DANGER, 0.1))
+		Draw.circle_border(badge, c, 30.75, Color(Tokens.DANGER, 0.38), 1.5)
+		Draw.disc(badge, c, 26, Color(Tokens.DANGER, 0.14))
+		Draw.icon(badge, "wifi_off", Rect2(c - Vector2(13, 13), Vector2(26, 26)), Tokens.DANGER))
 	var buttons := UI.hbox(10)
 	# Only a brand-new connect can simply try again; a seat that was given up
 	# cannot be retried into existence.
 	if session.is_network() and session.view == null:
 		buttons.add_child(UI.expand(UI.gold_button("Try again", func(): session.retry_connect(), "refresh_rounded", true)))
 	buttons.add_child(UI.expand(UI.ghost_button("Back", _leave, "", true)))
-	var col := UI.vbox(0, [pulse, UI.gap(14),
+	var col := UI.vbox(0, [badge, UI.gap(14),
 		UI.label("Can't connect", 18, Tokens.TEXT_PRIMARY, "bold", HORIZONTAL_ALIGNMENT_CENTER), UI.gap(6),
 		UI.paragraph(message, 13, Tokens.TEXT_MUTED, "medium", HORIZONTAL_ALIGNMENT_CENTER), UI.gap(22), buttons])
 	col.custom_minimum_size.x = minf(300, size.x - 48)

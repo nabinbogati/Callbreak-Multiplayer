@@ -13,6 +13,11 @@ extends Control
 ## table's colourway with a spade medallion, the same proportions as the face,
 ## so a dealt card turns over into the hand without changing shape. The pivot
 ## is kept at the centre so rotations and zooms turn about the middle.
+##
+## The card is painted on a child [Node2D], not on this control: a control
+## redraws itself whenever it is turned or scaled, which would repaint a card
+## on every frame it moves. The child repaints only when the card's look
+## changes; moving, turning and scaling the card just moves that painting.
 
 const FACE_ASPECT := 80.0 / 54.0
 const BACK_ASPECT := FACE_ASPECT
@@ -27,24 +32,25 @@ var dimmed := false:
 	set(v):
 		if v != dimmed:
 			dimmed = v
-			queue_redraw()
-## Lit with a warm halo — a playable card on your turn, or the card currently
-## winning the trick.
+			_art.queue_redraw()
+## Lit with a warm halo — the card currently winning the trick.
 var highlighted := false:
 	set(v):
 		if v != highlighted:
 			highlighted = v
-			queue_redraw()
+			_art.queue_redraw()
 ## 0 resting … 1 held high (being previewed or dragged); deepens the shadow so
 ## a lifted card visibly leaves the fan.
 var elevation := 0.0:
 	set(v):
 		if v != elevation:
 			elevation = v
-			queue_redraw()
+			_art.queue_redraw()
 var shadow := true
 var spade_emblem := false
 var card_width := 54.0
+
+var _art := Node2D.new()
 
 
 static func face(card_id: String, width: float) -> CardView:
@@ -65,7 +71,9 @@ static func back(width: float, emblem := false) -> CardView:
 
 func _init() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
-	Settings.changed.connect(queue_redraw)
+	_art.draw.connect(_paint)
+	add_child(_art)
+	Settings.changed.connect(_art.queue_redraw)
 
 
 func set_card_width(width: float) -> void:
@@ -73,19 +81,47 @@ func set_card_width(width: float) -> void:
 	custom_minimum_size = Vector2(width, width * FACE_ASPECT)
 	size = custom_minimum_size
 	pivot_offset = size / 2.0
-	queue_redraw()
+	_art.queue_redraw()
 
 
 func card_height() -> float:
 	return card_width * FACE_ASPECT
 
 
-func _draw() -> void:
+func _paint() -> void:
 	var rect := Rect2(Vector2.ZERO, Vector2(card_width, card_height()))
 	if face_up:
-		CardView.paint_face(self, rect, card, dimmed, highlighted, shadow, elevation)
+		CardView.paint_face(_art, rect, card, dimmed, highlighted, shadow, elevation)
 	else:
-		CardView.paint_back(self, rect, spade_emblem, shadow)
+		CardView.paint_back(_art, rect, spade_emblem, shadow)
+
+
+# ------------------------------------------------------------------ cache
+
+## Built card art ([Draw.Shapes]) by everything it depends on. A card's shapes
+## take milliseconds of GDScript to build and are the same every time they
+## are drawn, so each is built once: dealing a hand, lighting the playable
+## cards or flipping a card over then costs a few engine calls, not a rebuild.
+static var _built := {}
+## Enough for two hands' worth of sizes of every card, with backs; a new
+## screen density or colour style starts the cache over.
+const _CACHE_LIMIT := 160
+
+
+static func _cached(key: String, build: Callable) -> Draw.Shapes:
+	var shapes: Draw.Shapes = _built.get(key)
+	if shapes == null:
+		if _built.size() >= _CACHE_LIMIT:
+			_built.clear()
+		var art := Draw.Batch.new()
+		build.call(art)
+		shapes = art.take()
+		_built[key] = shapes
+	return shapes
+
+
+static func _key(kind: String, rect: Rect2, extra: String) -> String:
+	return "%s|%s|%s|%s|%.4f" % [kind, extra, rect.position, rect.size, Draw.device_px()]
 
 
 # ------------------------------------------------------------------- face
@@ -95,8 +131,6 @@ func _draw() -> void:
 static func paint_face(ci: CanvasItem, rect: Rect2, card_id: String, is_dimmed := false,
 		is_highlighted := false, with_shadow := true, lift := 0.0) -> void:
 	var w := rect.size.x
-	var palette := Settings.card_face()
-	var face_color: Color = palette["face"]
 	var radius := w * 0.11
 	var e := clampf(lift, 0.0, 1.0)
 	var shadows := []
@@ -106,7 +140,31 @@ static func paint_face(ci: CanvasItem, rect: Rect2, card_id: String, is_dimmed :
 		shadows.append([Color(0, 0, 0, 0.32 + 0.14 * e), w * (0.16 + 0.22 * e), Vector2(0, w * (0.08 + 0.16 * e))])
 	Draw.box_shadow(ci, rect, radius, shadows)
 
-	var art := Draw.Batch.new()
+	_cached(_key("face", rect, card_id + Settings.card_style), func(art: Draw.Batch):
+		_face_art(art, rect, card_id)).draw(ci)
+
+	var palette := Settings.card_face()
+	var ink: Color = palette["red"] if Cards.is_red(card_id) else palette["ink"]
+	var pad := w * 0.075
+	var top_left := rect.position + Vector2(pad, pad * 0.55)
+	var turned := Transform2D(PI, rect.end - Vector2(pad, pad * 0.55))
+	_index_rank(ci, card_id, ink, w, top_left)
+	ci.draw_set_transform_matrix(turned)
+	_index_rank(ci, card_id, ink, w, Vector2.ZERO)
+	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	_center_letter(ci, card_id, ink, w, rect.get_center())
+	if is_dimmed:
+		_cached(_key("veil", rect, ""), func(art: Draw.Batch):
+			art.fill(Draw.rounded_rect_points(rect, radius, 8), VEIL)).draw(ci)
+
+
+## A face's shapes — the card, its border, its suit marks — gathered into
+## [param art]; the lettering is drawn over them.
+static func _face_art(art: Draw.Batch, rect: Rect2, card_id: String) -> void:
+	var w := rect.size.x
+	var palette := Settings.card_face()
+	var face_color: Color = palette["face"]
+	var radius := w * 0.11
 	var trump := Cards.is_trump(card_id)
 	var pts := Draw.rounded_rect_points(rect, radius, 8)
 	art.fill_linear(pts, rect.position, Vector2(rect.position.x, rect.end.y),
@@ -128,16 +186,6 @@ static func paint_face(ci: CanvasItem, rect: Rect2, card_id: String, is_dimmed :
 	_index_suit(art, card_id, ink, w, Vector2.ZERO)
 	art.transform = Transform2D.IDENTITY
 	_center_suit(art, card_id, ink, w, rect.get_center())
-	art.flush(ci)
-
-	_index_rank(ci, card_id, ink, w, top_left)
-	ci.draw_set_transform_matrix(turned)
-	_index_rank(ci, card_id, ink, w, Vector2.ZERO)
-	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
-	_center_letter(ci, card_id, ink, w, rect.get_center())
-	if is_dimmed:
-		art.fill(pts, VEIL)
-		art.flush(ci)
 
 
 ## Width and height of the corner index (rank over suit).
@@ -231,9 +279,13 @@ static func _court_layout(w: float, center: Vector2) -> Vector2:
 static func paint_back(ci: CanvasItem, rect: Rect2, emblem := false, with_shadow := true) -> void:
 	if with_shadow:
 		back_shadow(ci, rect)
-	var art := Draw.Batch.new()
-	back_art(art, rect, emblem)
-	art.flush(ci)
+	back_shapes(rect, emblem).draw(ci)
+
+
+## A card back's artwork for [param rect], built once (see [method _cached]).
+static func back_shapes(rect: Rect2, emblem := false) -> Draw.Shapes:
+	return _cached(_key("back", rect, "%s%s" % [Settings.theme, emblem]), func(art: Draw.Batch):
+		back_art(art, rect, emblem))
 
 
 ## The shadow under a card back.

@@ -219,7 +219,7 @@ func test_layout_holds_at_every_window_shape() -> void:
 		await _resize(shape)
 		var winner: WinnerScreen = winners.call()[0]
 		var view := app.get_viewport_rect().grow(1.0)
-		var col: Control = winner.get_child(2).get_child(0)
+		var col: Control = winner.get_child(1).get_child(0)
 		expect_true(view.encloses(col.get_global_rect()), "winner screen at %s lies on screen: %s" % [shape,
 				col.get_global_rect()])
 		var pill: Pressable = winner.find_children("*", "Pressable", false, false)[0]
@@ -242,7 +242,7 @@ func _resize(shape: Vector2i) -> void:
 	get_tree().root.size = shape
 	get_tree().root.content_scale_size = shape
 	await _frames(3)
-	# The table's panels pop in from a little smaller.
+	# The table's panels fade in.
 	await get_tree().create_timer(0.35).timeout
 
 

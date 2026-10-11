@@ -70,7 +70,7 @@ func _portrait() -> Control:
 		UI.gap(26),
 		_section_label("Choose how to play"),
 		UI.gap(12),
-		_staggered(0, _featured(MODES[0], false)),
+		_featured(MODES[0], false),
 		UI.gap(12),
 		_tiles(false),
 		UI.gap(16),
@@ -92,7 +92,7 @@ func _landscape() -> Control:
 	var col := UI.vbox(0, [
 		_section_label("Choose how to play"),
 		UI.gap(8),
-		_staggered(0, _featured(MODES[0], true)),
+		_featured(MODES[0], true),
 		UI.gap(10),
 		_tiles(true),
 	])
@@ -184,11 +184,6 @@ func _shadowed(word: Label, font: Font, size: float) -> Control:
 	return word
 
 
-## A one-shot rise-and-fade, staggered by [param index], for the mode cards.
-func _staggered(index: int, node: Control) -> Control:
-	return UI.rise_in(node, (420 + index * 90) / 1000.0, 16, index, 0.25)
-
-
 func _mode_icon(spec: Dictionary, size: float) -> Control:
 	var accent: Color = spec["accent"]
 	var c := Control.new()
@@ -260,7 +255,7 @@ func _featured(spec: Dictionary, dense: bool) -> Control:
 func _tiles(dense: bool) -> Control:
 	var row := UI.hbox(10)
 	for i in range(1, MODES.size()):
-		row.add_child(UI.expand(_staggered(i, _tile(MODES[i], dense))))
+		row.add_child(UI.expand(_tile(MODES[i], dense)))
 	return row
 
 
@@ -346,17 +341,14 @@ func _offer_rejoin() -> void:
 	App.instance.push(TableScreen.new(session))
 
 
-## Three card backs fanned above the wordmark. They spread out of a single
-## stack when the screen opens, then drift very slowly — transform-only motion
-## on nodes drawn once, so it costs next to nothing to keep alive.
+## Three card backs fanned above the wordmark. Still: drawn once, they cost
+## nothing while the menu waits.
 class HeroFan:
 	extends Control
 
 	var card_width: float
 	var fan_width: float
 	var top: float
-	var _cards: Array[CardView] = []
-	var _t := 0.0
 
 	func _init(card_width_in: float, fan_width_in: float, extra_height: float, top_in: float) -> void:
 		card_width = card_width_in
@@ -364,27 +356,16 @@ class HeroFan:
 		top = top_in
 		custom_minimum_size = Vector2(fan_width, card_width * CardView.FACE_ASPECT + extra_height)
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var cards: Array[CardView] = []
 		for i in 3:
 			var card := CardView.back(card_width, true)
 			# Turning about the bottom edge, like a hand fanning cards.
 			card.pivot_offset = Vector2(card_width / 2.0, card.size.y)
-			_cards.append(card)
+			var k := i - 1
+			card.position = Vector2(fan_width / 2.0 - card_width / 2.0 + k * card_width * 0.62,
+					top + (-8.0 if k == 0 else 0.0))
+			card.rotation = k * 0.24
+			cards.append(card)
 		# Paint order: the outer two, then the middle one on top.
 		for i in [0, 2, 1]:
-			add_child(_cards[i])
-		_place()
-
-	func _process(delta: float) -> void:
-		_t += delta
-		_place()
-
-	func _place() -> void:
-		var spread := Motion.ease_out_back(clampf(_t / 0.9, 0.0, 1.0))
-		var phase := fmod(_t, 4.2) / 4.2 * TAU
-		for i in 3:
-			var k := i - 1
-			var bob := sin(phase + i * 1.3) * 3.0
-			var card := _cards[i]
-			card.position = Vector2(fan_width / 2.0 - card_width / 2.0 + k * card_width * 0.62 * spread,
-					top + (-8.0 if k == 0 else 0.0) * spread + bob)
-			card.rotation = k * 0.24 * spread + sin(phase + i) * 0.015
+			add_child(cards[i])

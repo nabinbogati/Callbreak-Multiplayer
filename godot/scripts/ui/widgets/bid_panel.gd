@@ -109,53 +109,26 @@ func _refresh() -> void:
 	_suggest_style.border_color = Color(Tokens.GOLD_BORDER, 0.5) if at_suggestion else Tokens.HAIRLINE
 
 
-## The chosen number, large, rolling to each new value.
+## The chosen number, large.
 class BigValue:
 	extends Control
 
 	var value := 0:
 		set(v):
-			if v == value or _new == null:
-				value = v
-				return
-			_old.text = _new.text
 			value = v
-			_new.text = str(v)
-			_t = 0.0
-			set_process(true)
-			_place()
-	var _new: Label
-	var _old: Label
-	var _t := 1.0
+			if _label != null:
+				_label.text = str(v)
+	var _label: Label
 
 	func _init(size_in: float, initial: int) -> void:
-		value = initial
 		custom_minimum_size = Vector2(size_in * 1.5, size_in * 1.25)
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
 		size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		_old = UI.gold_text("", size_in)
-		_new = UI.gold_text(str(initial), size_in)
-		for l in [_old, _new]:
-			l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-			add_child(l)
-		resized.connect(_place)
-		set_process(false)
-
-	func _place() -> void:
-		for l in [_old, _new]:
-			l.position = Vector2.ZERO
-			l.size = size
-			l.pivot_offset = size / 2.0
-		_old.visible = _t < 1.0
-		_new.modulate.a = Motion.enter(_t)
-		_new.scale = Vector2.ONE * (0.6 + 0.4 * Motion.enter(_t))
-		_old.modulate.a = 1.0 - _t
-
-	func _process(delta: float) -> void:
-		_t = minf(_t + delta / 0.22, 1.0)
-		if _t >= 1.0:
-			set_process(false)
-		_place()
+		_label = UI.gold_text(str(initial), size_in)
+		_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		_label.set_anchors_preset(Control.PRESET_FULL_RECT)
+		add_child(_label)
+		value = initial
 
 
 class BidChip:

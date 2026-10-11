@@ -266,11 +266,37 @@ class Batch:
 		flush_rid(ci.get_canvas_item())
 
 	func flush_rid(item: RID) -> void:
-		if not _idx.is_empty():
-			RenderingServer.canvas_item_add_triangle_array(item, _idx, _verts, _colors)
+		take().draw_rid(item)
+
+	## Everything gathered so far as [Draw.Shapes] to draw as often as needed;
+	## the batch starts afresh.
+	func take() -> Shapes:
+		var shapes := Shapes.new()
+		shapes.idx = _idx
+		shapes.verts = _verts
+		shapes.colors = _colors
 		_verts = PackedVector2Array()
 		_colors = PackedColorArray()
 		_idx = PackedInt32Array()
+		return shapes
+
+
+## A [Draw.Batch]'s triangles, kept. Building a drawing is GDScript work;
+## drawing a kept one again is a single engine call, so anything drawn the
+## same way over and over (a card's art) is built once.
+class Shapes:
+	extends RefCounted
+
+	var idx := PackedInt32Array()
+	var verts := PackedVector2Array()
+	var colors := PackedColorArray()
+
+	func draw(ci: CanvasItem) -> void:
+		draw_rid(ci.get_canvas_item())
+
+	func draw_rid(item: RID) -> void:
+		if not idx.is_empty():
+			RenderingServer.canvas_item_add_triangle_array(item, idx, verts, colors)
 
 
 ## A filled circle with an antialiased edge.
@@ -343,8 +369,8 @@ static func _stem() -> PackedVector2Array:
 
 static func _circle(c: Vector2, r: float) -> PackedVector2Array:
 	var pts := PackedVector2Array()
-	for i in 48:
-		var a := TAU * i / 48.0
+	for i in 32:
+		var a := TAU * i / 32.0
 		pts.append(c + Vector2(cos(a), sin(a)) * r)
 	return pts
 
@@ -353,7 +379,9 @@ static func _circle(c: Vector2, r: float) -> PackedVector2Array:
 ## `["q", cx, cy, x, y]` or `["c", c1x, c1y, c2x, c2y, x, y]`.
 static func _path(cmds: Array) -> PackedVector2Array:
 	var pts := PackedVector2Array([Vector2(cmds[0][0], cmds[0][1])])
-	const STEPS := 14
+	# Points per curve: the largest suit on a card strays under a tenth of a
+	# device pixel from the true curve at this.
+	const STEPS := 8
 	for i in range(1, cmds.size()):
 		var c: Array = cmds[i]
 		var p0 := pts[pts.size() - 1]

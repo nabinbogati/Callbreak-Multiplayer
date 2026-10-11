@@ -12,13 +12,16 @@ extends Control
 ##   with a tick under the thumb at each one. Letting go after a slide never
 ##   plays anything — it is for reading the hand.
 ## * **Drag up** and the card follows the finger, tilting with its motion; it
-##   is thrown once it passes the threshold or is flicked upward, and springs
+##   is thrown once it passes the threshold or is flicked upward, and glides
 ##   back home otherwise.
 ## * **Tap** a playable card to play it (or, with "tap twice to play" on, to
 ##   raise it; a second tap plays).
 ##
 ## A card that cannot be played shakes, buzzes and reports itself through
 ## [signal illegal], so the table can say why.
+##
+## On the player's turn the playable cards rise and the rest dim; nothing
+## glows. Each card is drawn once and moved by its transform.
 
 ## A card left the hand from [param global_center], at [param scale] of the
 ## fan's card size and turned [param angle] — so its flight starts exactly
@@ -77,17 +80,14 @@ var _samples: Array = []
 var _refused_this_gesture := false
 ## "Tap twice to play": the card raised by the first tap.
 var _armed := ""
-## The card springing home after a drag that did not throw.
+## The card gliding home after a drag that did not throw.
 var _returning := ""
 var _return_from := Vector2.ZERO
 var _return_tilt := 0.0
-var _spring_t := 0.0
+var _return_t := 0.0
 ## The card shaking its head.
 var _shake_id := ""
 var _shake_t := 1.0
-var _glow_alpha := 0.0
-var _glow_t := 1.0
-var _glow_on := false
 
 
 func _init() -> void:
@@ -175,14 +175,9 @@ func _relayout() -> void:
 		var node: CardView = _nodes[id]
 		if node.card_width != card_width:
 			node.set_card_width(card_width)
-		var visible_now := i < revealed
-		if visible_now and not node.visible:
-			# A card turning face up as it arrives: it swings in from edge-on,
-			# finishing the flip the dealt card started in the air.
-			_poses[id].reveal = 0.0
-		node.visible = visible_now
+		# A dealt card shows face up the moment it lands.
+		node.visible = i < revealed
 	_update_targets(false)
-	_set_glow(interactive and n > 0)
 	set_process(true)
 
 
@@ -269,33 +264,20 @@ func _process(delta: float) -> void:
 	for id in _poses:
 		busy = _poses[id].advance(delta) or busy
 	if not _returning.is_empty():
-		_spring_t += delta
+		_return_t = minf(_return_t + delta / _return_time(), 1.0)
 		busy = true
-		if absf(_spring(_spring_t)) < 0.001 and _spring_t > 0.2:
+		if _return_t >= 1.0:
 			_returning = ""
 	if _shake_t < 1.0:
 		_shake_t = minf(_shake_t + delta / 0.42, 1.0)
 		busy = true
-	if _glow_t < 1.0:
-		_glow_t = minf(_glow_t + delta / 2.1, 1.0)
-		busy = true
-	var fade := 1.0 if interactive and not _laid.is_empty() else 0.0
-	if not is_equal_approx(_glow_alpha, fade):
-		_glow_alpha = move_toward(_glow_alpha, fade, delta / 0.3)
-		busy = true
 	_render()
-	queue_redraw()
 	if not busy and _mode == Mode.IDLE:
 		set_process(false)
 
 
-## Displacement of a card springing home (1 → 0), an underdamped spring of
-## stiffness 380 and damping 24 on a unit mass.
-static func _spring(t: float) -> float:
-	const OMEGA := 19.4936
-	const ZETA := 0.61559
-	var wd := OMEGA * sqrt(1.0 - ZETA * ZETA)
-	return exp(-ZETA * OMEGA * t) * (cos(wd * t) + ZETA * OMEGA / wd * sin(wd * t))
+func _return_time() -> float:
+	return maxf(Motion.scaled(Motion.SLOT_MS, Settings.animation_scale()), 0.001)
 
 
 func _render() -> void:
@@ -312,41 +294,17 @@ func _render() -> void:
 			extra = _drag
 			tilt = _tilt
 		elif id == _returning:
-			var k := _spring(_spring_t)
+			var k := 1.0 - Motion.decelerate(_return_t)
 			extra = _return_from * k
 			tilt = _return_tilt * k
 		if id == _shake_id and _shake_t < 1.0:
 			extra.x += sin(_shake_t * PI * 6.0) * (1.0 - _shake_t) * card_width * 0.12
-		var flip := sin(Motion.ease_out_cubic(pose.reveal) * PI / 2.0) if pose.reveal < 1.0 else 1.0
 		node.pivot_offset = Vector2(card_width, h) / 2.0
 		node.position = Vector2(pose.value(0), pose.value(1)) + extra
 		node.rotation = pose.value(2) + tilt
-		node.scale = Vector2(pose.value(3) * flip, pose.value(3))
+		node.scale = Vector2.ONE * pose.value(3)
 		node.elevation = pose.to[4]
 		node.dimmed = interactive and not _legal.is_empty() and not legal
-		node.highlighted = interactive and legal
-
-
-## A warm glow rising behind the hand when it is the player's turn. It swells a
-## few times as the turn arrives, then settles to a steady low light.
-func _set_glow(active: bool) -> void:
-	if active and not _glow_on:
-		_glow_t = 0.0
-	_glow_on = active
-
-
-func _draw() -> void:
-	if _glow_alpha <= 0.01:
-		return
-	var h := fan_height()
-	var box := Rect2(-size.x * 0.05, -h * 0.6, size.x * 1.1, h * 1.7)
-	var swell := 0.55 + 0.45 * absf(sin(_glow_t * PI * 6.0)) * (1.0 - _glow_t) if _glow_t < 1.0 else 0.55
-	var center := Draw.align(box, Vector2(0, 0.45))
-	var radius := 0.7 * minf(box.size.x, box.size.y)
-	var pts := PackedVector2Array([box.position, Vector2(box.end.x, box.position.y), box.end,
-			Vector2(box.position.x, box.end.y)])
-	Draw.fill_radial(self, pts, center, radius, [Color(Tokens.TURN_GLOW, 0.3), Color(Tokens.TURN_GLOW, 0.0)], [],
-			Color(1, 1, 1, swell * _glow_alpha))
 
 
 # ---------------------------------------------------------------- gestures
@@ -492,7 +450,7 @@ func _on_up(_pos: Vector2) -> void:
 			if flung:
 				_throw(selected)
 			else:
-				_spring_home(selected)
+				_glide_home(selected)
 		_:
 			_reset()
 
@@ -542,11 +500,11 @@ func _refuse(id: String) -> void:
 		not_your_turn.emit()
 
 
-func _spring_home(id: String) -> void:
+func _glide_home(id: String) -> void:
 	_returning = id
 	_return_from = _drag
 	_return_tilt = _tilt
-	_spring_t = 0.0
+	_return_t = 0.0
 	_reset()
 
 
@@ -568,16 +526,17 @@ class _Pose:
 	var from: Array = [0.0, 0.0, 0.0, 1.0, 0.0]
 	var to: Array = [0.0, 0.0, 0.0, 1.0, 0.0]
 	var t := 1.0
-	var duration := 0.22
+	var duration := 0.18
 	var placed := false
-	## 0 → 1 as a dealt card turns face up.
-	var reveal := 1.0
+	## [member t] on the curve, worked out once per frame.
+	var _eased := 1.0
 
 	func retarget(target: Array, d: float, snap: bool) -> void:
 		if snap:
 			from = target.duplicate()
 			to = target.duplicate()
 			t = 1.0
+			_eased = 1.0
 			return
 		if target == to:
 			return
@@ -585,16 +544,14 @@ class _Pose:
 		to = target.duplicate()
 		duration = maxf(d, 0.001)
 		t = 0.0
+		_eased = 0.0
 
 	func value(i: int) -> float:
-		return lerpf(from[i], to[i], Motion.emphasized(t))
+		return lerpf(from[i], to[i], _eased)
 
 	func advance(delta: float) -> bool:
-		var moving := false
-		if t < 1.0:
-			t = minf(t + delta / duration, 1.0)
-			moving = true
-		if reveal < 1.0:
-			reveal = minf(reveal + delta / Motion.scaled(Motion.REVEAL_MS, Settings.animation_scale()), 1.0)
-			moving = true
-		return moving
+		if t >= 1.0:
+			return false
+		t = minf(t + delta / duration, 1.0)
+		_eased = Motion.decelerate(t)
+		return true

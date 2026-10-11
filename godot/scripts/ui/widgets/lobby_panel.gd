@@ -86,11 +86,10 @@ func _seat(occupant: Dictionary, size: float) -> Control:
 	avatar.draw.connect(func():
 		var c := avatar.size / 2.0
 		if empty:
-			var t := (sin(Time.get_ticks_msec() / 1400.0 * PI) + 1.0) / 2.0
-			avatar.draw_circle(c, size / 2.0, Color(Tokens.TEXT_PRIMARY, 0.04 + 0.03 * t), true, -1.0, true)
-			avatar.draw_arc(c, size / 2.0 - 0.75, 0, TAU, 40, Color(Tokens.TEXT_MUTED, 0.25 + 0.25 * t), 1.5, true)
+			avatar.draw_circle(c, size / 2.0, Color(Tokens.TEXT_PRIMARY, 0.055), true, -1.0, true)
+			avatar.draw_arc(c, size / 2.0 - 0.75, 0, TAU, 40, Color(Tokens.TEXT_MUTED, 0.38), 1.5, true)
 			Draw.icon(avatar, "person_add", Rect2(c - Vector2.ONE * size * 0.2, Vector2.ONE * size * 0.4),
-					Color(Tokens.TEXT_MUTED, 0.5 + 0.25 * t))
+					Color(Tokens.TEXT_MUTED, 0.62))
 			return
 		var you: bool = occupant["isYou"]
 		var alpha := 1.0 if occupant["connected"] else 0.45
@@ -109,12 +108,6 @@ func _seat(occupant: Dictionary, size: float) -> Control:
 			var tw := font.get_string_size(initial, HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
 			avatar.draw_string(font, c + Vector2(-tw / 2.0, fs * 0.36), initial, HORIZONTAL_ALIGNMENT_LEFT, -1, fs,
 					Color(Tokens.ON_GOLD if you else Tokens.TEXT_ON_DARK, alpha)))
-	if empty:
-		var pulse := Timer.new()
-		pulse.wait_time = 1.0 / 30.0
-		pulse.autostart = true
-		pulse.timeout.connect(avatar.queue_redraw)
-		avatar.add_child(pulse)
 	col.add_child(avatar)
 	var name := UI.label("Open" if empty else occupant["name"], 12,
 			Tokens.TEXT_MUTED if empty or not occupant["connected"] else Tokens.TEXT_PRIMARY, "semibold",

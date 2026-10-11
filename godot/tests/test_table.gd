@@ -190,6 +190,100 @@ func test_a_deadline_bar_without_a_deadline_stays_idle() -> void:
 	counting.queue_free()
 
 
+## A turn being thought over leaves the screen still, so the engine can stop
+## drawing: the clock draws nothing before its last ten seconds, and inside
+## them once a second at most.
+func test_a_turn_clock_redraws_only_as_its_seconds_change() -> void:
+	var far := TurnClock.new()
+	var near := TurnClock.new()
+	var draws := {"far": 0, "near": 0}
+	for clock in [far, near]:
+		clock.size = Vector2(54, 54)
+		add_child(clock)
+	far.deadline_ms = Time.get_ticks_msec() + 25000
+	near.deadline_ms = Time.get_ticks_msec() + 7500
+	await _frames(3)
+	far.draw.connect(func(): draws["far"] += 1)
+	near.draw.connect(func(): draws["near"] += 1)
+	var start := Time.get_ticks_msec()
+	await _frames(30)
+	var seconds := (Time.get_ticks_msec() - start) / 1000 + 1
+	expect_eq(draws["far"], 0, "a clock outside its window never redraws")
+	expect_true(draws["near"] <= seconds, "inside it, once a second at most: %d draws in %d s" % [draws["near"],
+			seconds])
+	far.queue_free()
+	near.queue_free()
+
+
+## The deal moves its cards rather than repainting them: each card back is
+## painted the first time it shows, the deck once, and nothing again while
+## they fly.
+func test_dealt_cards_are_drawn_once_then_only_moved() -> void:
+	Settings.animation_speed = "fast"
+	var deal := DealOverlay.new()
+	add_child(deal)
+	deal.start = Vector2(180, 300)
+	deal.seat_targets = {SeatView.Slot.LEFT: Vector2(20, 300), SeatView.Slot.TOP: Vector2(180, 40),
+			SeatView.Slot.RIGHT: Vector2(340, 300)}
+	var targets := []
+	for i in 13:
+		targets.append([Vector2(40 + i * 22, 560), 0.0])
+	deal.hand_targets = targets
+	var counts := {"draws": 0, "frames": 0}
+	var painted: Array = [deal._deck]
+	for card in deal._flying:
+		painted.append(card._art)
+	for node in painted:
+		node.draw.connect(func(): counts["draws"] += 1)
+	deal.begin(0, 0)
+	expect_true(await wait_until(func():
+		counts["frames"] += 1
+		return not deal.is_processing(), 10.0), "the deal finishes")
+	expect_true(counts["frames"] > 30, "the deal ran over many frames (%d)" % counts["frames"])
+	expect_true(counts["draws"] <= DealOverlay.POOL + 1, "%d paints for a whole deal" % counts["draws"])
+	Settings.animation_speed = "normal"
+	deal.queue_free()
+
+
+## Cards gliding about the fan are moved, not repainted: pressing a card to
+## preview it repaints that one card once (its shadow deepens), however many
+## frames it takes to grow and the others to part around it.
+func test_a_previewed_card_glides_without_repainting_the_fan() -> void:
+	var made: Array = await _fan()
+	var fan: HandFan = made[0]
+	await _seconds(0.3)
+	var paints := {"count": 0}
+	for id in fan._nodes:
+		fan._nodes[id]._art.draw.connect(func(): paints["count"] += 1)
+	_button(fan, _strip(fan, "5H"), true)
+	await _seconds(0.3)
+	expect_eq(fan._selected, "5H", "the card is held up")
+	expect_eq(paints["count"], 1, "only the lifted card repaints, once")
+	fan.queue_free()
+
+
+## The turn moving round redraws an opponent's avatar once, for its ring, and
+## leaves their face-down fan alone; the fan redraws only as a card leaves it.
+func test_a_turn_moving_round_redraws_the_avatar_once_and_not_the_fan() -> void:
+	var seat := SeatView.new(SeatView.Slot.TOP)
+	add_child(seat)
+	var player := GameView.make_player(2, "Kamal", "human")
+	seat.update(player, 3, 1, false, false, false, 0, 13)
+	seat.size = seat.get_combined_minimum_size()
+	await _frames(3)
+	var draws := {"avatar": 0, "fan": 0}
+	seat.avatar.draw.connect(func(): draws["avatar"] += 1)
+	seat.avatar._fan.draw.connect(func(): draws["fan"] += 1)
+	seat.update(player, 3, 1, true, false, false, 0, 13)
+	await _frames(20)
+	expect_eq(draws["avatar"], 1, "the ring goes on in one redraw")
+	expect_eq(draws["fan"], 0, "the fan is left as it was")
+	seat.update(player, 3, 1, true, false, false, 0, 12)
+	await _frames(3)
+	expect_eq(draws["fan"], 1, "a card leaving the fan redraws it once")
+	seat.queue_free()
+
+
 ## A gradient gathered into a batch is cut at its inner stops into pieces that
 ## cover the shape exactly — a card, and the spade on a card back, which is
 ## not convex — and its antialiased rim runs through the same cut points, so

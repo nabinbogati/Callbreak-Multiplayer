@@ -12,6 +12,10 @@ var palette_key := "background"
 var glow_alignment_portrait := Vector2(-0.85, 0.0)
 var glow_alignment_landscape := Vector2(-0.55, -0.1)
 var glow_scale := 1.1
+## Whether the bloom is painted at all. The table turns it off: the felt
+## covers most of it, and every full-screen layer costs a cheap phone's GPU on
+## each frame that moves.
+var bloom := true
 
 var _linear := GradientTexture2D.new()
 var _radial := GradientTexture2D.new()
@@ -55,6 +59,8 @@ func _draw() -> void:
 	_linear.width = 256 if horizontal else 4
 	_linear.height = 4 if horizontal else 256
 	draw_texture_rect(_linear, Rect2(Vector2.ZERO, size), false)
+	if not bloom:
+		return
 	var align := glow_alignment_portrait if not horizontal else glow_alignment_landscape
 	# A circle, as wide as the shorter side of the scaled box.
 	var d := minf(size.x * glow_scale, size.y * glow_scale)

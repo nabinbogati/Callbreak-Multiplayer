@@ -1,8 +1,8 @@
 class_name WinnerScreen
 extends Control
 
-## The final-game screen: a burst of confetti, a trophy, the podium (1st
-## tallest and centre-most, 2nd and 3rd flanking, 4th apart and lowest), and
+## The final-game screen: a trophy, the podium (1st tallest and
+## centre-most, 2nd and 3rd flanking, 4th apart and lowest), and
 ## the player's next move — another game or home. The round history is a tap
 ## away, behind the same pill as on the table, so it all fits on one screen.
 
@@ -12,7 +12,6 @@ signal go_home
 const VISUAL_ORDER := [1, 0, 2, 3]
 const PEDESTAL_HEIGHTS := [100.0, 70.0, 54.0, 40.0]
 const AVATAR_SIZES := [76.0, 62.0, 58.0, 52.0]
-const STAGGER := [0.2, 0.05, 0.3, 0.4]
 const PLACE_LABEL := {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
 const PEDESTALS := {
 	1: [Color("#FFE7A3"), Color("#F0C75E"), Color("#C9922A")],
@@ -20,14 +19,10 @@ const PEDESTALS := {
 	3: [Color("#F0B78C"), Color("#C98552"), Color("#8C5A34")],
 	4: [Color("#52625B"), Color("#34413B"), Color("#1D2622")],
 }
-const ENTRANCE := 0.9
 
-var _t := 0.0
 var _view: GameView
 var _history: Control
 var _trophy: Control
-var _headline: Control
-var _columns: Array = []
 
 
 func _init(view: GameView) -> void:
@@ -44,9 +39,6 @@ func _init(view: GameView) -> void:
 				[Color("#163A2CF2"), Color("#040F0BF8")]))
 	bg.resized.connect(bg.queue_redraw)
 	add_child(bg)
-	var confetti := Confetti.new()
-	confetti.set_anchors_preset(Control.PRESET_FULL_RECT)
-	add_child(confetti)
 
 	var ranked := view.rankings.duplicate()
 	ranked.sort_custom(func(a, b): return a["place"] < b["place"])
@@ -65,7 +57,6 @@ func _init(view: GameView) -> void:
 	fv.base_font = Tokens.font("display")
 	fv.spacing_glyph = int(round(UI.sc(28, 22) * 0.04))
 	word.add_theme_font_override("font", fv)
-	_headline = word
 	col.add_child(word)
 	col.add_child(UI.label("Game over · %d rounds played" % view.hands_per_game, UI.sc(12, 11), Tokens.TEXT_FAINT,
 			"medium", HORIZONTAL_ALIGNMENT_CENTER))
@@ -106,7 +97,6 @@ func _init(view: GameView) -> void:
 		padded.scale = Vector2.ONE * minf((size.y - top - UI.safe.w) / padded.get_combined_minimum_size().y, 1.0)
 	resized.connect(fit)
 	padded.minimum_size_changed.connect(fit)
-	_apply(0.0)
 
 
 ## Opens the round history over the podium, or closes it. Kept here rather
@@ -118,28 +108,6 @@ func _toggle_history() -> void:
 		return
 	_history = RoundHistory.overlay(_view, _toggle_history)
 	add_child(_history)
-
-
-func _process(delta: float) -> void:
-	if _t >= 1.0:
-		return
-	_t = minf(_t + delta / ENTRANCE, 1.0)
-	_apply(_t)
-
-
-func _apply(t: float) -> void:
-	# The trophy springs in; the headline fades up with the entrance.
-	var spring := Motion.elastic_out(clampf(t / 0.9, 0.0, 1.0))
-	_trophy.pivot_offset = _trophy.size / 2.0
-	_trophy.scale = Vector2.ONE * (0.4 + 0.6 * spring)
-	_headline.modulate.a = t
-	for entry in _columns:
-		var start: float = entry[1]
-		var local := clampf((t - start) / (minf(start + 0.55, 1.0) - start), 0.0, 1.0)
-		var e := Motion.ease_out_back(local)
-		var column: Control = entry[0]
-		column.modulate.a = clampf(e, 0.0, 1.0)
-		column.position.y = column.size.y * 0.25 * (1.0 - e)
 
 
 func _make_trophy(size_px: float) -> Control:
@@ -169,7 +137,6 @@ func _podium(view: GameView, ranked: Array) -> Control:
 		column.minimum_size_changed.connect(func(): wrap.custom_minimum_size = column.get_combined_minimum_size())
 		wrap.resized.connect(func(): column.size = wrap.size)
 		row.add_child(wrap)
-		_columns.append([column, STAGGER[rank_index]])
 	return row
 
 
@@ -230,51 +197,3 @@ func _column(view: GameView, r: Dictionary, rank_index: int) -> Control:
 		parts.append(UI.center(UI.icon("crown", UI.sc(22, 16), Tokens.GOLD)))
 	parts.append_array([avatar, UI.gap(UI.sc(8, 4)), name, score, UI.gap(UI.sc(8, 4)), pedestal])
 	return UI.vbox(0, parts)
-
-
-## A single burst of paper: pieces launched from the top, fluttering down with
-## a sway and a spin. Positions are a pure function of time and a fixed seed,
-## so one clock drives it all — and it stops for good once it has fallen.
-class Confetti:
-	extends Control
-
-	const DURATION := 3.2
-	const COUNT := 70
-	const COLORS := [Color("#F5D78A"), Color("#FFF6D8"), Color("#3DDC84"), Color("#7CC4FF"), Color("#FF6F61"),
-			Color("#E8B84A")]
-
-	static var _pieces: Array = []
-	var _t := 0.0
-
-	func _init() -> void:
-		mouse_filter = Control.MOUSE_FILTER_IGNORE
-		if _pieces.is_empty():
-			var rng := RandomNumberGenerator.new()
-			rng.seed = 42
-			for i in COUNT:
-				_pieces.append({"x": rng.randf(), "delay": rng.randf() * 0.35, "fall": 0.75 + rng.randf() * 0.5,
-						"sway": 0.02 + rng.randf() * 0.05, "spin": (rng.randf() - 0.5) * 18.0,
-						"size": 5.0 + rng.randf() * 6.0, "color": COLORS[i % COLORS.size()]})
-
-	func _process(delta: float) -> void:
-		_t = minf(_t + delta / DURATION, 1.0)
-		queue_redraw()
-		if _t >= 1.0:
-			set_process(false)
-
-	func _draw() -> void:
-		if _t >= 1.0:
-			return
-		for p in _pieces:
-			var local := clampf((_t - p["delay"]) / (1.0 - p["delay"]), 0.0, 1.0)
-			if local <= 0.0:
-				continue
-			var y: float = -0.1 + Motion.enter(local) * p["fall"] * 1.1
-			var x: float = p["x"] + sin(local * PI * 4.0 + p["x"] * 9.0) * p["sway"]
-			var fade := (1.0 - local) / 0.25 if local > 0.75 else 1.0
-			# A tumbling rectangle reads as paper: squash it with the spin.
-			var squash := 0.35 + 0.65 * absf(cos(local * p["spin"]))
-			var s: float = p["size"]
-			draw_set_transform(Vector2(x * size.x, y * size.y), p["spin"] * local, Vector2.ONE)
-			draw_rect(Rect2(-s / 2.0, -s * 0.55 * squash / 2.0, s, s * 0.55 * squash), Color(p["color"], 0.9 * fade))
-		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)

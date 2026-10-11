@@ -2,18 +2,10 @@ class_name FeltSurface
 extends Control
 
 ## The playing surface: a leather rail with a gold inlay around a lit felt,
-## plus two live layers on top of the static paint — a spotlight that swings
-## toward whoever is to act, and a large faint suit mark in the middle (the
-## trump spade between tricks, the led suit during one). The felt itself is
-## drawn once per size or theme; the live layers redraw only while they move.
+## and a large faint suit mark in the middle (the trump spade between tricks,
+## the led suit during one). The felt is drawn once per size or theme, the mark
+## once per suit; neither moves.
 
-## The seat being waited on (a [enum SeatView.Slot]), or -1 when nobody is
-## (the spotlight fades).
-var spotlight := -1:
-	set(v):
-		if v != spotlight:
-			spotlight = v
-			_spot.aim(v)
 ## The suit led in the trick under way, or -1 between tricks.
 var lead_suit := -1:
 	set(v):
@@ -23,12 +15,11 @@ var lead_suit := -1:
 
 var _base := _Base.new()
 var _mark := _LeadMark.new()
-var _spot := _Spotlight.new()
 
 
 func _init() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
-	for layer in [_base, _mark, _spot]:
+	for layer in [_base, _mark]:
 		layer.set_anchors_preset(Control.PRESET_FULL_RECT)
 		layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		add_child(layer)
@@ -95,13 +86,12 @@ class _Base:
 		var outer := FeltSurface.outline(Rect2(Vector2.ZERO, size), radii)
 
 		# Cast shadow, so the table sits on the room rather than being printed
-		# on it: layers of the outline spreading out and fading.
-		var sigma := rail * 0.9
-		const LAYERS := 10
-		for i in LAYERS:
-			var grow := sigma * 2.4 * (float(i) / (LAYERS - 1) - 0.4)
-			var r := Rect2(Vector2(-grow, rail * 0.5 - grow), size + Vector2.ONE * 2.0 * grow)
-			draw_colored_polygon(FeltSurface.outline(r, radii + Vector2.ONE * grow), Color(0, 0, 0, 0.55 / LAYERS))
+		# on it: one soft band fading out from the rail. Only the band is
+		# painted, never the area under the table, which nobody sees — on a
+		# cheap phone's GPU every layer over the whole table costs.
+		var shadow := Draw.Batch.new()
+		shadow.strip(outer, true, PackedColorArray([Color(0, 0, 0, 0.4)]), 0.0, rail * 1.6, true)
+		shadow.flush(self)
 
 		# Dark leather rail, tinted toward the felt so every colourway agrees.
 		var leather := Color("#2B231E").lerp(felt_colors[2], 0.22)
@@ -128,29 +118,18 @@ class _Base:
 				Color(Tokens.GOLD_BORDER, 0.13), 1.0)
 
 
-## Big, faint suit mark at the centre of the felt, cross-fading (with a little
-## zoom) whenever the suit changes.
+## Big, faint suit mark at the centre of the felt, swapped whenever the suit
+## changes.
 class _LeadMark:
 	extends Control
 
 	var _suit := -1
-	var _old := -1
-	var _t := 1.0
 
 	func _init() -> void:
 		resized.connect(queue_redraw)
-		set_process(false)
 
 	func show_suit(suit: int) -> void:
-		_old = _suit
 		_suit = suit
-		_t = 0.0
-		set_process(true)
-
-	func _process(delta: float) -> void:
-		_t = minf(_t + delta / 0.32, 1.0)
-		if _t >= 1.0:
-			set_process(false)
 		queue_redraw()
 
 	static func _color(suit: int) -> Color:
@@ -161,90 +140,5 @@ class _LeadMark:
 		return Color("#FFFFFF1F")
 
 	func _draw() -> void:
-		var glyph := minf(size.x, size.y) * 0.34
-		var c := size / 2.0
-		if _t < 1.0:
-			# The old mark leaves on a plain fade, as Flutter's switcher does.
-			var out := 1.0 - _t
-			var col := _color(_old)
-			Draw.suit(self, Cards.TRUMP_SUIT if _old < 0 else _old, c, glyph * (0.8 + 0.2 * out),
-					Color(col, col.a * out))
-		var e := Motion.enter(_t)
-		var col := _color(_suit)
-		Draw.suit(self, Cards.TRUMP_SUIT if _suit < 0 else _suit, c, glyph * (0.8 + 0.2 * e), Color(col, col.a * e))
-
-
-## A warm pool of light on the felt in front of the seat being waited on. It
-## glides round the table (the short way) as the turn passes, so the eye is
-## pulled to the next player without anything blinking.
-class _Spotlight:
-	extends Control
-
-	var _from_angle := 0.0
-	var _to_angle := 0.0
-	var _from_intensity := 0.0
-	var _to_intensity := 0.0
-	var _t := 1.0
-
-	func _init() -> void:
-		resized.connect(queue_redraw)
-		set_process(false)
-
-	static func _angle_of(slot: int) -> float:
-		match slot:
-			SeatView.Slot.BOTTOM: return PI / 2
-			SeatView.Slot.TOP: return -PI / 2
-			SeatView.Slot.LEFT: return PI
-		return 0.0
-
-	func _eased() -> float:
-		return Motion.emphasized(_t)
-
-	func _angle() -> float:
-		return _from_angle + (_to_angle - _from_angle) * _eased()
-
-	func _intensity() -> float:
-		return _from_intensity + (_to_intensity - _from_intensity) * _eased()
-
-	func aim(slot: int) -> void:
-		var angle := _angle()
-		var intensity := _intensity()
-		_from_angle = angle
-		_from_intensity = intensity
-		if slot < 0:
-			_to_angle = angle
-			_to_intensity = 0.0
-		else:
-			var target := _angle_of(slot)
-			# Always travel the short way round.
-			while target - angle > PI:
-				target -= TAU
-			while target - angle < -PI:
-				target += TAU
-			# Fading in from nothing: start already pointing at the seat.
-			if intensity < 0.05:
-				_from_angle = target
-			_to_angle = target
-			_to_intensity = 1.0
-		_t = 0.0
-		set_process(true)
-
-	func _process(delta: float) -> void:
-		_t = minf(_t + delta / 0.42, 1.0)
-		if _t >= 1.0:
-			set_process(false)
-		queue_redraw()
-
-	func _draw() -> void:
-		var intensity := _intensity()
-		if intensity <= 0.01 or size.x < 8:
-			return
-		var angle := _angle()
-		var c := size / 2.0
-		var focus := c + Vector2(cos(angle) * size.x * 0.4, sin(angle) * size.y * 0.4)
-		var radius := minf(size.x, size.y) * 0.62
-		var felt := FeltSurface.deflated(size, FeltSurface.rail_width(size))
-		for pool in Geometry2D.intersect_polygons(Draw.ellipse_points(focus, Vector2.ONE * radius, 48), felt):
-			Draw.fill_radial(self, pool, focus, radius, [Color(Tokens.TURN_GLOW, 0.26),
-					Color(Tokens.TURN_GLOW, 0.09), Color(Tokens.TURN_GLOW, 0.0)], [0.0, 0.45, 1.0],
-					Color(1, 1, 1, intensity))
+		Draw.suit(self, Cards.TRUMP_SUIT if _suit < 0 else _suit, size / 2.0, minf(size.x, size.y) * 0.34,
+				_color(_suit))

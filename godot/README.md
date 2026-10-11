@@ -36,13 +36,20 @@ test also fails that test. `TEST_FILTER=lan` runs only the matching tests.
 | `test_sessions.gd` | A whole solo game through the real timers. A LAN host and guest playing a full game over a loopback socket. Timeout to autoplay and back. Bots holding their bids until the deal is down, on the solo and LAN tables. LAN discovery over UDP. Identity and uuid. |
 | `test_server_e2e.gd` | Against the real Go server: create a private room, join, deal, play, drop the connection and reclaim the same seat, and check that server error messages reach the player. Skipped unless `E2E_SERVER_URL` is set. |
 | `test_ui.gd` | Drives every screen of the real app shell. Plays a full game through the table screen, taps and drags cards, opens every sheet, and covers the rejoin prompt and the failure states. |
-| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, the animation budgets: the trick sequence inside the hosts' 1100 ms linger at every speed, and the deal inside the wait before bidding opens. And the table on every phone and tablet either way up, with the felt and without it (Settings → Show table): nothing touching or off screen, the played cards on the felt's centre (or, without it, the screen's, each seat at its own edge), a larger screen drawing it larger. |
+| `test_table.gd` | The hand fan's gestures (tap, refuse, scrub, drag-to-throw, spring back, off-turn, tap twice), a throw holding on the felt until a slow server confirms it (and returning to the hand if it never does), the refusal hints, the animation budgets: the trick sequence inside the hosts' 1100 ms linger at every speed, and the deal inside the wait before bidding opens. That a still screen stays still and moving cards are moved, not repainted: a turn clock outside its last ten seconds, a whole deal, a card held up in the fan, the turn passing an opponent. And the table on every phone and tablet either way up, with the felt and without it (Settings → Show table): nothing touching or off screen, the played cards on the felt's centre (or, without it, the screen's, each seat at its own edge), a larger screen drawing it larger. |
 
 End-to-end against the backend:
 
 ```sh
 (cd backend && ADDR=127.0.0.1:18080 go run ./cmd/server) &
 E2E_SERVER_URL=ws://127.0.0.1:18080/ws godot --headless --path godot -s res://tests/test_runner.gd
+```
+
+How long the busiest moments at the table take on the CPU, frame by frame
+(a deal, an opponent's turn, your turn, a trick, a whole solo hand):
+
+```sh
+godot --headless --fixed-fps 60 --path godot -s res://tests/bench.gd
 ```
 
 Screenshots of the main screens, which need a display (Xvfb works):
@@ -103,10 +110,36 @@ tests/      runner, suites, server fixture, screenshot tour
   look the same on every device and don't depend on a symbol font. Icons are
   the design's own Material glyphs, from a 45-glyph subset of the Material
   Icons font (`assets/fonts/MaterialIcons-Subset.otf`, licence alongside it).
-- **Motion lives in `motion.gd`.** Every gameplay timing and curve sits in one
-  place, because several have to agree: the throw, gather and sweep of a trick
-  must finish inside the hosts' 1100 ms linger, and the deal inside the
+- **Motion lives in `motion.gd`, and is kept plain.** Cards slide in straight
+  lines; nothing spins, bounces, flips in the air, glows or pulses, so the game
+  stays smooth on 2–3 GB phones with old processors. Every gameplay timing sits
+  in one place, because several have to agree: the throw, hold and sweep of a
+  trick must finish inside the hosts' 1100 ms linger, and the deal inside the
   3.5 s wait before bidding opens. The tests check both.
+- **What keeps it cheap.**
+  - A card is painted once, on a child `Node2D`, and then only moved. A
+    `Control` repaints itself whenever it is turned or scaled (Godot's
+    `set_rotation`, `set_scale` and `set_pivot_offset` all queue a redraw),
+    which would rebuild a card on every frame it moves.
+  - A card's shapes (`Draw.Shapes`) are built once per card, size, screen
+    density and colour style, and replayed in one engine call.
+  - The deal is a small pool of card backs moved by their transforms. One
+    waiting in the pool is fully transparent rather than hidden: the renderer
+    skips it either way, and showing a hidden item again would repaint it.
+  - Nothing redraws while nothing changes, so `App` can stop the engine
+    drawing: the turn clock and countdown bars step once a second, the menus
+    are still, and a toast is held up by a timer (any running tween keeps the
+    engine drawing).
+  - Layers the eye doesn't need are left out on every moving frame: one soft
+    band for the table's shadow rather than ten full layers, no backdrop
+    bloom behind the felt.
+- **Sound effects are uncompressed WAV.** They play with nothing to decode,
+  and each was trimmed to start on its attack: the card sound used to be
+  near-silent for its first 145 ms and the trick-collect sound for 360 ms,
+  which read as the sound lagging the cards. Each sound has its own player
+  with a few voices, and the collect sound plays as the trick sweeps off. The
+  ticking loop is QOA-compressed (cheap to decode, a fifth of the size); only
+  the soundtrack streams from MP3.
 - **Antialiasing is one device pixel wide.** Godot's antialiased lines feather
   by a whole canvas unit, which is two or three device pixels on a phone and
   makes every border read thick and soft. `Draw` strokes and fills with its
@@ -131,5 +164,3 @@ tests/      runner, suites, server fixture, screenshot tour
   upload queue persist as before.
 - **LAN lobby.** When a guest leaves before the deal, their chair is freed
   for someone else rather than kept as a disconnected seat.
-- The one sound that was a 24-bit WAVE (which Godot can't import) was
-  converted to Ogg Vorbis.

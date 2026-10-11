@@ -17,6 +17,9 @@ func _ready() -> void:
 func _shot(name: String) -> void:
 	for i in 6:
 		await get_tree().process_frame
+	# A still screen is not redrawn (see App._process): mark a change so this
+	# frame is drawn.
+	App.instance.queue_redraw()
 	await RenderingServer.frame_post_draw
 	get_tree().root.get_texture().get_image().save_png("%s/%s.png" % [out, name])
 	print("saved ", name)
@@ -34,7 +37,6 @@ func _run() -> void:
 	settings.player_name = "Nabin"
 	var app: App = load("res://scenes/main.tscn").instantiate()
 	get_tree().root.add_child(app)
-	# Let the hero fan finish spreading.
 	await _wait(1.5)
 	await _shot("01_home")
 

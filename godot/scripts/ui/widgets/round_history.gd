@@ -165,5 +165,5 @@ static func overlay(view: GameView, on_close: Callable) -> Control:
 		var chrome := card.get_combined_minimum_size().y
 		sc.custom_minimum_size.y = clampf(natural, 0.0, maxf(minf(520.0, scrim.size.y) - 40.0 - chrome, 40.0))
 	scrim.resized.connect(fit)
-	UI.pop_in(card)
+	UI.fade_in(card)
 	return scrim
