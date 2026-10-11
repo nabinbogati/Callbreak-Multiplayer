@@ -11,7 +11,7 @@ extends Control
 ## Court cards carry their letter in the display face instead of a pip; trumps
 ## catch a little gold light in the corner. Back: a gold-framed lattice in the
 ## table's colourway with a spade medallion, the same proportions as the face,
-## so a dealt card turns over into the hand without changing shape. The pivot
+## so a dealt back and the face that replaces it in the hand match exactly. The pivot
 ## is kept at the centre so rotations and zooms turn about the middle.
 ##
 ## The card is painted on a child [Node2D], not on this control: a control

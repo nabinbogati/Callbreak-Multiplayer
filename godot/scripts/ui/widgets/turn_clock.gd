@@ -13,15 +13,16 @@ extends Control
 const WINDOW_MS := 10000
 const ALARM_SECONDS := 5
 
-## The deadline on this device's monotonic clock, or 0 for none.
+## The deadline on this device's monotonic clock, or 0 for none. The table
+## restates it on every refresh; only a new deadline changes anything.
 var deadline_ms := 0:
 	set(v):
-		if v != deadline_ms:
-			_set_ticking(false)
+		if v == deadline_ms:
+			return
+		_set_ticking(false)
 		deadline_ms = v
-		_shown = 0
 		set_process(v > 0)
-		queue_redraw()
+		_step()
 ## Only the viewer's own clock may tick out loud.
 var audible := false
 
@@ -36,6 +37,12 @@ func _init() -> void:
 
 
 func _process(_delta: float) -> void:
+	_step()
+
+
+## Brings the seconds on show, and the ticking, up to date; redraws only when
+## the number changes.
+func _step() -> void:
 	var left := deadline_ms - Time.get_ticks_msec()
 	var seconds := ceili(left / 1000.0)
 	_set_ticking(audible and seconds > 0 and seconds <= ALARM_SECONDS)

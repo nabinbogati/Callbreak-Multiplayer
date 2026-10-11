@@ -84,9 +84,7 @@ func _ready() -> void:
 	_make_seats()
 	_trick.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_trick.throw_refused.connect(func(_card): _refresh())
-	# The collect sound goes with the cards leaving, not with the last one
-	# landing.
-	_trick.sweep_started.connect(Audio.play_collect)
+	_trick.trick_taken.connect(_on_trick_taken)
 	_body.add_child(_trick)
 	_fx.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_fx.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -430,9 +428,6 @@ func _on_game_event(event: Dictionary) -> void:
 			Audio.play_shot()
 			if _is_trump_into_side_suit(str(event.get("card", ""))):
 				Audio.play_trump()
-		"trickWon":
-			if session.view != null and int(event.get("seat", -1)) == session.view.you:
-				Haptics.thud()
 		"seatChanged":
 			var online: bool = event.get("connected", true)
 			var bot: bool = event.get("kind") == "bot"
@@ -450,6 +445,15 @@ func _on_game_event(event: Dictionary) -> void:
 			var name := str(event.get("name", "A player"))
 			_announce("%s is idle — playing automatically" % name if on else "%s is playing again" % name, not on,
 					"robot" if on else "touch", int(event.get("seat", -1)))
+
+
+## The collect sound, and for the player's own tricks a thud, go with the
+## cards leaving for the winner rather than with the last one landing, so
+## sound, touch and picture arrive together.
+func _on_trick_taken(winner: int) -> void:
+	Audio.play_collect()
+	if session.view != null and winner == session.view.you:
+		Haptics.thud()
 
 
 ## A trump landing into a trick a side suit led — the moment the lead suit

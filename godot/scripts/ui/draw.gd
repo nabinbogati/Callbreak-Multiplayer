@@ -290,6 +290,11 @@ class Shapes:
 	var idx := PackedInt32Array()
 	var verts := PackedVector2Array()
 	var colors := PackedColorArray()
+	## Indices and colours for several copies, end to end, grown as needed by
+	## [method placed]: built once, then only sliced.
+	var _copies := 0
+	var _copy_idx := PackedInt32Array()
+	var _copy_colors := PackedColorArray()
 
 	func draw(ci: CanvasItem) -> void:
 		draw_rid(ci.get_canvas_item())
@@ -297,6 +302,27 @@ class Shapes:
 	func draw_rid(item: RID) -> void:
 		if not idx.is_empty():
 			RenderingServer.canvas_item_add_triangle_array(item, idx, verts, colors)
+
+	## One copy of these shapes per transform in [param transforms], as one
+	## [Draw.Shapes] to draw in a single call — a fan or a stack of the same
+	## card back. The Compatibility renderer never batches polygons, so drawn
+	## one by one, thirteen copies would cost thirteen draw calls.
+	func placed(transforms: Array) -> Shapes:
+		var out := Shapes.new()
+		var n := transforms.size()
+		if n == 0 or idx.is_empty():
+			return out
+		while _copies < n:
+			var base := _copies * verts.size()
+			for i in idx:
+				_copy_idx.append(base + i)
+			_copy_colors.append_array(colors)
+			_copies += 1
+		for xf: Transform2D in transforms:
+			out.verts.append_array(xf * verts)
+		out.idx = _copy_idx.slice(0, n * idx.size())
+		out.colors = _copy_colors.slice(0, n * colors.size())
+		return out
 
 
 ## A filled circle with an antialiased edge.
@@ -369,8 +395,8 @@ static func _stem() -> PackedVector2Array:
 
 static func _circle(c: Vector2, r: float) -> PackedVector2Array:
 	var pts := PackedVector2Array()
-	for i in 32:
-		var a := TAU * i / 32.0
+	for i in 48:
+		var a := TAU * i / 48.0
 		pts.append(c + Vector2(cos(a), sin(a)) * r)
 	return pts
 
@@ -379,9 +405,7 @@ static func _circle(c: Vector2, r: float) -> PackedVector2Array:
 ## `["q", cx, cy, x, y]` or `["c", c1x, c1y, c2x, c2y, x, y]`.
 static func _path(cmds: Array) -> PackedVector2Array:
 	var pts := PackedVector2Array([Vector2(cmds[0][0], cmds[0][1])])
-	# Points per curve: the largest suit on a card strays under a tenth of a
-	# device pixel from the true curve at this.
-	const STEPS := 8
+	const STEPS := 14
 	for i in range(1, cmds.size()):
 		var c: Array = cmds[i]
 		var p0 := pts[pts.size() - 1]

@@ -38,7 +38,6 @@ func _init(view: GameView, deadline_ms := 0, max_height := INF) -> void:
 		var scores: Array = view.round_scores[seat]
 		var row := _row(view, seat, i == 0 and view.totals[seats[0]] > view.totals[seats[1]],
 				scores.back() if not scores.is_empty() else null, place_of.get(seat, 0) if final else 0)
-		# Rows slide in one after another.
 		col.add_child(row)
 		col.add_child(UI.gap(UI.sc(6, 4)))
 	col.add_child(UI.gap(UI.sc(10, 6)))

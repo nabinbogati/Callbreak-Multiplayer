@@ -464,7 +464,8 @@ class SeatAvatar:
 
 	## A face-down fan of the opponent's remaining cards in front of the avatar
 	## (toward the table centre), pivoting on the avatar's centre. Every card is
-	## the same kept drawing, placed; only the front one casts a shadow.
+	## the same kept drawing, placed: the cards behind in one draw call, then
+	## the front one, the only one with a shadow, over it.
 	func _draw_hand_fan() -> void:
 		var placed := _fan_transforms(hand_count)
 		if placed.is_empty():
@@ -472,11 +473,10 @@ class SeatAvatar:
 		var card := _fan_card()
 		var rect := Rect2(-card / 2.0, card)
 		var back := CardView.back_shapes(rect)
-		for i in placed.size():
-			_fan.draw_set_transform_matrix(placed[i])
-			if i == placed.size() - 1:
-				CardView.back_shadow(_fan, rect)
-			back.draw(_fan)
+		back.placed(placed.slice(0, placed.size() - 1)).draw(_fan)
+		_fan.draw_set_transform_matrix(placed[-1])
+		CardView.back_shadow(_fan, rect)
+		back.draw(_fan)
 		_fan.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 	## Where each card of a face-down fan of [param count] is drawn: its centre

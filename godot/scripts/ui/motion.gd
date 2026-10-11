@@ -4,16 +4,17 @@ extends RefCounted
 ## Every gameplay timing in one place.
 ##
 ## Motion at the table is deliberately plain: cards slide in straight lines
-## and nothing bounces, spins, flips in the air, glows or pulses. Anything that
+## and nothing bounces, spins, flips in the air or pulses; the only glows are
+## steady ones (the card winning the trick, the seat to act). Anything that
 ## moves is a node drawn once and moved by its transform, so a cheap phone keeps
 ## up, and anything that is not moving costs nothing — the engine stops drawing
 ## (see [method App._process]).
 ##
 ## Several timings have to agree with each other across widgets — the whole
 ## throw → hold → sweep sequence must finish inside the host's trick linger
-## (1100 ms on the Go server, the LAN host and the solo table alike) or the
-## trick is cleared mid-animation. Keeping them side by side makes those
-## budgets visible.
+## (1100 ms on the Go server; a LAN host or a solo table scales its own by its
+## animation speed) or the trick is cleared mid-animation. Keeping them side by
+## side makes those budgets visible.
 ##
 ## All values are base milliseconds at normal animation speed; scale them with
 ## [method scaled] and the player's animation-speed setting.

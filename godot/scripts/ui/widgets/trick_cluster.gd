@@ -20,8 +20,11 @@ extends Control
 ## visible for its whole flight.
 
 signal throw_refused(card: String)
-## A decided trick starts leaving for the winner's seat.
-signal sweep_started
+## A decided trick leaves for [param winner]'s seat: as it starts to sweep
+## off, or, if the table clears it before then (a host on a faster animation
+## speed, a phone that stalled), as it goes. Once per trick either way, so the
+## take is always heard.
+signal trick_taken(winner: int)
 
 ## How long a thrown card may wait, landed, for the table to confirm it before
 ## it is treated as refused.
@@ -177,6 +180,8 @@ func sync(plays: Array, viewer: int, winner: int, anchors: Dictionary, origins: 
 		_collect_wait = Motion.scaled(Motion.THROW_MS + Motion.TRICK_HOLD_MS, _trick_scale())
 		_aim_collect()
 	elif winner < 0:
+		if _winner >= 0 and not _collecting:
+			trick_taken.emit(_winner)
 		_winner = -1
 		_collecting = false
 	set_process(true)
@@ -243,7 +248,7 @@ func _process(delta: float) -> void:
 		if _collect_wait <= 0.0:
 			_collecting = true
 			_aim_collect()
-			sweep_started.emit()
+			trick_taken.emit(_winner)
 	_render()
 	if not busy and not _collecting:
 		set_process(false)

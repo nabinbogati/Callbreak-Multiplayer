@@ -140,7 +140,8 @@ func _place() -> void:
 	_deck.position = start - _deck.size / 2.0
 
 
-## The deck waiting at the centre: a few backs squared up, drawn once.
+## The deck waiting at the centre: a few backs squared up, drawn once, in one
+## draw call.
 class _Deck:
 	extends Control
 
@@ -155,7 +156,7 @@ class _Deck:
 	func _draw() -> void:
 		var rect := Rect2(Vector2.ZERO, size)
 		CardView.back_shadow(self, rect)
+		var layers: Array[Transform2D] = []
 		for i in LAYERS:
-			draw_set_transform(Vector2(i * STEP * 0.5, -i * STEP))
-			CardView.back_shapes(rect).draw(self)
-		draw_set_transform(Vector2.ZERO)
+			layers.append(Transform2D(0.0, Vector2(i * STEP * 0.5, -i * STEP)))
+		CardView.back_shapes(rect).placed(layers).draw(self)

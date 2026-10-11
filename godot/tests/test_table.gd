@@ -192,27 +192,87 @@ func test_a_deadline_bar_without_a_deadline_stays_idle() -> void:
 
 ## A turn being thought over leaves the screen still, so the engine can stop
 ## drawing: the clock draws nothing before its last ten seconds, and inside
-## them once a second at most.
+## them redraws only as its number steps down — never for the table restating
+## the same deadline (every refresh does), and never blank.
 func test_a_turn_clock_redraws_only_as_its_seconds_change() -> void:
 	var far := TurnClock.new()
 	var near := TurnClock.new()
-	var draws := {"far": 0, "near": 0}
+	var shown := {"far": [], "near": []}
 	for clock in [far, near]:
 		clock.size = Vector2(54, 54)
 		add_child(clock)
 	far.deadline_ms = Time.get_ticks_msec() + 25000
-	near.deadline_ms = Time.get_ticks_msec() + 7500
+	# Just over seven seconds left: it shows 8, and steps to 7 in a moment.
+	near.deadline_ms = Time.get_ticks_msec() + 7150
+	await _frames(2)
+	expect_eq(near._shown, 8, "inside its window it shows the seconds left")
+	far.draw.connect(func(): shown["far"].append(far._shown))
+	near.draw.connect(func(): shown["near"].append(near._shown))
+	await _seconds(0.4)
+	far.deadline_ms = far.deadline_ms
+	near.deadline_ms = near.deadline_ms
 	await _frames(3)
-	far.draw.connect(func(): draws["far"] += 1)
-	near.draw.connect(func(): draws["near"] += 1)
-	var start := Time.get_ticks_msec()
-	await _frames(30)
-	var seconds := (Time.get_ticks_msec() - start) / 1000 + 1
-	expect_eq(draws["far"], 0, "a clock outside its window never redraws")
-	expect_true(draws["near"] <= seconds, "inside it, once a second at most: %d draws in %d s" % [draws["near"],
-			seconds])
+	expect_eq(shown["far"], [], "a clock outside its window never redraws")
+	var steps := []
+	for n in range(7, near._shown - 1, -1):
+		steps.append(n)
+	expect_eq(shown["near"], steps, "one redraw per step down, none for a restated deadline, never blank")
 	far.queue_free()
 	near.queue_free()
+
+
+## The take is always heard: a decided trick announces itself once as it
+## sweeps off to the winner, and still once if the table clears it before the
+## sweep could start (a host on a faster animation speed, a phone that
+## stalled).
+func test_a_taken_trick_is_announced_once_even_if_cleared_early() -> void:
+	var trick := TrickCluster.new()
+	trick.size = Vector2(360, 640)
+	add_child(trick)
+	var anchors := {SeatView.Slot.BOTTOM: Vector2(180, 600), SeatView.Slot.LEFT: Vector2(20, 320),
+			SeatView.Slot.TOP: Vector2(180, 40), SeatView.Slot.RIGHT: Vector2(340, 320)}
+	var center := Vector2(180, 320)
+	var taken := []
+	trick.trick_taken.connect(func(winner): taken.append(winner))
+	var plays := [{"seat": 1, "card": "KH"}, {"seat": 2, "card": "3H"}, {"seat": 3, "card": "QH"},
+			{"seat": 0, "card": "AH"}]
+	trick.sync(plays, 0, 0, anchors, {}, center, 52)
+	var whole := Motion.scaled(Motion.TRICK_ANIMATION_MS, Motion.trick_scale(Settings.animation_scale()))
+	await _seconds(whole + 0.1)
+	trick.sync([], 0, -1, anchors, {}, center, 52)
+	expect_eq(taken, [0], "a trick that sweeps off is taken once")
+	plays = [{"seat": 0, "card": "2C"}, {"seat": 1, "card": "9C"}, {"seat": 2, "card": "4C"}, {"seat": 3, "card": "5C"}]
+	trick.sync(plays, 0, 1, anchors, {}, center, 52)
+	await _frames(2)
+	trick.sync([], 0, -1, anchors, {}, center, 52)
+	await _frames(2)
+	expect_eq(taken, [0, 1], "a trick cleared before it could sweep is still taken, once")
+	trick.queue_free()
+
+
+## Copies of one card back placed into a single batch (an opponent's fan, the
+## deck) are the same shapes, each moved by its own transform and indexing its
+## own vertices — one draw call for them all.
+func test_placed_copies_of_shapes_make_one_batch() -> void:
+	var back := CardView.back_shapes(Rect2(-12, -18, 24, 36))
+	var a := Transform2D(0.3, Vector2(40, 10))
+	var b := Transform2D(-0.2, Vector2(-5, 60))
+	var both := back.placed([a, b])
+	var n := back.verts.size()
+	var m := back.idx.size()
+	expect_eq(both.verts.size(), 2 * n, "a copy's worth of vertices each")
+	expect_eq(both.colors.size(), 2 * back.colors.size(), "and of colours")
+	var moved := true
+	for i in n:
+		moved = moved and both.verts[i].is_equal_approx(a * back.verts[i]) \
+				and both.verts[n + i].is_equal_approx(b * back.verts[i])
+	expect_true(moved, "each copy is the back under its own transform")
+	var indexed := both.idx.size() == 2 * m
+	for i in m:
+		indexed = indexed and both.idx[i] == back.idx[i] and both.idx[m + i] == back.idx[i] + n
+	expect_true(indexed, "the second copy's triangles index the second copy's vertices")
+	expect_eq(back.placed([b]).idx, back.idx, "one copy has the back's own triangles")
+	expect_eq(back.placed([]).idx.size(), 0, "no copies, nothing to draw")
 
 
 ## The deal moves its cards rather than repainting them: each card back is

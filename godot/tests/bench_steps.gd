@@ -7,7 +7,9 @@ extends Node
 ## frame, start to finish: everything the main thread does in that frame
 ## (scripts, rebuilding drawings, layout). Run with --fixed-fps 60 so each
 ## frame moves the animations on by 1/60 s, as on a phone. Headless rendering is
-## a stub, so this measures the CPU side, not the GPU.
+## a stub, so this measures the CPU side, not the GPU. Run under a display
+## (xvfb-run, --rendering-driver opengl3) and it also counts the draw calls
+## in each frame that was drawn.
 
 const HAND: Array[String] = ["AS", "10S", "8S", "5S", "AH", "KH", "QH", "3H", "AD", "4D", "9C", "8C", "2C"]
 
@@ -32,19 +34,28 @@ func run() -> void:
 	await _trick()
 	await _solo_hand()
 
-	print("Main-thread time per frame, this machine, headless, 60 fps steps:")
-	print("  %-44s %6s %8s %8s %8s %10s" % ["scenario", "frames", "mean ms", "p95 ms", "max ms", "total ms"])
+	var drawn := DisplayServer.get_name() != "headless"
+	print(("Whole-frame time, drawing included (a software renderer such as llvmpipe draws on the CPU)" if drawn
+			else "Script and layout time per frame (headless: nothing is drawn)") + ", 60 fps steps:")
+	print("  %-44s %6s %8s %8s %8s %10s" % ["scenario", "frames", "mean ms", "p95 ms", "max ms", "total ms"]
+			+ ("  %9s %9s" % ["draws avg", "draws max"] if drawn else ""))
 	for r in _rows:
-		print("  %-44s %6d %8.2f %8.2f %8.2f %10.1f" % r)
+		print("  %-44s %6d %8.2f %8.2f %8.2f %10.1f" % r.slice(0, 6)
+				+ ("  %9.1f %9d" % [r[6], r[7]] if drawn else ""))
 
 
 ## Times [param count] frames, or until [param done] holds.
 func _measure(label: String, count: int, done := Callable()) -> void:
 	var times: Array[float] = []
+	var draws: Array[int] = []
 	for i in count:
 		var t := Time.get_ticks_usec()
 		await get_tree().process_frame
 		times.append((Time.get_ticks_usec() - t) / 1000.0)
+		# The last frame drawn; 0 when the engine skipped drawing an idle frame.
+		var calls := RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
+		if calls > 0:
+			draws.append(calls)
 		if done.is_valid() and done.call():
 			break
 	var sorted := times.duplicate()
@@ -52,7 +63,11 @@ func _measure(label: String, count: int, done := Callable()) -> void:
 	var total := 0.0
 	for x in times:
 		total += x
-	_rows.append([label, times.size(), total / times.size(), sorted[int(sorted.size() * 0.95)], sorted[-1], total])
+	var draw_total := 0
+	for d in draws:
+		draw_total += d
+	_rows.append([label, times.size(), total / times.size(), sorted[int(sorted.size() * 0.95)], sorted[-1], total,
+			float(draw_total) / maxi(draws.size(), 1), draws.max() if not draws.is_empty() else 0, draws.size()])
 
 
 func _frames(n: int) -> void:
@@ -165,9 +180,15 @@ func _merge_last(n: int) -> void:
 	var total := 0.0
 	var p95 := 0.0
 	var top := 0.0
+	var drawn := 0
+	var draw_sum := 0.0
+	var draw_top := 0
 	for r in rows:
 		frames += r[1]
 		total += r[5]
 		p95 = maxf(p95, r[3])
 		top = maxf(top, r[4])
-	_rows.append([rows[0][0], frames, total / frames, p95, top, total])
+		drawn += r[8]
+		draw_sum += r[6] * r[8]
+		draw_top = maxi(draw_top, r[7])
+	_rows.append([rows[0][0], frames, total / frames, p95, top, total, draw_sum / maxi(drawn, 1), draw_top, drawn])
